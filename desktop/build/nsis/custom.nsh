@@ -128,15 +128,31 @@
   ; 先强杀残留的应用进程树。Electron 是多进程的（主进程/渲染/GPU 同名），
   ; 托盘退出后仍可能有卡死的子进程占着名字——礼貌的 WM_CLOSE 对它无效，
   ; 安装器会弹「无法关闭」并卡住。taskkill /F /T 清整棵树（含桥接/微信
-  ; Bot 等 node 子进程），杀完等半秒让文件句柄释放。
-  nsExec::Exec 'taskkill /F /IM "DualHabitat Matrix.exe" /T'
-  Pop $0
-  Sleep 500
+  ; Bot 等 node 子进程）。
+  ;
+  ; 循环杀 8 轮（每轮间隔 400ms）：防「刚杀完又被拉起 / 进程退出慢」。
+  StrCpy $R9 0
+  dhm_kill_loop:
+    nsExec::Exec 'taskkill /F /IM "DualHabitat Matrix.exe" /T'
+    Pop $0
+    IntOp $R9 $R9 + 1
+    ${If} $R9 >= 8
+      Goto dhm_kill_done
+    ${EndIf}
+    Sleep 400
+    Goto dhm_kill_loop
+  dhm_kill_done:
+  Sleep 300
   ; nsDialogs 要 $PLUGINSDIR，先建好；提示文本不再落盘，所以没有 File 了
   InitPluginsDir
 !macroend
 
 !macro customInstall
+  ; 文件复制前再杀一次：安装中途应用可能被重新拉起（Windows 重启应用 / 手动）
+  nsExec::Exec 'taskkill /F /IM "DualHabitat Matrix.exe" /T'
+  Pop $0
+  Sleep 300
+
   !ifdef DHM_NAPCAT_7Z
     ; 本机已有 NapCat 就不再装自带的那份
     IfFileExists "$PROFILE\napcat-shell\NapCatWinBootMain.exe" dhm_napcat_done
