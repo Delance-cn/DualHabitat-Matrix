@@ -4161,6 +4161,7 @@ const server = http.createServer(async (req, res) => {
       }
       const body = await readBody(req);
       const cfg = loadConfig();
+      const oldPreset = platform === 'wechat' ? cfg.platforms?.wechat?.agentPreset : cfg.agentPreset;
       cfg.matrix = {
         ...(cfg.matrix ?? {}),
         baseUrl: String(body.baseUrl ?? '').trim(),
@@ -4185,7 +4186,11 @@ const server = http.createServer(async (req, res) => {
         if (title !== undefined) cfg.workspaceTitle = title;
       }
       writeJson(configFile(), cfg);
-      return sendJson(res, { ok: true, platform });
+      const presetChanged = preset !== undefined && String(preset) !== String(oldPreset ?? '');
+      let regenOk = true;
+      if (presetChanged) regenOk = (await regenerateConfig()).ok;
+      const applied = await restartBotsFor(platform);
+      return sendJson(res, { ok: true, platform, applied, configRegenerated: regenOk });
     }
 
     /* ── 模型池 ───────────────────────────────────────── */
@@ -4528,7 +4533,8 @@ const server = http.createServer(async (req, res) => {
         Object.assign(config, patch);
       }
       writeJson(configFile(), config);
-      return sendJson(res, { ok: true, platform });
+      const applied = await restartBotsFor(platform);
+      return sendJson(res, { ok: true, platform, applied });
     }
 
     if (p === '/api/roles') {
@@ -4673,13 +4679,15 @@ const server = http.createServer(async (req, res) => {
           wechat: { ...(config.platforms?.wechat ?? {}), role }
         };
         writeJson(configFile(), config);
-        return sendJson(res, { ok: true, platform, role });
+        const applied = await restartBotsFor('wechat');
+        return sendJson(res, { ok: true, platform, role, applied });
       }
 
       const file = path.join(getRoot(), 'state', 'current-role.json');
       fs.mkdirSync(path.dirname(file), { recursive: true });
       writeJson(file, { role: body.role || null, mode: body.mode === 'silent' ? 'silent' : 'active' });
-      return sendJson(res, { ok: true, platform });
+      const applied = await restartBotsFor('qq');
+      return sendJson(res, { ok: true, platform, applied });
     }
 
     if (p === '/api/backend') {
@@ -4777,9 +4785,26 @@ const server = http.createServer(async (req, res) => {
       // 桥接读到的还是老配置。生成失败不回滚保存（配置已经在盘上了），
       // 但要把原因带回前端，别让人以为生效了。
       const regen = await regenerateConfig();
+
+      // 存完即生效：正在跑的 BOT 就地重启拿新配置（不用再手动重启桥接）。
+      let botsRestarted = false;
+      if (regen.ok) {
+        if (bridge.child) {
+          stopBridge();
+          await new Promise((r) => setTimeout(r, 1200));
+          botsRestarted = startBridge().ok === true;
+        }
+        if (wechat.child) {
+          stopWechat();
+          await new Promise((r) => setTimeout(r, 800));
+          startWechat();
+          botsRestarted = true;
+        }
+      }
       return sendJson(res, {
         ok: true,
         profiles,
+        botsRestarted,
         regenerated: regen.ok,
         regenError: regen.ok ? undefined : (() => {
           const real = (regen.lines ?? []).filter((l) => l.trim() && !l.trim().startsWith('at ') && !l.includes('node:internal'));
@@ -5430,6 +5455,26 @@ const server = http.createServer(async (req, res) => {
 });
 
 /** 监听一次。失败必须 reject —— 不挂 error 监听的话 EADDRINUSE 会变成未捕获异常，直接弹红框。 */
+/** 配置保存后让 BOT 立刻生效：只重启受影响平台、且正在跑的那个。 */
+async function restartBotsFor(platform) {
+  let restarted = false;
+  try {
+    if (platform === 'wechat') {
+      if (wechat.child) {
+        stopWechat();
+        await new Promise((r) => setTimeout(r, 800));
+        startWechat();
+        restarted = true;
+      }
+    } else if (bridge.child) {
+      stopBridge();
+      await new Promise((r) => setTimeout(r, 1200));
+      restarted = startBridge().ok === true;
+    }
+  } catch { /* 重启失败不打断保存 */ }
+  return restarted;
+}
+
 function listenOnce(port) {
   return new Promise((resolve, reject) => {
     const onError = (error) => {

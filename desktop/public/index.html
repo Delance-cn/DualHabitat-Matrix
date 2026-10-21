@@ -200,10 +200,6 @@
 
       </div>
 
-      <div class="panel">
-        <div class="panel-head"><h2>刚开始用？跟着走</h2><span class="hint">QQ 和微信各一套，做完一步自动打勾</span></div>
-        <div id="wizard"></div>
-      </div>
 
       <div class="panel">
         <div class="panel-head"><h2>最近动态</h2><span class="hint">完整日志在「高级」页</span></div>
@@ -642,7 +638,7 @@
         </div>
 
         <div class="actions">
-          <button class="btn btn-primary" id="btn-save-pool">保存并重建配置</button>
+          <button class="btn btn-primary" id="btn-save-pool" hidden>保存并重建配置</button>
           <span class="result" id="pool-result"></span>
         </div>
 
@@ -1002,7 +998,7 @@
         <span class="hint">两种模式下都生效，命中就彻底不吭声（连报错都不回）。</span>
 
         <div class="actions">
-          <button class="btn btn-primary" id="btn-save-chat">保存</button>
+          <button class="btn btn-primary" id="btn-save-chat" hidden>保存</button>
           <span class="result" id="chat-result"></span>
         </div>
       </div>
@@ -1062,7 +1058,7 @@
         </label>
 
         <div class="actions">
-          <button class="btn btn-primary" id="btn-save-role">保存人格设置</button>
+          <button class="btn btn-primary" id="btn-save-role" hidden>保存人格设置</button>
           <span class="result" id="role-result"></span>
         </div>
       </div>
@@ -1844,6 +1840,17 @@
 </div>
 
 <div id="toast"></div>
+    <!-- 新手引导：悬浮面板（可关；4 步全亮自动收起） -->
+    <div class="wizard-float" id="wizard-float" hidden>
+      <div class="wizard-float-head">
+        <div>
+          <strong>把机器人跑起来 · 4 步</strong>
+          <div class="wizard-float-sub" id="wizard-float-sub">QQ 通道 · 填好自动保存</div>
+        </div>
+        <button class="btn btn-sm btn-ghost" id="wizard-close" title="收起，不再自动弹出">✕</button>
+      </div>
+      <div id="wizard"></div>
+    </div>
 <script src="/qrcode.js"></script>
 <script src="/app.js"></script>
 </body>

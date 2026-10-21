@@ -1819,6 +1819,16 @@ html[data-view="home"] .app { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* 新手引导：QQ / 微信两栏 */
-#wizard { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+#wizard { display: grid; grid-template-columns: 1fr; gap: 10px; align-items: start; }
 .wizard-col-head { font-weight: 700; font-size: 13px; margin-bottom: 6px; }
 @media (max-width: 960px) { #wizard { grid-template-columns: 1fr; } }
+
+/* 新手引导：悬浮面板 */
+.wizard-float {
+  position: fixed; right: 18px; bottom: 18px; z-index: 60;
+  width: min(400px, calc(100vw - 36px));
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35); padding: 14px 16px;
+}
+.wizard-float-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.wizard-float-sub { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }

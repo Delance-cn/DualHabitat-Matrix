@@ -490,6 +490,7 @@ function applyPlatform(value, opts = {}) {
   // 模型配置按平台分开存，切完要重新填一遍表单
   if (modelProfilesLoaded && prev !== next) {
     fillAllSlots();
+    for (const k of [...autoSavedSig.keys()]) if (k.startsWith('slot-') || k.startsWith('chat-')) autoSavedSig.delete(k);
   }
 
   // 同一个页面两套副标题（标题统一叫「对话与人格」）
@@ -581,6 +582,7 @@ async function refreshState() {
   if (!next || next.ok === false) return;
   S = next;
   renderShell();
+  renderWizard();
   if (currentPage === 'overview') {
     renderOverview();
     renderHomeCards();
@@ -1034,112 +1036,85 @@ $('#wxo-hook-test').addEventListener('click', async (e) => {
   });
 });
 
-/* 新手引导：QQ / 微信各一套，每步一键直达 */
+/* 新手引导：悬浮面板，当前通道 4 步，做完一步亮一个勾，全亮自动收起 */
+const WIZARD_KEY = 'dhm-wizard-state'; // 'done' | 'dismissed' | 空
+function wizardState() {
+  try { return localStorage.getItem(WIZARD_KEY) ?? ''; } catch { return ''; }
+}
+function wizardMark(v) {
+  try { localStorage.setItem(WIZARD_KEY, v); } catch { }
+  applyWizardVisibility();
+}
+
 function wizardGo(p, page) {
   if (platform() !== p) applyPlatform(p);
   showPage(page);
 }
 
+function wizardSteps() {
+  const wx = platform() === 'wechat';
+  const hasKey = (S.secrets ?? []).some((x) => x.set);
+  const prof = S.backend?.profiles?.[platform()]?.chat ?? null;
+  const hasSource = Boolean((prof?.baseUrl && prof?.model) || (!wx && S.backend?.modelApi?.baseUrl && S.backend?.modelApi?.model));
+  const running = wx ? S.wechat?.running === true : Boolean(S.bridge?.running || S.napcat?.reachable === true);
+  if (wx) {
+    return [
+      { title: '登录微信', desc: '「登录」页先点「启动」，二维码出来后用手机微信扫', done: S.wechat?.running === true, go: () => wizardGo('wechat', 'wx-overview'), btn: '去扫码' },
+      { title: '填模型密钥', desc: '「API 与模型」页：厂商选智谱 GLM 等，密钥从厂商控制台复制（只显示一次）。填好自动保存', done: hasKey, go: () => wizardGo('wechat', 'models'), btn: '去填' },
+      { title: '选模型和人格', desc: '「API 与模型」页选模型；「对话与人格」页挑个预设人格。选了自动保存', done: hasSource, go: () => wizardGo('wechat', 'chat'), btn: '去选' },
+      { title: '发条消息试', desc: '用手机微信给机器人发一句话。第一次要等模型服务自启（约十几秒），没回话隔一会再发', done: running, go: () => wizardGo('wechat', 'status'), btn: '去状态页' }
+    ];
+  }
+  return [
+    { title: '登录 QQ', desc: '点「去扫码」打开 NapCat 面板，用手机 QQ 扫一下', done: S.napcat?.reachable === true, go: openNapcatPanel, btn: '去扫码' },
+    { title: '填模型密钥', desc: '「API 与模型」页：厂商选智谱 GLM 等，接口地址自动带出；密钥在厂商控制台生成，只显示一次，复制粘贴进来（填好自动保存）', done: hasKey, go: () => wizardGo('qq', 'models'), btn: '去填' },
+    { title: '选模型和人格', desc: '「API 与模型」页选模型；「对话与人格」页挑个预设人格（比如塔菲）。选了自动保存', done: hasSource, go: () => wizardGo('qq', 'chat'), btn: '去选' },
+    { title: '开起来，发条消息试', desc: '点「一键全开」，然后用手机 QQ 给机器人发一句话。没回话看「当前状态」哪个灯不亮', done: running, go: () => $('#btn-up').click(), btn: '一键全开' }
+  ];
+}
+
 function renderWizard() {
   if (!S) return;
-  const hasKey = (S.secrets ?? []).some((s) => s.set);
-  const hasSource = Boolean(S.backend?.modelApi?.baseUrl && S.backend?.modelApi?.model);
-  const running = Boolean(S.bridge?.running || S.wechat?.running);
-  const napcatUp = S.napcat?.reachable === true;
-  const wechatUp = S.wechat?.running === true;
-
-  const cols = [
-    {
-      name: 'QQ 通道（NapCat）',
-      steps: [
-        {
-          title: '登录 QQ',
-          desc: napcatUp ? 'NapCat 已连上。还没扫码就去 NapCat 面板扫' : '点「去扫码」打开 NapCat 面板，用手机 QQ 扫一下',
-          done: napcatUp,
-          go: openNapcatPanel,
-          btn: '去扫码'
-        },
-        {
-          title: '填模型密钥',
-          desc: hasKey ? '密钥已经填了' : '「API 与模型」页：厂商选智谱 GLM 等，接口地址自动带出；密钥在厂商控制台生成，只显示一次，复制粘贴进来',
-          done: hasKey,
-          go: () => wizardGo('qq', 'models'),
-          btn: '去填'
-        },
-        {
-          title: '选模型和人格',
-          desc: hasSource ? `模型：${S.backend.modelApi.model}。再去「对话与人格」挑个人格（比如塔菲）` : '「API 与模型」页选模型；「对话与人格」页挑个预设人格',
-          done: hasSource,
-          go: () => wizardGo('qq', 'chat'),
-          btn: '去选'
-        },
-        {
-          title: '开起来，发条消息试',
-          desc: running ? '服务在跑。用手机 QQ 给机器人发一句话试试' : '点「一键全开」，然后用手机 QQ 给机器人发一句话。没回话看「当前状态」哪个灯不亮',
-          done: running,
-          go: () => $('#btn-up').click(),
-          btn: '一键全开'
-        }
-      ]
-    },
-    {
-      name: '微信通道（iLink）',
-      steps: [
-        {
-          title: '登录微信',
-          desc: wechatUp ? '微信 Bot 在跑。还没扫码就去「登录」页' : '「登录」页先点「启动」，二维码出来后用手机微信扫',
-          done: wechatUp,
-          go: () => wizardGo('wechat', 'wx-overview'),
-          btn: '去扫码'
-        },
-        {
-          title: '填模型密钥',
-          desc: '和 QQ 各存一份，要单独填：厂商选智谱 GLM 等，密钥从厂商控制台复制（只显示一次）',
-          done: false,
-          go: () => wizardGo('wechat', 'models'),
-          btn: '去填'
-        },
-        {
-          title: '选模型和人格',
-          desc: '「API 与模型」页选模型；「对话与人格」页挑个预设人格',
-          done: false,
-          go: () => wizardGo('wechat', 'chat'),
-          btn: '去选'
-        },
-        {
-          title: '发条消息试',
-          desc: '用手机微信给机器人发一句话。第一次要等模型服务自启（约十几秒），没回话隔一会再发',
-          done: false,
-          go: () => wizardGo('wechat', 'status'),
-          btn: '去状态页'
-        }
-      ]
-    }
-  ];
-
-  $('#wizard').innerHTML = cols
-    .map((col, ci) => `
-      <div class="wizard-col">
-        <div class="wizard-col-head">${esc(col.name)}</div>
-        ${col.steps
-          .map((s, i) => `
-            <div class="wizard-step ${s.done ? 'done' : ''}">
-              <span class="wizard-num">${s.done ? '✓' : i + 1}</span>
-              <div class="wizard-body">
-                <strong>${esc(s.title)}</strong>
-                <span>${esc(s.desc)}</span>
-              </div>
-              ${s.done ? '' : `<button class="btn btn-sm btn-ghost" data-wizard="${ci}-${i}">${esc(s.btn)}</button>`}
-            </div>`)
-          .join('')}
-      </div>`)
+  const steps = wizardSteps();
+  const allDone = steps.every((s) => s.done);
+  const sub = $('#wizard-float-sub');
+  if (sub) sub.textContent = `${platform() === 'wechat' ? '微信' : 'QQ'} 通道 · 填好自动保存，不用点按钮`;
+  const firstOpen = steps.findIndex((s) => !s.done);
+  $('#wizard').innerHTML = steps
+    .map((s, i) => {
+      const cls = s.done ? 'done' : i === firstOpen ? 'current' : '';
+      return `<div class="wizard-step ${cls}">
+        <span class="wizard-num">${s.done ? '✓' : i + 1}</span>
+        <div class="wizard-body">
+          <strong>${esc(s.title)}</strong>
+          <span>${esc(s.desc)}</span>
+        </div>
+        ${s.done ? '' : `<button class="btn btn-sm btn-ghost" data-wizard="${i}">${esc(s.btn)}</button>`}
+      </div>`;
+    })
     .join('');
-
   $$('#wizard [data-wizard]').forEach((b) => {
-    const [ci, si] = b.dataset.wizard.split('-').map(Number);
-    b.addEventListener('click', () => cols[ci].steps[si].go());
+    b.addEventListener('click', () => steps[Number(b.dataset.wizard)].go());
   });
+  applyWizardVisibility(allDone);
 }
+
+function applyWizardVisibility(allDone) {
+  const box = $('#wizard-float');
+  if (!box) return;
+  const st = wizardState();
+  if (st === 'done' || st === 'dismissed') { box.hidden = true; return; }
+  if (allDone) {
+    // 4 个勾都亮了：让人看清一秒，然后自动收起，以后不再弹
+    box.hidden = false;
+    wizardMark('done');
+    setTimeout(() => { box.hidden = true; }, 1600);
+    return;
+  }
+  box.hidden = false;
+}
+
+$('#wizard-close')?.addEventListener('click', () => wizardMark('dismissed'));
 
 async function loadOverview() {
   await refreshState();
@@ -1535,7 +1510,7 @@ function buildSlotPanels() {
     panel.querySelector(`#${def.key}-chat-slot-note`)?.remove();
 
     const save = panel.querySelector(`#${def.key}-btn-save-model`);
-    if (save) save.textContent = `保存${def.title}`;
+    if (save) save.hidden = true; // 自动保存，不再单独点保存
 
     // 默认选中第一块，让人一眼看出这是两块独立配置
     if (def.key === SLOT_DEFS[0].key) panel.classList.add('is-active');
@@ -1559,6 +1534,18 @@ function stashAllSlots() {
 /** 把草稿填回两块表单 */
 function fillAllSlots() {
   for (const def of SLOT_DEFS) fillSource(def.key, profileOf(def.key));
+}
+
+/* ── 自动保存：改了就存，不再单独点保存 ─────────────── */
+const autoSaveTimers = new Map();
+const autoSavedSig = new Map();
+let autoSaveChain = Promise.resolve();
+const sig = (o) => JSON.stringify(o);
+function scheduleAutoSave(key, run) {
+  clearTimeout(autoSaveTimers.get(key));
+  autoSaveTimers.set(key, setTimeout(() => {
+    autoSaveChain = autoSaveChain.then(run).catch(() => { });
+  }, 900));
 }
 
 /* 两块面板各自绑定：所有 id 都带前缀，互不干扰。只绑一次。 */
@@ -1619,41 +1606,44 @@ function bindSlotEvents() {
       });
     });
 
-    el('btn-save-model')?.addEventListener('click', async (e) => {
-      const btn = e.target.closest('button');
-      await busy(btn, '保存中…', async () => {
-        const data = collectSource(s);
-        if (!data.baseUrl || !data.model) {
-          return setResult(res, '至少要填「接口地址」和「模型」', 'err');
-        }
-        const key = el('apiKey').value.trim();
-        const p = providerById(el('provider').value);
-        if (key && p?.keyEnv) {
-          const sr = await post('/api/secrets', { [p.keyEnv]: key });
-          if (sr.ok === false) return setResult(res, sr.error ?? '保存 key 失败', 'err');
-        }
-        // 普通聊天不给工具：把可能残留的开关一并清掉，否则存进去也不生效
-        if (s === 'chat') {
-          data.allowTools = false;
-          delete data.maxToolRounds;
-          delete data.workspaceDir;
-        }
-
-        const pf = platform();
-        if (!modelProfiles[pf]) modelProfiles[pf] = {};
-        modelProfiles[pf][s] = data;
-
-        const r = await post('/api/model-profiles', { profiles: modelProfiles });
-        if (r.ok === false) return setResult(res, r.error, 'err');
-        el('apiKey').value = '';
-        if (r.regenerated === false) {
-          return setResult(res, `已保存，但重新生成配置失败：${r.regenError ?? '看日志'}`, 'err');
-        }
-        setResult(res, '已保存，配置已重新生成；重启桥接后生效', 'saved-pending');
-        await refreshState();
-        await loadModelProfiles();
-      });
-    });
+    // 自动保存：厂商/地址/模型/密钥改了就存，存完立刻生效（跑着的服务自动重启）。
+    // 旧的「保存」按钮已隐藏 —— 不再需要单独点保存。
+    const slotSig = () => sig(collectSource(s)) + '|' + el('apiKey').value;
+    async function saveSlotAuto() {
+      const data = collectSource(s);
+      const key = el('apiKey').value.trim();
+      if (!data.baseUrl && !data.model) return; // 空配置不触发
+      const mark = slotSig();
+      if (autoSavedSig.get(`slot-${platform()}-${s}`) === mark) return;
+      const p = providerById(el('provider').value);
+      if (key && p?.keyEnv) {
+        const sr = await post('/api/secrets', { [p.keyEnv]: key });
+        if (sr.ok === false) return setResult(res, sr.error ?? '保存密钥失败', 'err');
+      }
+      if (s === 'chat') {
+        data.allowTools = false;
+        delete data.maxToolRounds;
+        delete data.workspaceDir;
+      }
+      const pf = platform();
+      if (!modelProfiles[pf]) modelProfiles[pf] = {};
+      modelProfiles[pf][s] = data;
+      const r = await post('/api/model-profiles', { profiles: modelProfiles });
+      el('apiKey').value = '';
+      if (r.ok === false) return setResult(res, r.error ?? '保存失败', 'err');
+      if (r.regenerated === false) return setResult(res, `已自动保存，但生成配置失败：${r.regenError ?? '看日志'}`, 'err');
+      autoSavedSig.set(`slot-${platform()}-${s}`, mark);
+      setResult(res, r.botsRestarted ? '已自动保存 ✓ 服务已重启生效' : '已自动保存 ✓ 下次服务启动生效', 'saved');
+      await refreshState();
+      await loadModelProfiles();
+    }
+    for (const f of ['provider', 'baseUrl', 'model', 'apiKey']) {
+      const node = el(f);
+      if (!node) continue;
+      const kick = () => scheduleAutoSave(`slot-${s}`, () => saveSlotAuto());
+      node.addEventListener('change', kick);
+      node.addEventListener('input', kick);
+    }
   }
 
   // 点哪块哪块高亮，另一块退回灰色
@@ -1709,6 +1699,7 @@ function renderPool() {
       else if (b.dataset.move === 'up' && i > 0) [list[i - 1], list[i]] = [list[i], list[i - 1]];
       else if (b.dataset.move === 'down' && i < list.length - 1) [list[i + 1], list[i]] = [list[i], list[i + 1]];
       renderPool();
+      scheduleAutoSave('pool', savePoolAuto);
     });
   });
 
@@ -1734,10 +1725,28 @@ function renderPool() {
 
 $('#poolEnabled').addEventListener('change', () => {
   if (poolDraft) poolDraft.enabled = $('#poolEnabled').checked;
+  scheduleAutoSave('pool', savePoolAuto);
 });
 $('#poolAllowPaid').addEventListener('change', () => {
   if (poolDraft) poolDraft.allowPaid = $('#poolAllowPaid').checked;
+  scheduleAutoSave('pool', savePoolAuto);
 });
+$('#poolNotice').addEventListener('input', () => scheduleAutoSave('pool', savePoolAuto));
+async function savePoolAuto() {
+  if (!poolDraft) return;
+  const mark = sig({ e: poolDraft.enabled, a: poolDraft.allowPaid, n: $('#poolNotice').value, f: poolDraft.free, p: poolDraft.paid });
+  if (autoSavedSig.get('pool') === mark) return;
+  const r = await post('/api/model-pool', {
+    enabled: poolDraft.enabled !== false,
+    allowPaid: poolDraft.allowPaid === true,
+    exhaustedNotice: $('#poolNotice').value,
+    free: poolDraft.free,
+    paid: poolDraft.paid
+  });
+  if (r.ok === false) return setResult('#pool-result', r.error ?? '保存失败', 'err');
+  autoSavedSig.set('pool', mark);
+  setResult('#pool-result', r.bridgeRestarted ? '已自动保存 ✓ 桥接已重启生效' : '已自动保存 ✓ 下次桥接启动生效', 'saved');
+}
 
 $$('[data-add]').forEach((b) => {
   b.addEventListener('click', () => {
@@ -1748,6 +1757,7 @@ $$('[data-add]').forEach((b) => {
     if (!poolDraft[listName].includes(id)) poolDraft[listName].push(id);
     input.value = '';
     renderPool();
+    scheduleAutoSave('pool', savePoolAuto);
   });
 });
 
@@ -2437,42 +2447,52 @@ async function loadChat() {
   if (p === 'qq') await loadTools();
 }
 
-$('#btn-save-chat').addEventListener('click', async (e) => {
+/* 自动保存：对话与人格页所有字段改了就存（停手 1 秒自动落盘并生效，不用点保存） */
+function collectChatPayload() {
   const mode = $('input[name="accessMode"]:checked')?.value ?? 'all';
-  await busy(e.target.closest('button'), '保存中…', async () => {
-    const r = await post(`/api/chat?platform=${platform()}`, {
-      mode,
-      ownerQQ: $('#ownerQQ').value.trim() || null,
-      allow: { private: splitIds($('#allowPrivate').value), groups: splitIds($('#allowGroups').value) },
-      deny: { private: splitIds($('#denyPrivate').value), groups: splitIds($('#denyGroups').value) },
-      allowAllWhenEmpty: mode === 'all',
-      maxInjectChars: $('#maxInjectChars').value.trim() || undefined,
-      injectMode: $('#injectMode').value
-    });
-    if (r.ok === false) return setResult('#chat-result', r.error, 'err');
-    setResult('#chat-result', '已保存，重启桥接后生效', 'saved-pending');
-    await loadChat();
+  return {
+    mode,
+    ownerQQ: $('#ownerQQ').value.trim() || null,
+    allow: { private: splitIds($('#allowPrivate').value), groups: splitIds($('#allowGroups').value) },
+    deny: { private: splitIds($('#denyPrivate').value), groups: splitIds($('#denyGroups').value) },
+    allowAllWhenEmpty: mode === 'all',
+    maxInjectChars: $('#maxInjectChars').value.trim() || undefined,
+    injectMode: $('#injectMode').value
+  };
+}
+function collectRolePayload() {
+  return {
+    role: $('#role').value || null,
+    mode: $('#silentMode').checked ? 'silent' : 'active',
+    maxInjectChars: $('#maxInjectChars').value.trim() || undefined,
+    injectMode: $('#injectMode').value
+  };
+}
+async function saveChatAuto() {
+  const mark = sig([collectChatPayload(), collectRolePayload(), $('#agentPreset').value, $('#workspaceTitle').value]);
+  if (autoSavedSig.get(`chat-${platform()}`) === mark) return;
+  const rc = await post(`/api/chat?platform=${platform()}`, collectChatPayload());
+  if (rc.ok === false) return setResult('#chat-result', rc.error, 'err');
+  const rr = await post(`/api/role?platform=${platform()}`, collectRolePayload());
+  if (rr.ok === false) return setResult('#role-result', rr.error, 'err');
+  const rm = await post(`/api/matrix?platform=${platform()}`, {
+    agentPreset: $('#agentPreset').value,
+    workspaceTitle: $('#workspaceTitle').value
   });
-});
-
-$('#btn-save-role').addEventListener('click', async (e) => {
-  await busy(e.target.closest('button'), '保存中…', async () => {
-    const r = await post(`/api/role?platform=${platform()}`, {
-      role: $('#role').value || null,
-      mode: $('#silentMode').checked ? 'silent' : 'active',
-      maxInjectChars: $('#maxInjectChars').value.trim() || undefined,
-      injectMode: $('#injectMode').value
-    });
-    if (r.ok === false) return setResult('#role-result', r.error, 'err');
-    // 默认方案 / 会话标题按平台存，一起写
-    await post(`/api/matrix?platform=${platform()}`, {
-      agentPreset: $('#agentPreset').value,
-      workspaceTitle: $('#workspaceTitle').value
-    });
-    setResult('#role-result', '已保存', 'saved');
-    await loadChat();
-  });
-});
+  if (rm.ok === false) return setResult('#role-result', rm.error, 'err');
+  autoSavedSig.set(`chat-${platform()}`, mark);
+  const applied = rc.applied || rr.applied || rm.applied;
+  setResult('#chat-result', applied ? '已自动保存 ✓ 服务已重启生效' : '已自动保存 ✓ 下次服务启动生效', 'saved');
+  setResult('#role-result', '已自动保存 ✓', 'saved');
+  await loadChat();
+}
+for (const sel of ['#ownerQQ', '#allowPrivate', '#allowGroups', '#denyPrivate', '#denyGroups', '#role', '#maxInjectChars', '#workspaceTitle']) {
+  $(sel)?.addEventListener('input', () => scheduleAutoSave('chat', saveChatAuto));
+}
+for (const sel of ['#injectMode', '#agentPreset', '#silentMode']) {
+  $(sel)?.addEventListener('change', () => scheduleAutoSave('chat', saveChatAuto));
+}
+$$('input[name="accessMode"]').forEach((r) => r.addEventListener('change', () => scheduleAutoSave('chat', saveChatAuto)));
 
 /* ── 7. 消息 ────────────────────────────────────────── */
 
