@@ -69,8 +69,8 @@ for (const file of ['config.example.json', 'models.json']) {
   const from = path.join(srcRoot, file);
   if (!fs.existsSync(from)) continue;
   if (file === 'models.json') {
-    // 模型池是个人配置：安装包只带空模板，不把任何人接的模型数据带出去
-    fs.writeFileSync(path.join(outDir, file), JSON.stringify({ _comment: '模型池：在桌面端「API 与模型」页配置', enabled: true, free: [], paid: [] }, null, 2) + '\n');
+    // 不携带 models.json：升级时不覆盖用户自己的模型池；首次运行没有这个
+    // 文件时，桥接按内置默认（空池）跑，用户在「API 与模型」页配置
     continue;
   }
   fs.copyFileSync(from, path.join(outDir, file));
