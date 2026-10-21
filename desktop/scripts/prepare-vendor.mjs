@@ -21,7 +21,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(here, '..');
 
 // 兼容旧 env 名 QQBRIDGE_SRC：只在本文件这类「不进打包名单」的开发脚本里保留。
-const bridgeRootRaw = process.env.DHM_SRC || process.env.QQBRIDGE_SRC || 'C:\\Users\\<用户>\\DualHabitatMatrix';
+const bridgeRootRaw = process.env.DHM_SRC || process.env.QQBRIDGE_SRC || `${process.env.USERPROFILE}\\DualHabitatMatrix`;
 const bridgeRoot = fs.existsSync(bridgeRootRaw) ? fs.realpathSync(bridgeRootRaw) : bridgeRootRaw;
 const fromBridge = path.join(bridgeRoot, 'src', 'backends');
 const fromLocal = path.resolve(desktopDir, '..', 'src', 'backends');

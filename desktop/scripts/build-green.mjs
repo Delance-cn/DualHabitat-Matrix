@@ -114,7 +114,7 @@ console.log('    桥接 → ' + path.relative(outDir, bridgeDst));
 // 不想带就设 DHM_NO_NAPCAT=1，或者源目录不存在 —— 那就退回用户自己配路径。
 // 兼容旧 env 名（QQBRIDGE_NAPCAT_SRC / QQBRIDGE_NO_NAPCAT）：只在本文件这类
 // 「不进打包名单」的开发脚本里保留；打包进 resources/app 的 main.mjs / server.mjs 不带旧名。
-const napcatRaw = process.env.DHM_NAPCAT_SRC || process.env.QQBRIDGE_NAPCAT_SRC || 'C:\\Users\\<用户>\\napcat-shell';
+const napcatRaw = process.env.DHM_NAPCAT_SRC || process.env.QQBRIDGE_NAPCAT_SRC || `${process.env.USERPROFILE}\\napcat-shell`;
 // napcat-shell 可能是个符号链接（Delance 机器上就是），必须先解到真实路径，
 // 否则 cpSync 默认不跟随链接，会拷出一个空目录。
 const napcatSrc = fs.existsSync(napcatRaw) ? fs.realpathSync(napcatRaw) : napcatRaw;

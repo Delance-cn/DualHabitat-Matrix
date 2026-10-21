@@ -21,7 +21,7 @@ const desktopRoot = path.resolve(here, '..');
 const outDir = path.join(desktopRoot, 'bridge-dist');
 
 // 兼容旧 env 名 QQBRIDGE_SRC：只在本文件这类「不进打包名单」的开发脚本里保留。
-const srcRootRaw = process.env.DHM_SRC || process.env.QQBRIDGE_SRC || 'C:\\Users\\<用户>\\DualHabitatMatrix';
+const srcRootRaw = process.env.DHM_SRC || process.env.QQBRIDGE_SRC || `${process.env.USERPROFILE}\\DualHabitatMatrix`;
 const srcRoot = fs.existsSync(srcRootRaw) ? fs.realpathSync(srcRootRaw) : srcRootRaw;
 
 if (!fs.existsSync(path.join(srcRoot, 'src', 'bridge.js'))) {

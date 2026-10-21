@@ -53,7 +53,7 @@ if (!fs.existsSync(path.join(root, 'build', 'icon.ico'))) {
 //   DHM_NO_NAPCAT=1 等价于 --no-napcat
 const NO_NAPCAT = process.env.DHM_NO_NAPCAT === '1' || process.argv.includes('--no-napcat');
 const REBUILD_NAPCAT = process.env.DHM_REBUILD_NAPCAT === '1' || process.argv.includes('--rebuild-napcat');
-const napcatRaw = process.env.DHM_NAPCAT_SRC || 'C:\\Users\\<用户>\\napcat-shell';
+const napcatRaw = process.env.DHM_NAPCAT_SRC || `${process.env.USERPROFILE}\\napcat-shell`;
 
 const buildDir = path.join(root, 'build');
 let napcatSrc = '';
