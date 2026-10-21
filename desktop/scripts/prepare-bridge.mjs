@@ -75,7 +75,7 @@ for (const file of ['config.example.json', 'models.json']) {
   }
   fs.copyFileSync(from, path.join(outDir, file));
 }
-for (const dir of ['roles', 'plugins']) { // plugins/ 本地指令插件（可选目录）
+for (const dir of ['roles', 'plugins', 'upstream']) { // upstream/ agent 预置文件（配置生成必读）
   const from = path.join(srcRoot, dir);
   if (fs.existsSync(from)) fs.cpSync(from, path.join(outDir, dir), { recursive: true, force: true });
 }
