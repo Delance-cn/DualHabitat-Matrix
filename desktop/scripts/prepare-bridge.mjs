@@ -13,6 +13,7 @@
 //   package.json         只需要 type:module，让 src/*.js 按 ESM 解析
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -78,6 +79,30 @@ for (const file of ['config.example.json', 'models.json']) {
 for (const dir of ['roles', 'plugins', 'upstream']) { // upstream/ agent 预置文件（配置生成必读）
   const from = path.join(srcRoot, dir);
   if (fs.existsSync(from)) fs.cpSync(from, path.join(outDir, dir), { recursive: true, force: true });
+}
+
+// 模型引擎：opencode-cli 单文件。没有它，模型 API 在没装 OpenCode 桌面端的
+// 机器上永远起不来（2026-10-21 朋友的机器就是死在这）。打包时从本机
+// OpenCode 桌面端的缓存里取最新一份塞进 vendor/，装完即有。
+{
+  const roaming = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  const cliBase = path.join(roaming, 'ai.opencode.desktop', 'cli');
+  let picked = null;
+  try {
+    picked = fs.readdirSync(cliBase, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => path.join(cliBase, e.name))
+      .filter((d) => fs.existsSync(path.join(d, 'opencode-cli.exe')))
+      .map((d) => ({ d, t: fs.statSync(path.join(d, 'opencode-cli.exe')).mtimeMs }))
+      .sort((a, b) => b.t - a.t)[0]?.d ?? null;
+  } catch { }
+  if (picked) {
+    fs.mkdirSync(path.join(outDir, 'vendor', 'opencode-cli'), { recursive: true });
+    fs.copyFileSync(path.join(picked, 'opencode-cli.exe'), path.join(outDir, 'vendor', 'opencode-cli', 'opencode-cli.exe'));
+    console.log('  vendor/opencode-cli/（模型引擎，取自 ' + picked + '）');
+  } else {
+    console.warn('  ⚠️ 没找到 opencode-cli.exe（%APPDATA%\\ai.opencode.desktop\\cli）——这包在没装 OpenCode 桌面端的机器上起不了模型 API');
+  }
 }
 
 // 4. package.json：只要 type:module

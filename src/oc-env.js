@@ -55,18 +55,24 @@ export const MODELS_FILE = path.join(ROOT, 'models.json');
  * 不钉死版本号 —— 否则桌面端一升级，桥接就找不到 CLI 了。
  */
 export function resolveCli() {
-  // APPDATA 在某些非交互环境（沙箱 shell、计划任务、部分终端）里是空的，
-  // 直接用它会得到相对路径 `ai.opencode.desktop\cli` —— 报错信息会误导人。
-  // 所以兜底到 %USERPROFILE%\AppData\Roaming。
+  // 0. 显式指定（测试 / 特殊布局用）
+  const envCli = process.env.DHM_OPENCODE_CLI;
+  if (envCli && fs.existsSync(envCli)) return envCli;
+  // 1. 安装包自带：bridge 根目录 vendor/opencode-cli/opencode-cli.exe
+  //    （prepare-bridge 打包时从本机 OpenCode 桌面端缓存取的，单文件无依赖）
+  //    —— 没装 OpenCode 桌面端的新机器靠它起模型 API。
+  const bundled = path.join(ROOT, 'vendor', 'opencode-cli', 'opencode-cli.exe');
+  if (fs.existsSync(bundled)) return bundled;
+  // 2. 本机装了 OpenCode 桌面端：%APPDATA%\ai.opencode.desktop\cli\<版本>\opencode-cli.exe
+  //    APPDATA 在某些非交互环境（沙箱 shell、计划任务、部分终端）里是空的，
+  //    直接用它会得到相对路径 —— 报错信息会误导人。兜底到 USERPROFILE。
   const roaming = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
   const base = path.join(roaming, 'ai.opencode.desktop', 'cli');
   let entries;
   try {
     entries = fs.readdirSync(base, { withFileTypes: true });
-  } catch (error) {
-    // 报错里不带 base：那个路径含引擎自己的目录名（见上面注释），不该出现在
-    // 给人看的日志里。要查具体路径看上面那段注释。
-    throw new Error(`读不到命令行程序目录（桌面端没装好？）：${error?.message ?? error}`);
+  } catch {
+    throw new Error('找不到模型引擎（opencode-cli.exe）：安装包 vendor/ 里没有，本机也没装 OpenCode 桌面端。请重装完整安装包。');
   }
   const candidates = entries
     .filter((entry) => entry.isDirectory())
@@ -79,7 +85,7 @@ export function resolveCli() {
     const exe = path.join(dir, 'opencode-cli.exe');
     if (fs.existsSync(exe)) return exe;
   }
-  throw new Error('命令行程序目录里没有可执行文件 —— 桌面端没装好，或者版本目录是空的');
+  throw new Error('找不到模型引擎（opencode-cli.exe）：安装包 vendor/ 里没有，OpenCode 桌面端的版本目录也是空的。请重装完整安装包。');
 }
 
 /**
