@@ -4711,7 +4711,11 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         profiles,
         regenerated: regen.ok,
-        regenError: regen.ok ? undefined : regen.lines?.slice(-3).join(' / ') ?? '生成配置失败'
+        regenError: regen.ok ? undefined : (() => {
+          const real = (regen.lines ?? []).filter((l) => l.trim() && !l.trim().startsWith('at ') && !l.includes('node:internal'));
+          const msg = real.slice(0, 2).join(' ｜ ') || (regen.lines ?? []).slice(-1).join('') || '生成配置失败';
+          return msg + '（修复后重试；模型相关先到「API 与模型」页检查模型池）';
+        })()
       });
     }
 
