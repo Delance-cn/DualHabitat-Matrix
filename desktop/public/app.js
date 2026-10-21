@@ -1108,7 +1108,7 @@ function renderWizard() {
         },
         {
           title: '发条消息试',
-          desc: '用手机微信给机器人发一句话；没回话看「当前状态」页哪个灯不亮',
+          desc: '用手机微信给机器人发一句话。第一次要等模型服务自启（约十几秒），没回话隔一会再发',
           done: false,
           go: () => wizardGo('wechat', 'status'),
           btn: '去状态页'

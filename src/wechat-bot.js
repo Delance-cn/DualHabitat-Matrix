@@ -32,6 +32,7 @@ import {
   unwrap,
   createTurnCollector
 } from './oc-client.js';
+import { ensureServer } from './oc-server.js';
 import { runLocalCommand, loadPlugins } from './chat-commands.js';
 import { appendMemory } from './memory-daily.js';
 
@@ -350,8 +351,20 @@ async function ensureAi() {
 async function initAi() {
   const cfg = readConfig();
   const stateDir = cfg.matrix?.stateDir || '';
-  const endpoint = await discoverMatrixEndpoint({ stateDir });
-  if (!endpoint) throw new Error('找不到模型 API 服务。回电脑软件首页看三张状态卡：哪张显示「未运行」就点它的「启动」；都亮着还报这个错，就把桥接停止再启动一次。');
+  let endpoint = await discoverMatrixEndpoint({ stateDir });
+  if (!endpoint) {
+    // 微信-only 用户没人拉模型 API（它原本只由 QQ 桥接顺手拉起）——
+    // 这里自己幂等拉起：在跑就复用，没跑就 spawn 并等注册文件。
+    // 首次启动要等 opencode serve 就绪（十来秒），期间的消息会重试。
+    log('模型 API 不在，微信 Bot 自己拉一个（首次要等十几秒）…');
+    try {
+      await ensureServer({ log });
+      endpoint = await discoverMatrixEndpoint({ stateDir });
+    } catch (error) {
+      log(`模型 API 自启失败：${error?.message ?? error}`);
+    }
+  }
+  if (!endpoint) throw new Error('模型服务没起来。等半分钟再发一条试试；还不行就重启软件（它会自动带上模型服务）。');
   // 必须用 NodeApiClient（DSH 同形状门面），不能用裸 SDK：
   // 裸 SDK 只有 session/event/provider，没有 workspace.* / sessions.* /
   // events.mux —— 微信这条线一上来就调 workspace.create，直接 TypeError。
