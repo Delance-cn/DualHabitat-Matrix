@@ -60,6 +60,7 @@ import {
   markStickerUsed
 } from './sticker-lib.js';
 import { runLocalCommand, loadPlugins } from './chat-commands.js';
+import { appendMemory } from './memory-daily.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -7260,6 +7261,13 @@ async function main() {
     // 插件事件：onBotReply（进发送队列后触发一次；分条细节不暴露）
     sendChain = sendChain.then(() => {
       firePluginHook('onBotReply', { platform: 'qq', chatId: key, text: safeMsg });
+      // 每日记忆日志：机器人发出去的也记（按当前角色）
+      try {
+        appendMemory({
+          root: ROOT, channel: 'qq', role: roleState.role,
+          conv: key, who: 'bridge', self: true, text: safeMsg
+        });
+      } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }
     }).catch(() => { });
     return sendChain;
   }
@@ -10581,6 +10589,13 @@ async function main() {
       // 发语音：传本地音频文件路径（插件自己负责 TTS/素材）；微信侧无此能力
       sendVoice: (filePath) => sendVoiceV2(key, String(filePath), { guard: true })
     });
+    // 每日记忆日志：QQ 侧收到的消息按角色落盘（跨天自动换文件）
+    try {
+      appendMemory({
+        root: ROOT, channel: 'qq', role: roleState.role,
+        conv: key, who: event.user_id ?? '', text: plainContent
+      });
+    } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }
 
     // 控制类话语：仅管理员（ownerQQ）可下达；群友触发直接拦截
     if (!isOwner && /进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(plainContent)) {

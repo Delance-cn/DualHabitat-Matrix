@@ -16,6 +16,18 @@
 !include "LogicLib.nsh"
 !include "WinMessages.nsh"
 
+; 安装器初始化：先强杀残留的应用进程树。
+; Electron 是多进程的（主进程/渲染/GPU 在任务管理器里同名），托盘退出后
+; 仍可能有卡死的子进程占着名字——礼貌的 WM_CLOSE 对它无效，安装器会弹
+; 「无法关闭」并卡住。taskkill /F /T 直接清掉整棵树（桥接/微信 Bot 等
+; node 子进程一并清掉）。杀完等半秒让文件句柄释放。
+; 卸载器同理（系统设置里的卸载也走这里）
+!macro customUnInit
+  nsExec::Exec 'taskkill /F /IM "DualHabitat Matrix.exe" /T'
+  Pop $0
+  Sleep 500
+!macroend
+
 !ifndef BUILD_UNINSTALLER
   Var DhmAgreeText
   Var DhmAgreeCheck
@@ -113,6 +125,13 @@
 !macroend
 
 !macro customInit
+  ; 先强杀残留的应用进程树。Electron 是多进程的（主进程/渲染/GPU 同名），
+  ; 托盘退出后仍可能有卡死的子进程占着名字——礼貌的 WM_CLOSE 对它无效，
+  ; 安装器会弹「无法关闭」并卡住。taskkill /F /T 清整棵树（含桥接/微信
+  ; Bot 等 node 子进程），杀完等半秒让文件句柄释放。
+  nsExec::Exec 'taskkill /F /IM "DualHabitat Matrix.exe" /T'
+  Pop $0
+  Sleep 500
   ; nsDialogs 要 $PLUGINSDIR，先建好；提示文本不再落盘，所以没有 File 了
   InitPluginsDir
 !macroend

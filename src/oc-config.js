@@ -286,6 +286,8 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     // 于是 RULES.md 承诺的"群友只读联网搜索"是死的（spike/probe-perms.mjs 实测）。
     // MCP 工具的动作名是 `<服务名>_<工具名>`，所以前缀是 `web-search-safe_`。
     permissions.push({ action: 'web-search-safe_*', resource: '*', effect: 'allow' });
+    // 记忆日志只读工具（mcp-memory 注册的服务名是 memory-safe）
+    permissions.push({ action: 'memory-safe_*', resource: '*', effect: 'allow' });
   }
   config.permissions = permissions;
 
@@ -334,6 +336,22 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     };
   } else {
     notes.push(`⚠️ 找不到 ${webServer}，跳过联网搜索 MCP（群友的只读搜索会不可用）`);
+  }
+
+  // 记忆日志（只读）：每日记忆由 memory-daily.js 增量写在 state/memory/<角色>/，
+  // 新开对话时模型可以自主决定读取哪天/哪个角色/按关键词过滤。
+  // 只读、范围锁死在 state/memory/，没有写接口、没有路径参数。
+  const memoryServer = path.join(ROOT, 'src', 'mcp-memory.js');
+  if (fs.existsSync(memoryServer)) {
+    mcpServers['memory-safe'] = {
+      type: 'local',
+      command: [process.execPath, memoryServer],
+      cwd: SESSION_WORKDIR,
+      codemode: false,
+      timeout: { startup: 20_000, catalog: 20_000, execution: 60_000 }
+    };
+  } else {
+    notes.push(`⚠️ 找不到 ${memoryServer}，跳过记忆 MCP（每日记忆日志会不可读）`);
   }
 
   } // ← chatOnly 结束

@@ -33,6 +33,7 @@ import {
   createTurnCollector
 } from './oc-client.js';
 import { runLocalCommand, loadPlugins } from './chat-commands.js';
+import { appendMemory } from './memory-daily.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const STATE_DIR = path.join(ROOT, 'state');
@@ -743,6 +744,10 @@ async function handleMessage(msg) {
     isOwner: Boolean(wx.ownerId) && from === String(wx.ownerId),
     reply: (t) => sendText(from, ctx, String(t)).catch((e) => log('插件回复失败：', e?.message ?? e))
   });
+  // 每日记忆日志：微信侧收到的消息落盘（角色目录固定为「微信」）
+  try {
+    appendMemory({ root: ROOT, channel: 'wechat', role: '微信', conv: from, who: from, text });
+  } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }
 
   if (!text) {
     await sendText(from, ctx, `收到你的${kinds}消息，我现在只能看文字。`).catch(() => {});
@@ -786,6 +791,9 @@ async function handleMessage(msg) {
         log(`回复 ${from}：${reply.slice(0, 60)}`);
         appendActivity(from, 'agent 回复', reply);
         firePluginHook('onBotReply', { platform: 'wechat', chatId: from, text: reply });
+        try {
+          appendMemory({ root: ROOT, channel: 'wechat', role: '微信', conv: from, who: 'bridge', self: true, text: reply });
+        } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }
         fireHook('message.replied', { to: from, text: reply.slice(0, 2000) });
       } catch (error) {
         log('处理失败：', error?.message ?? error);
