@@ -351,7 +351,7 @@ async function initAi() {
   const cfg = readConfig();
   const stateDir = cfg.matrix?.stateDir || '';
   const endpoint = await discoverMatrixEndpoint({ stateDir });
-  if (!endpoint) throw new Error('找不到模型 API 服务（先在「运行」页把桥接起来一次）');
+  if (!endpoint) throw new Error('找不到模型 API 服务。回电脑软件首页看三张状态卡：哪张显示「未运行」就点它的「启动」；都亮着还报这个错，就把桥接停止再启动一次。');
   // 必须用 NodeApiClient（DSH 同形状门面），不能用裸 SDK：
   // 裸 SDK 只有 session/event/provider，没有 workspace.* / sessions.* /
   // events.mux —— 微信这条线一上来就调 workspace.create，直接 TypeError。

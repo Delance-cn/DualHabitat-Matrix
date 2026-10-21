@@ -810,6 +810,10 @@ function renderStatus() {
   const title = $('#status-title');
   if (title) title.textContent = ok ? '正常运行' : partial ? '部分就绪' : '未启动';
 
+  // QQ 登录直达门：QQ 通道且 NapCat 没连上时亮出来（微信通道一直藏着）
+  const npPanel = $('#status-napcat-panel');
+  if (npPanel) npPanel.hidden = wx || S.napcat?.reachable === true;
+
   const sub = $('#status-sub');
   if (sub) {
     sub.textContent = ok
@@ -1030,55 +1034,110 @@ $('#wxo-hook-test').addEventListener('click', async (e) => {
   });
 });
 
+/* 新手引导：QQ / 微信各一套，每步一键直达 */
+function wizardGo(p, page) {
+  if (platform() !== p) applyPlatform(p);
+  showPage(page);
+}
+
 function renderWizard() {
   if (!S) return;
   const hasKey = (S.secrets ?? []).some((s) => s.set);
   const hasSource = Boolean(S.backend?.modelApi?.baseUrl && S.backend?.modelApi?.model);
   const running = Boolean(S.bridge?.running || S.wechat?.running);
-  const steps = [
+  const napcatUp = S.napcat?.reachable === true;
+  const wechatUp = S.wechat?.running === true;
+
+  const cols = [
     {
-      title: '让 QQ 能登录',
-      desc: S.napcat?.reachable ? 'NapCat 已连上' : '配好 NapCat 目录后点「启动」，再用面板扫码',
-      done: S.napcat?.reachable === true,
-      go: () => showPage('advanced')
+      name: 'QQ 通道（NapCat）',
+      steps: [
+        {
+          title: '登录 QQ',
+          desc: napcatUp ? 'NapCat 已连上。还没扫码就去 NapCat 面板扫' : '点「去扫码」打开 NapCat 面板，用手机 QQ 扫一下',
+          done: napcatUp,
+          go: openNapcatPanel,
+          btn: '去扫码'
+        },
+        {
+          title: '填模型密钥',
+          desc: hasKey ? '密钥已经填了' : '「API 与模型」页：厂商选智谱 GLM 等，接口地址自动带出；密钥在厂商控制台生成，只显示一次，复制粘贴进来',
+          done: hasKey,
+          go: () => wizardGo('qq', 'models'),
+          btn: '去填'
+        },
+        {
+          title: '选模型和人格',
+          desc: hasSource ? `模型：${S.backend.modelApi.model}。再去「对话与人格」挑个人格（比如塔菲）` : '「API 与模型」页选模型；「对话与人格」页挑个预设人格',
+          done: hasSource,
+          go: () => wizardGo('qq', 'chat'),
+          btn: '去选'
+        },
+        {
+          title: '开起来，发条消息试',
+          desc: running ? '服务在跑。用手机 QQ 给机器人发一句话试试' : '点「一键全开」，然后用手机 QQ 给机器人发一句话。没回话看「当前状态」哪个灯不亮',
+          done: running,
+          go: () => $('#btn-up').click(),
+          btn: '一键全开'
+        }
+      ]
     },
     {
-      title: '接一个模型',
-      desc: hasKey ? '已经有 API key 了' : '在「API 与模型」页粘一个 key 进来',
-      done: hasKey || hasSource,
-      go: () => showPage('models')
-    },
-    {
-      title: '选模型',
-      desc: hasSource ? `当前：${S.backend.modelApi.model}` : '选厂商 + 模型名，或者把模型加进模型池',
-      done: hasSource,
-      go: () => showPage('models')
-    },
-    {
-      title: '把服务开起来',
-      desc: running ? '已经有服务在跑了' : '点上面的「一键全开」',
-      done: running,
-      go: () => $('#btn-up').click()
+      name: '微信通道（iLink）',
+      steps: [
+        {
+          title: '登录微信',
+          desc: wechatUp ? '微信 Bot 在跑。还没扫码就去「登录」页' : '「登录」页先点「启动」，二维码出来后用手机微信扫',
+          done: wechatUp,
+          go: () => wizardGo('wechat', 'wx-overview'),
+          btn: '去扫码'
+        },
+        {
+          title: '填模型密钥',
+          desc: '和 QQ 各存一份，要单独填：厂商选智谱 GLM 等，密钥从厂商控制台复制（只显示一次）',
+          done: false,
+          go: () => wizardGo('wechat', 'models'),
+          btn: '去填'
+        },
+        {
+          title: '选模型和人格',
+          desc: '「API 与模型」页选模型；「对话与人格」页挑个预设人格',
+          done: false,
+          go: () => wizardGo('wechat', 'chat'),
+          btn: '去选'
+        },
+        {
+          title: '发条消息试',
+          desc: '用手机微信给机器人发一句话；没回话看「当前状态」页哪个灯不亮',
+          done: false,
+          go: () => wizardGo('wechat', 'status'),
+          btn: '去状态页'
+        }
+      ]
     }
   ];
 
-  const firstOpen = steps.findIndex((s) => !s.done);
-  $('#wizard').innerHTML = steps
-    .map((s, i) => {
-      const cls = s.done ? 'done' : i === firstOpen ? 'current' : '';
-      return `<div class="wizard-step ${cls}">
-        <span class="wizard-num">${s.done ? '✓' : i + 1}</span>
-        <div class="wizard-body">
-          <strong>${esc(s.title)}</strong>
-          <span>${esc(s.desc)}</span>
-        </div>
-        ${s.done ? '' : `<button class="btn btn-sm btn-ghost" data-wizard="${i}">去这一步</button>`}
-      </div>`;
-    })
+  $('#wizard').innerHTML = cols
+    .map((col, ci) => `
+      <div class="wizard-col">
+        <div class="wizard-col-head">${esc(col.name)}</div>
+        ${col.steps
+          .map((s, i) => `
+            <div class="wizard-step ${s.done ? 'done' : ''}">
+              <span class="wizard-num">${s.done ? '✓' : i + 1}</span>
+              <div class="wizard-body">
+                <strong>${esc(s.title)}</strong>
+                <span>${esc(s.desc)}</span>
+              </div>
+              ${s.done ? '' : `<button class="btn btn-sm btn-ghost" data-wizard="${ci}-${i}">${esc(s.btn)}</button>`}
+            </div>`)
+          .join('')}
+      </div>`)
     .join('');
 
   $$('#wizard [data-wizard]').forEach((b) => {
-    b.addEventListener('click', () => steps[Number(b.dataset.wizard)].go());
+    const [ci, si] = b.dataset.wizard.split('-').map(Number);
+    b.addEventListener('click', () => cols[ci].steps[si].go());
   });
 }
 
@@ -1180,11 +1239,20 @@ $('#btn-down').addEventListener('click', async () => {
 $('#btn-refresh').addEventListener('click', () => loadOverview());
 $('#btn-goto-backend').addEventListener('click', () => showPage('backend'));
 
-$('#btn-napcat-panel').addEventListener('click', async () => {
+async function openNapcatPanel() {
   const r = await api('/api/napcat/panel');
-  if (!r.ok) return toast(r.error ?? '拿不到 NapCat 面板地址');
+  if (!r.ok) {
+    toast(r.error ?? '拿不到 NapCat 面板地址 —— NapCat 可能还没装/没启动，先去「高级」页配好');
+    wizardGo('qq', 'advanced');
+    return false;
+  }
   window.open(r.url, '_blank');
-});
+  return true;
+}
+
+$('#btn-napcat-panel').addEventListener('click', () => openNapcatPanel());
+
+$('#status-napcat-login')?.addEventListener('click', () => openNapcatPanel());
 
 $$('[data-watch]').forEach((el) => {
   el.addEventListener('change', async () => {
