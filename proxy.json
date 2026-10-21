@@ -1,0 +1,4 @@
+{
+  "url": "http://127.0.0.1:7897",
+  "_comment": "Clash Verge 的混合端口。本机 huggingface.co 被 DNS 投毒，只有走代理才通。删掉这个文件或取消 QQ_BRIDGE_PROXY 即关闭。"
+}

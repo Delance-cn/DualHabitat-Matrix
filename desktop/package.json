@@ -1,0 +1,53 @@
+{
+  "name": "dualhabitat-matrix-desktop",
+  "version": "0.3.1",
+  "private": true,
+  "type": "module",
+  "description": "DualHabitat Matrix 桌面端：总览服务、配模型、管人格、发消息、看日志",
+  "author": "Delance",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "serve": "node server.mjs",
+    "prepare:vendor": "node scripts/prepare-vendor.mjs",
+    "prepare:bridge": "node scripts/prepare-bridge.mjs",
+    "patch:builder": "node scripts/patch-builder-win.mjs",
+    "icon": "node scripts/make-icon.mjs",
+    "green": "npm run prepare:vendor && npm run prepare:bridge && node scripts/build-green.mjs",
+    "installer": "npm run prepare:vendor && npm run prepare:bridge && npm run patch:builder && npm run icon && node scripts/build-installer.mjs",
+    "installer:lite": "npm run prepare:vendor && npm run prepare:bridge && npm run patch:builder && npm run icon && node scripts/build-installer.mjs --no-napcat",
+    "installer:full": "npm run prepare:vendor && npm run prepare:bridge && npm run patch:builder && npm run icon && node scripts/build-installer.mjs",
+    "pack": "npm run prepare:vendor && npm run prepare:bridge && npm run patch:builder && electron-builder --win --dir"
+  },
+  "devDependencies": {
+    "7zip-bin": "^5.2.0",
+    "electron": "^44.9.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "cn.delance.dualhabitat-matrix",
+    "productName": "DualHabitat Matrix",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.mjs",
+      "server.mjs",
+      "public/**/*",
+      "vendor/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bridge-dist",
+        "to": "bridge"
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        "dir"
+      ]
+    }
+  }
+}

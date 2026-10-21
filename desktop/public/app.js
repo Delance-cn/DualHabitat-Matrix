@@ -1,0 +1,3657 @@
+/* ══════════════════════════════════════════════════════════════════════════
+ * DualHabitat Matrix · 桌面控制台前端
+ *
+ * 手写、无构建链。文件按「壳 → 页」排：
+ *   1. 小工具（请求、转义、toast、弹窗）
+ *   2. 壳（主题 / 模式 / 平台 / 导航 / 状态轮询）
+ *   3. 总览
+ *   4. API 与模型
+ *   5. 后端
+ *   6. 聊天
+ *   7. 消息
+ *   8. 高级（配置项 / 路径 / 原始文件 / 日志 / 自检）
+ *
+ * 一条纪律：任何会动到外部世界的动作（安装更新、发消息、停服务）都先过
+ * confirmBox()，不许点一下就发生。只读操作不弹窗。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+
+/* ── 1. 小工具 ──────────────────────────────────────── */
+
+async function api(path, options = {}) {
+  try {
+    const res = await fetch(path, { headers: { 'content-type': 'application/json' }, ...options });
+    const text = await res.text();
+    if (!text) return { ok: res.ok };
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { ok: false, error: `返回的不是 JSON（HTTP ${res.status}）` };
+    }
+  } catch (error) {
+    return { ok: false, error: `请求失败：${error?.message ?? error}` };
+  }
+}
+
+const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body ?? {}) });
+
+/** 拼 HTML 前统一转义。用户自己填的模型名、人格名都会进 DOM。 */
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+/** "1, 2 ,3" / "1 2" / "1，2" → ['1','2','3'] */
+const splitIds = (s) => String(s ?? '').split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean);
+
+let toastTimer = null;
+function toast(text) {
+  let el = $('#toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.classList.add('is-on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('is-on'), 2600);
+}
+
+/**
+ * 面板底下那行小字。成功顺手弹一下 toast —— 红字留原地，绿字容易看漏。
+ *
+ *   ok             测试 / 状态类：弹具体结果（“通了，1200ms”）
+ *   saved          真的改了数据且立即生效：统一弹「修改成功」
+ *   saved-pending  真的改了数据，但要重启桥接/服务才生效：弹「修改成功（重启后生效）」
+ *   err            红字留原地，不弹（一闪而过反而看不到）
+ */
+function setResult(sel, text, kind) {
+  const el = typeof sel === 'string' ? $(sel) : sel;
+  if (!el) return;
+  el.textContent = text ?? '';
+  el.className = `result${kind ? ` ${kind}` : ''}`;
+  if (kind === 'saved' && text) toast('修改成功');
+  else if (kind === 'saved-pending' && text) toast('修改成功（重启后生效）');
+  else if (kind === 'ok' && text) toast(text);
+}
+
+/**
+ * 按钮忙碌态：防止连点两次发两条消息。
+ *
+ * 注意：**不要传 e.currentTarget** —— 事件派发结束后它会被置成 null，
+ * 只要函数里有 await（比如先弹确认框），回来时就是 `null.textContent` 崩掉。
+ * 统一用 `e.target.closest('button')`（target 不会失效），这里再兜一层 null。
+ */
+async function busy(btn, label, task) {
+  if (!btn) return task();
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = label;
+  try {
+    return await task();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+function fmtTime(ms) {
+  if (!ms) return '—';
+  return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v > 1048576) return `${(v / 1048576).toFixed(1)} MB`;
+  if (v > 1024) return `${(v / 1024).toFixed(0)} KB`;
+  return `${v} B`;
+}
+
+/* ── 通用确认弹窗 ───────────────────────────────────── */
+
+let modalResolve = null;
+
+function openModal({ title, text = '', list = [], okLabel = '确定', cancelLabel = '取消', danger = false, choices = null }) {
+  const mask = $('#modal-mask');
+  $('#modal-title').textContent = title;
+  $('#modal-text').textContent = text;
+  const ul = $('#modal-list');
+  ul.innerHTML = list.map((x) => `<li>${esc(x)}</li>`).join('');
+  ul.hidden = list.length === 0;
+
+  const ok = $('#modal-ok');
+  const cancel = $('#modal-cancel');
+  ok.textContent = okLabel;
+  ok.className = `btn ${danger ? 'btn-danger' : 'btn-primary'}`;
+  ok.hidden = Boolean(choices);
+  cancel.textContent = choices ? '关闭' : cancelLabel;
+
+  mask.classList.add('is-on');
+
+  return new Promise((resolve) => {
+    modalResolve = resolve;
+    if (choices) {
+      // 选择模式：把候选项塞进列表位置，点哪个就 resolve 哪个
+      ul.hidden = false;
+      ul.innerHTML = choices
+        .map((c, i) => `<li><button class="btn btn-sm" style="width:100%;justify-content:flex-start" data-choice="${i}">${esc(c.label)}</button></li>`)
+        .join('');
+      ul.style.listStyle = 'none';
+      ul.style.paddingLeft = '0';
+      $$('#modal-list [data-choice]').forEach((b) => {
+        b.addEventListener('click', () => {
+          const pick = choices[Number(b.dataset.choice)];
+          closeModal(pick?.value ?? null);
+        });
+      });
+    } else {
+      ul.style.listStyle = '';
+      ul.style.paddingLeft = '';
+    }
+  });
+}
+
+function closeModal(value) {
+  $('#modal-mask').classList.remove('is-on');
+  const r = modalResolve;
+  modalResolve = null;
+  if (r) r(value);
+}
+
+$('#modal-cancel').addEventListener('click', () => closeModal(null));
+$('#modal-ok').addEventListener('click', () => closeModal(true));
+$('#modal-mask').addEventListener('click', (e) => {
+  if (e.target.id === 'modal-mask') closeModal(null);
+});
+
+/** 是/否。返回 true 才继续。 */
+async function confirmBox(opts) {
+  const r = await openModal(opts);
+  return r === true;
+}
+
+/* ── 2. 壳 ──────────────────────────────────────────── */
+
+/* 主题 */
+function applyTheme(theme) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  try {
+    localStorage.setItem('dhm-theme', next);
+  } catch { /* 隐私模式下写不了，本次会话照样生效 */ }
+}
+/* ── 界面语言与字号 ─────────────────────────────────── */
+
+/* 英文词典：键是界面上的中文原句。没收录的字符串保持中文 ——
+   翻译逐块推进，宁可漏翻也不要硬翻出歧义。 */
+const I18N_EN = {
+  '选择通道': 'Choose a channel',
+  '当前状态': 'Status',
+  '对话与人格': 'Chat & Persona',
+  '交流空间': 'Live Feed',
+  '消息与任务': 'Messages & Tasks',
+  'API 与模型': 'API & Models',
+  '链接手机': 'Phone Link',
+  '后端': 'Backend',
+  '高级': 'Advanced',
+  '登录': 'Sign in',
+  '两条通道各跑各的进程，能同时开。点卡片进去配置；下面的状态灯是实时读数，不用进去看。': 'Each channel runs its own process; both can run at once. Click a card to configure it — the LEDs below are live readings.',
+  '每收到或回复一条消息，都会按所选数据格式向指定地址推送一份 JSON。与 QQ 无关。': 'Every incoming or outgoing message is pushed as JSON to your URL in the selected format. Unrelated to QQ.',
+  '运行状态、运行时长与当前使用的模型档位。': 'Run state, uptime and the active model tier.',
+  '界面模式': 'UI mode',
+  'QQ 与微信两个机器人的收发记录和后台日志都汇总在这一页。': 'Messages of both the QQ and WeChat bots, plus backend logs, on one page.',
+  '这里管理模型供应商、密钥与切换顺序。批量粘贴多个 key，程序会自动识别厂商并分类，确认后即可保存。': 'Manage providers, keys and failover order. Paste several keys at once and the app detects vendors automatically.',
+  '决定聊天里的回复由谁来生成。三种只能选一种，选完点「启用这条后端」才生效。': 'Decides what generates replies. Pick one of the three, then click "Enable this backend" to apply.',
+  '谁能让机器人回话、用什么人格回。QQ 和微信各存一份配置，上面的平台按钮切的就是这一页。': 'Who can trigger a reply and with which persona. QQ and WeChat store separate configs — switch with the buttons above.',
+  '查看最近消息、主动发送与定时发送。这里显示最近数百条活动记录，不是完整聊天存档。': 'Recent messages, proactive and scheduled sends. Shows the latest few hundred records, not a full archive.',
+  '谁说了什么、机器人回了什么、后台在干什么，全在这一页。左边是收发的原文，右边是实时日志。': 'Who said what, what the bot replied, what runs in the background. Transcripts left, live logs right.',
+  '把手机上的通知转给电脑：短信、微信、QQ、快递取件码都行。手机端装一个转发 App，把这里的地址填进去就通了。': 'Forward phone notifications to the PC: SMS, WeChat, QQ, parcel codes and more. Install a forwarding app and paste this address.',
+  '细项、路径、原始配置、日志。看不懂的别改 —— 留空就是默认值，斜杠后面写的是默认值。': 'Fine-grained options, paths, raw configs, logs. Empty means default; the value after the slash is the default.',
+  '群聊、私聊、人格与工具': 'Group & private chat, persona, tools',
+  '登录、Hook 与机器人': 'Sign-in, hooks, bots',
+  '简易': 'Simple',
+  '深色': 'Dark',
+  '浅色': 'Light',
+  '设置': 'Settings',
+  '联系': 'Contact',
+  '设置：语言、字体大小、开机自启': 'Settings: language, font size, launch at login',
+  '联系方式与仓库地址': 'Contact info & repository',
+  '语言': 'Language',
+  '字体大小': 'Font size',
+  '小': 'Small',
+  '标准': 'Default',
+  '大': 'Large',
+  '特大': 'Extra large',
+  '外观': 'Theme',
+  '开机自启动': 'Launch at login',
+  '完成': 'Done',
+  '复制': 'Copy',
+  '写邮件': 'Email',
+  '打开': 'Open',
+  '已复制': 'Copied',
+  '联系与仓库': 'Contact & Repository',
+  '邮箱': 'Email',
+  'GitHub 仓库': 'GitHub repository',
+  '遇到问题、想提需求或参与开发，欢迎通过下面任意方式联系：': 'Questions, feature requests or contributions — reach me any of these ways:',
+  '常用界面文案支持英文，面板内的详细说明暂为中文，会逐步补齐。': 'Common UI strings are translated; detailed hints inside panels remain Chinese for now.',
+  '开机自启已开启，开机后会自动打开控制台并按「看护」开关拉起服务。': 'On — the console opens at login and guarded services are started.',
+  '开机自启已关闭。开启后安装版会在登录时自动打开控制台。': 'Off. Turn on to open the console automatically at login (installed builds).',
+  '当前环境不支持开机自启（开发模式直接跑源码没有安装信息）。': 'Not available here: dev mode running from source has no install info.',
+  '已开启开机自启': 'Launch at login enabled',
+  '已关闭开机自启': 'Launch at login disabled',
+  '保存失败': 'Save failed',
+  '复制不了，已选中文字，请手动 Ctrl+C': 'Could not copy — text selected, press Ctrl+C'
+};
+
+const uiLang = () => (document.documentElement.dataset.lang === 'en' ? 'en' : 'zh');
+
+/** 界面文案翻译：en 模式查词典，没收录就返回中文原句 */
+function t(s) {
+  if (uiLang() !== 'en') return s;
+  return I18N_EN[s] ?? s;
+}
+
+/** 把 data-i18n 标记的静态文案整体换一遍；JS 动态文案（导航/底栏）单独刷 */
+function applyI18n() {
+  const en = uiLang() === 'en';
+  $$('[data-i18n]').forEach((el) => {
+    if (el.dataset.origText === undefined) el.dataset.origText = el.textContent;
+    el.textContent = en ? (I18N_EN[el.dataset.i18n] ?? el.dataset.origText) : el.dataset.origText;
+  });
+  document.documentElement.lang = en ? 'en' : 'zh-CN';
+  renderNav();
+  applyModeLabel();
+  applyFootLabels();
+}
+
+/** 底栏按钮的小字与悬停说明 */
+function applyFootLabels() {
+  $('#settings-label').textContent = t('设置');
+  $('#contact-label').textContent = t('联系');
+  $('#btn-settings').title = t('设置：界面模式、语言、字体大小、外观、开机自启');
+  $('#btn-contact').title = t('联系方式与仓库地址');
+}
+
+/* 字号：整体 zoom（布局大量用 px，改根字号无效）。1 = 标准，不写内联样式 */
+function applyFont(scale) {
+  const v = Number(scale) || 1;
+  document.documentElement.style.zoom = v === 1 ? '' : String(v);
+  try {
+    localStorage.setItem('dhm-font', String(v));
+  } catch { /* 写不了就本次会话内生效 */ }
+}
+
+/* ── 设置面板：改动即时生效，没有「保存」按钮 ────────── */
+
+function autostartHintFor(supported, on) {
+  if (!supported) return t('当前环境不支持开机自启（开发模式直接跑源码没有安装信息）。');
+  return on
+    ? t('开机自启已开启，开机后会自动打开控制台并按「看护」开关拉起服务。')
+    : t('开机自启已关闭。开启后安装版会在登录时自动打开控制台。');
+}
+
+function openSettings() {
+  $('#set-lang').value = uiLang();
+  $('#set-mode').value = uiMode();
+  $('#set-font').value = localStorage.getItem('dhm-font') || '1';
+  $('#set-theme').value = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+  $('#settings-mask').classList.add('is-on');
+  // 自启状态每次打开都现查：automation.json 可能被总览页改过
+  api('/api/automation')
+    .then((a) => {
+      const supported = a.autostart?.supported !== false;
+      const box = $('#set-autostart');
+      box.checked = supported && a.launchAtLogin === true;
+      box.disabled = !supported;
+      $('#set-autostart-hint').textContent = autostartHintFor(supported, box.checked);
+    })
+    .catch(() => {});
+  api('/api/state')
+    .then((s) => {
+      $('#set-about').textContent = `DualHabitat Matrix 桌面端 v${s.version ?? '?'}`;
+    })
+    .catch(() => {});
+}
+
+$('#btn-settings').addEventListener('click', openSettings);
+$('#settings-done').addEventListener('click', () => $('#settings-mask').classList.remove('is-on'));
+$('#settings-mask').addEventListener('click', (e) => {
+  if (e.target.id === 'settings-mask') $('#settings-mask').classList.remove('is-on');
+});
+
+$('#set-lang').addEventListener('change', (e) => {
+  const lang = e.target.value === 'en' ? 'en' : 'zh';
+  try {
+    localStorage.setItem('dhm-lang', lang);
+  } catch { /* 写不了就本次会话内生效 */ }
+  document.documentElement.dataset.lang = lang;
+  applyI18n();
+  toast(lang === 'en' ? 'Switched to English' : '已切换到中文');
+});
+
+$('#set-font').addEventListener('change', (e) => applyFont(e.target.value));
+$('#set-theme').addEventListener('change', (e) => applyTheme(e.target.value));
+
+$('#set-autostart').addEventListener('change', async (e) => {
+  const on = e.target.checked;
+  const r = await post('/api/automation', { launchAtLogin: on });
+  if (r.ok === false) {
+    e.target.checked = !on;
+    toast(r.error ?? t('保存失败'));
+    return;
+  }
+  $('#set-autostart-hint').textContent = autostartHintFor(r.autostart?.supported !== false, on);
+  toast(on ? t('已开启开机自启') : t('已关闭开机自启'));
+});
+
+/* ── 联系面板：邮箱 + 仓库地址 ───────────────────────── */
+
+$('#btn-contact').addEventListener('click', () => $('#contact-mask').classList.add('is-on'));
+$('#contact-done').addEventListener('click', () => $('#contact-mask').classList.remove('is-on'));
+$('#contact-mask').addEventListener('click', (e) => {
+  if (e.target.id === 'contact-mask') $('#contact-mask').classList.remove('is-on');
+});
+
+$$('.contact-copy').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const text = btn.dataset.copy ?? '';
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(t('已复制'));
+    } catch {
+      // 兜底：选中文本让人手动 Ctrl+C（正常桌面端是 http://127.0.0.1，clipboard 可用）
+      const code = btn.parentElement.querySelector('.contact-value');
+      if (code) {
+        const range = document.createRange();
+        range.selectNodeContents(code);
+        const sel = getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+      toast(t('复制不了，已选中文字，请手动 Ctrl+C'));
+    }
+  });
+});
+
+/* 简易 / 高级 */
+const uiMode = () => (document.documentElement.dataset.mode === 'advanced' ? 'advanced' : 'simple');
+
+function applyModeLabel() {
+  const sel = $('#set-mode');
+  if (sel) sel.value = uiMode();
+}
+$('#set-mode').addEventListener('change', (e) => {
+  const next = e.target.value === 'advanced' ? 'advanced' : 'simple';
+  try {
+    localStorage.setItem('dhm-mode', next);
+  } catch { /* 写不了就本次会话内生效 */ }
+  document.documentElement.dataset.mode = next;
+  applyModeLabel();
+  toast(next === 'advanced' ? '已切到高级：全部字段都露出来了' : '已切到简易：技术字段收起来了');
+});
+applyModeLabel();
+
+/* 平台 */
+const PLATFORM_KEY = 'dhm-platform';
+const platform = () => (document.documentElement.dataset.platform === 'wechat' ? 'wechat' : 'qq');
+
+/** 两套导航 —— 切平台连菜单都不一样，一眼能认出来。
+ *  排序按常用度：不配模型跑不起来 → 调人格 → 看消息 → 远程 → 少用的沉底。
+ *  总览不在导航里：它是外层首页，进去之前侧边栏根本不出现。 */
+const NAV = {
+  qq: [
+    ['status', '当前状态'],
+    ['chat', '对话与人格'],
+    ['exchange', '交流空间'],
+    ['messages', '消息与任务'],
+    ['models', 'API 与模型'],
+    ['phone', '链接手机'],
+    ['backend', '后端'],
+    ['advanced', '高级']
+  ],
+  wechat: [
+    ['status', '当前状态'],
+    ['wx-overview', '登录'],
+    ['chat', '对话与人格'],
+    ['exchange', '交流空间'],
+    ['messages', '消息与任务'],
+    ['models', 'API 与模型'],
+    ['phone', '链接手机'],
+    ['hook', 'Hook'],
+    ['backend', '后端'],
+    ['advanced', '高级']
+  ]
+};
+
+const pagesOf = (p) => NAV[p].map(([page]) => page);
+
+let currentPage = 'overview';
+
+/* 模型两块配置的状态。声明放这里是因为 applyPlatform 会用到，
+   放到函数定义旁边会踩 let 的暂时性死区。 */
+let modelProfiles = { qq: {}, wechat: {} };
+let modelProfilesLoaded = false;
+
+function renderNav() {
+  const items = NAV[platform()];
+  $('#nav').innerHTML = items
+    .map(
+      ([page, label]) =>
+        `<button class="nav-item${page === currentPage ? ' is-active' : ''}" data-page="${page}"><span class="nav-dot"></span><span class="nav-label">${t(label)}</span>${
+          page === 'overview' ? '<span class="nav-badge" id="nav-badge-update" hidden>新</span>' : ''
+        }</button>`
+    )
+    .join('');
+}
+
+function applyPlatform(value, opts = {}) {
+  const prev = platform();
+  const next = value === 'wechat' ? 'wechat' : 'qq';
+  // 切平台前先把正在编辑的模型配置收进草稿 —— 平台一换，草稿就该指向另一份
+  if (modelProfilesLoaded && prev !== next) {
+    try { stashAllSlots(); } catch { /* 模型页还没渲染，跳过 */ }
+  }
+  document.documentElement.dataset.platform = next;
+
+  const wx = next === 'wechat';
+  $('#pf-ribbon-text').textContent = wx ? '微信 · iLink 通道' : 'QQ · NapCat 通道';
+  document.title = wx ? 'DualHabitat Matrix · 微信' : 'DualHabitat Matrix · QQ';
+
+  // 当前页在新平台里没有（QQ 没有「登录」，微信没有独立总览）就回该平台第一页
+  if (currentPage !== 'overview' && !pagesOf(next).includes(currentPage)) currentPage = NAV[next][0][0];
+  renderNav();
+
+  $$('#platform-switch .pf-btn').forEach((b) => {
+    const on = b.dataset.platform === next;
+    b.classList.toggle('is-active', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+  try {
+    localStorage.setItem(PLATFORM_KEY, next);
+  } catch { /* 同上 */ }
+  // 微信那边没有 QQ 号，占位文字跟着变
+  if ($('#ownerQQ')) $('#ownerQQ').placeholder = wx ? '微信号 / wxid' : '你的 QQ 号';
+  if ($('#allowPrivate')) $('#allowPrivate').placeholder = wx ? '微信号，逗号分隔' : 'QQ 号，逗号分隔';
+  if ($('#denyPrivate')) $('#denyPrivate').placeholder = wx ? '微信号，逗号分隔' : 'QQ 号，逗号分隔';
+  if ($('#workspaceTitle')) $('#workspaceTitle').placeholder = wx ? '微信' : '聊天';
+  if ($('#send-target')) $('#send-target').placeholder = wx ? '微信用户 id（wxid…）' : 'QQ 号';
+  if ($('#send-target-hint')) {
+    $('#send-target-hint').textContent = wx
+      ? '从聊过的联系人或已保存的会话里挑，也可以直接填 id。'
+      : '点右边能从好友/群列表里挑，也可以直接填号。';
+  }
+  if ($('#send-platform-hint')) {
+    $('#send-platform-hint').textContent = wx ? '发给微信用户（要先扫码登录过）' : '发给 QQ 好友（NapCat 得在跑）';
+  }
+  if ($('#btn-send-dry')) $('#btn-send-dry').hidden = !wx;
+
+  // 模型配置按平台分开存，切完要重新填一遍表单
+  if (modelProfilesLoaded && prev !== next) {
+    fillAllSlots();
+  }
+
+  // 同一个页面两套副标题（标题统一叫「对话与人格」）
+  const chatP = $('#page-chat .page-head p');
+  if (chatP) {
+    chatP.textContent = wx
+      ? '微信这条线的人格、注入频率、谁能对话。和 QQ 完全是两份配置。'
+      : '谁能让机器人回话、用什么人格回。QQ 和微信各存一份配置，上面的平台按钮切的就是这一页。';
+  }
+
+  // 转场：微信从右边进来，QQ 从左边进来
+  if (opts.animate && prev !== next) {
+    const main = $('#main');
+    main.classList.remove('pf-in-right', 'pf-in-left');
+    void main.offsetWidth;
+    main.classList.add(wx ? 'pf-in-right' : 'pf-in-left');
+    setTimeout(() => main.classList.remove('pf-in-right', 'pf-in-left'), 360);
+  }
+}
+
+$('#nav').addEventListener('click', (e) => {
+  const b = e.target.closest('.nav-item');
+  if (b?.dataset.page) showPage(b.dataset.page);
+});
+
+$$('#platform-switch .pf-btn').forEach((b) => {
+  b.addEventListener('click', () => {
+    const next = b.dataset.platform;
+    if (platform() === next) return;
+    applyPlatform(next, { animate: true });
+    showPage(currentPage === 'overview' ? NAV[next][0][0] : currentPage);
+    toast(next === 'wechat' ? '已切到微信 · iLink' : '已切到 QQ · NapCat');
+  });
+});
+
+$('#nav-back')?.addEventListener('click', () => showPage('overview'));
+
+// 首页两张通道卡：点进去直接落在该平台第一页（API 与模型）
+$$('.home-card').forEach((card) => {
+  card.addEventListener('click', () => {
+    const target = card.dataset.enter === 'wechat' ? 'wechat' : 'qq';
+    applyPlatform(target, { animate: true });
+    showPage(NAV[target][0][0]);
+  });
+});
+
+function showPage(name) {
+  const home = name === 'overview';
+  // 总览是外层首页，不在导航列表里；其它页必须在当前平台的列表内
+  if (!home && !pagesOf(platform()).includes(name)) name = NAV[platform()][0][0];
+  currentPage = name;
+
+  const target = home ? 'overview' : name;
+  $$('#nav .nav-item').forEach((b) => b.classList.toggle('is-active', b.dataset.page === name));
+  $$('.page').forEach((p) => {
+    p.hidden = p.id !== `page-${target}`;
+  });
+  // 没进通道之前侧边栏不出现 —— 总览是独立的一层
+  document.documentElement.dataset.view = home ? 'home' : 'platform';
+  $('#main').scrollTop = 0;
+  try {
+    localStorage.setItem(`${PLATFORM_KEY}-page-${platform()}`, name);
+  } catch { /* 同上 */ }
+  loadPage(name);
+}
+
+function loadPage(name) {
+  if (name === 'overview') return loadOverview();
+  if (name === 'status') return renderStatus();
+  if (name === 'wx-overview') return loadWxOverview();
+  if (name === 'hook') return loadHook();
+  if (name === 'models') return loadModels();
+  if (name === 'backend') return loadBackend();
+  if (name === 'chat') return loadChat();
+  if (name === 'messages') return loadMessages();
+  if (name === 'exchange') return loadExchange();
+  if (name === 'phone') return loadPhone();
+  if (name === 'advanced') return loadAdvanced();
+  return null;
+}
+
+applyPlatform(document.documentElement.dataset.platform);
+
+/* 状态轮询：侧栏那颗灯、总览的服务卡都靠它 */
+let S = null;
+
+async function refreshState() {
+  const next = await api('/api/state');
+  if (!next || next.ok === false) return;
+  S = next;
+  renderShell();
+  if (currentPage === 'overview') {
+    renderOverview();
+    renderHomeCards();
+  } else if (currentPage === 'wx-overview') {
+    renderWxOverview();
+  } else if (currentPage === 'status') {
+    // 状态页跟着轮询重画，运行时长才会自己走
+    renderStatus();
+  }
+}
+
+function renderShell() {
+  if (!S) return;
+  const running = [S.napcat?.reachable, S.bridge?.running, S.wechat?.running].filter(Boolean).length;
+  const led = $('#led');
+  led.className = `led${running > 0 ? ' on' : ''}`;
+  $('#led-text').textContent = running > 0 ? `${running} 个 BOT 进程运行中` : '无 BOT 进程';
+  $('#build-tag').textContent = `v${S.version ?? '?'}`;
+
+  // 有新版本时侧栏「总览」上挂个小角标 —— 只按「没提醒过的版本」算
+  const appNew = S.updates?.app?.found && S.updates.app.found !== S.updates.app.reminded;
+  const ncNew = S.updates?.napcat?.found && S.updates.napcat.found !== S.updates.napcat.reminded;
+  // 通道式改版后导航里没有 overview 项了，角标挂不到那 —— 元素不存在就跳过，
+  // 否则这里每 6 秒抛一次 TypeError，总览页的状态灯永远刷不动。
+  const badge = $('#nav-badge-update');
+  if (badge) badge.hidden = !(appNew || ncNew);
+}
+
+setInterval(refreshState, 6000);
+
+/* 日志流（高级页用，但一直连着：总览的「最近动态」也吃它） */
+const SOURCE_LABEL = { napcat: 'NapCat', bridge: '桥接', wechat: '微信', phone: '手机', app: '软件' };
+const PANE_MAX = 1200;
+const panes = {};
+
+/** 简易模式下把日志里的行话翻一下。高级模式也翻 —— 引擎的牌子名不该出现在界面上。 */
+const ALWAYS_RULES = [
+  [/OpenCode 隔离实例/g, '模型 API 服务'],
+  [/OpenCode 本地实例/g, '模型 API 服务'],
+  [/OpenCode 实例/g, '模型 API 状态'],
+  [/OpenCode 后端/g, '模型 API'],
+  [/OpenCode/g, '模型 API'],
+  [/opencode\.json/g, '模型配置文件'],
+  [/opencode\.db/g, '会话库'],
+  [/opencode-cli\.exe/g, '命令行程序'],
+  [/@opencode\/client/g, '模型 API 客户端'],
+  [/OPENCODE_?[A-Z_]*/g, '环境变量'],
+  [/([\\/])opencode([\\/])/g, '$1运行数据$2'],
+  [/DSH/g, '模型 API']
+];
+const SIMPLE_RULES = [
+  [/模型链/g, '模型队列'],
+  [/链头/g, '首选模型'],
+  [/候选/g, '备用模型'],
+  [/熔断中/g, '额度用完·已暂停'],
+  [/熔断/g, '暂停使用'],
+  [/换模型重试/g, '换备用模型重试'],
+  [/会话繁忙，暂存唤醒原因/g, '上一条还没回完，这条先记下了'],
+  [/暂存唤醒原因/g, '先记下消息'],
+  [/cf-shim/g, '网络组件'],
+  [/（pid=\d+ version=[\d.]+）/g, ''],
+  [/bailian\//g, ''],
+  [/#none/g, '（不思考）'],
+  [/#low/g, '（快答）'],
+  [/#medium/g, '（深思）'],
+  [/#high/g, '（深思）']
+];
+
+function plainify(text) {
+  let out = String(text ?? '');
+  for (const [re, to] of ALWAYS_RULES) out = out.replace(re, to);
+  if (uiMode() === 'simple') for (const [re, to] of SIMPLE_RULES) out = out.replace(re, to);
+  return out;
+}
+
+/* 交流空间的「只看消息」：日志里跟收发有关的行才留下。
+ * 留一份环形缓冲，勾选状态一变就能整块重画 —— 否则只对新来的行生效，
+ * 用户会觉得这个勾没起作用。 */
+const EX_MSG_RE = /(管理员|群友|对方|agent 回复|主动发送|收到消息|发送消息|消息已入未读|回复|私聊|群聊)/;
+const EX_MSG_ONLY = () => $('#ex-only-msg')?.checked === true;
+const EX_BUF_MAX = 400;
+const exLogBuf = [];
+
+/** 造一行日志。withTag 时在前面挂来源标签（交流空间那格要）。 */
+function makeLogLine({ source, level, time, text }, withTag) {
+  const line = document.createElement('div');
+  line.className = `line${level === 'err' ? ' line-err' : level === 'sys' ? ' line-sys' : ''}`;
+  if (withTag) {
+    const tag = document.createElement('span');
+    tag.className = `src src-${source}`;
+    tag.textContent = SOURCE_LABEL[source];
+    line.appendChild(tag);
+  }
+  line.appendChild(document.createTextNode(`[${time}] ${text}`));
+  return line;
+}
+
+/** 按当前勾选状态整块重画交流空间的日志窗格 */
+function renderExLog() {
+  const box = panes.exchange;
+  if (!box) return;
+  const onlyMsg = EX_MSG_ONLY();
+  box.replaceChildren();
+  for (const row of exLogBuf) {
+    if (onlyMsg && !EX_MSG_RE.test(row.text)) continue;
+    box.appendChild(makeLogLine(row, true));
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+function appendLog(entry) {
+  const source = SOURCE_LABEL[entry.source] ? entry.source : 'app';
+  const time = new Date(entry.t).toLocaleTimeString('zh-CN', { hour12: false });
+  const text = plainify(entry.line);
+  const row = { source, level: entry.level, time, text };
+
+  // 交流空间那格是「所有来源 + 来源标签」，跟总览一样按 all 处理
+  const targets = ['all', source];
+  if (panes.exchange && (!EX_MSG_ONLY() || EX_MSG_RE.test(text))) targets.push('exchange');
+
+  exLogBuf.push(row);
+  while (exLogBuf.length > EX_BUF_MAX) exLogBuf.shift();
+
+  for (const pane of targets) {
+    const box = panes[pane];
+    if (!box) continue;
+    box.appendChild(makeLogLine(row, pane !== source));
+    while (box.childElementCount > PANE_MAX) box.removeChild(box.firstElementChild);
+  }
+
+  // 总览页的「最近动态」只留最后 8 行
+  const ov = $('#ov-log');
+  if (ov) {
+    const line = document.createElement('div');
+    line.className = `line${entry.level === 'err' ? ' line-err' : entry.level === 'sys' ? ' line-sys' : ''}`;
+    line.textContent = `[${time}] ${SOURCE_LABEL[source]} · ${text}`;
+    ov.appendChild(line);
+    while (ov.childElementCount > 8) ov.removeChild(ov.firstElementChild);
+    ov.scrollTop = ov.scrollHeight;
+  }
+
+  if ($('#autoScroll')?.checked) {
+    for (const pane of ['all', source]) {
+      const box = panes[pane];
+      if (box && box.offsetParent !== null) box.scrollTop = box.scrollHeight;
+    }
+  }
+}
+
+function connectLogs() {
+  const es = new EventSource('/api/logs');
+  es.onmessage = (ev) => {
+    try {
+      appendLog(JSON.parse(ev.data));
+    } catch { /* 忽略坏帧 */ }
+  };
+  es.onerror = () => {
+    es.close();
+    setTimeout(connectLogs, 2000);
+  };
+}
+
+/* 日志窗格：DOM 就绪后建索引 */
+function initLogPanes() {
+  for (const el of $$('.term-body .log')) panes[el.dataset.pane] = el;
+  panes.all = $('#log-all');
+  panes.napcat = $('#log-napcat');
+  panes.bridge = $('#log-bridge');
+  panes.wechat = $('#log-wechat');
+  panes.app = $('#log-app');
+  // 交流空间那格不叫 log-*，单独挂一次
+  if ($('#ex-log')) panes.exchange = $('#ex-log');
+
+  $$('#term-tabs .term-tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const pane = btn.dataset.pane;
+      $$('#term-tabs .term-tab').forEach((b) => b.classList.toggle('is-active', b === btn));
+      $$('.term-body .log').forEach((el) => el.classList.toggle('is-active', el.dataset.pane === pane));
+      if ($('#autoScroll').checked && panes[pane]) panes[pane].scrollTop = panes[pane].scrollHeight;
+    });
+  });
+
+  $('#btn-clear-log').addEventListener('click', () => {
+    const pane = $('#term-tabs .term-tab.is-active')?.dataset.pane ?? 'all';
+    if (panes[pane]) panes[pane].textContent = '';
+  });
+}
+
+/* ── 3. 总览 ────────────────────────────────────────── */
+
+function setLed(sel, state) {
+  const el = $(sel);
+  if (!el) return;
+  el.className = `led${state ? ` ${state}` : ''}`;
+}
+
+/* ── 当前状态 ──────────────────────────────────────── */
+
+/** 毫秒 → 「3 小时 12 分」这种人话 */
+function fmtDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d) return `${d} 天 ${h} 小时`;
+  if (h) return `${h} 小时 ${m} 分`;
+  if (m) return `${m} 分`;
+  return `${s} 秒`;
+}
+
+function renderStatus() {
+  if (!S) return;
+  const wx = platform() === 'wechat';
+
+  const napcat = S.napcat?.reachable === true;
+  const bridge = S.bridge?.running === true;
+  const wechat = S.wechat?.running === true;
+
+  // 这条通道算不算"正常启用"
+  const ok = wx ? wechat : bridge;
+  const partial = !ok && !wx && napcat;
+
+  const dot = $('#status-dot');
+  if (dot) dot.className = `status-dot${ok ? ' is-ok' : partial ? ' is-warn' : ''}`;
+
+  const title = $('#status-title');
+  if (title) title.textContent = ok ? '正常运行' : partial ? '部分就绪' : '未启动';
+
+  const sub = $('#status-sub');
+  if (sub) {
+    sub.textContent = ok
+      ? wx
+        ? '微信通道在跑，消息能收发'
+        : '桥接在跑，消息能收发'
+      : partial
+        ? '通道连上了，但桥接没起 —— 还不会回话'
+        : '未启动。可在下方「服务」里启动，或回首页一键全开';
+  }
+
+  // 运行时长只看 BOT（桥接/微信）。控制台启动时间与 BOT 无关，不再拿来充数
+  const startedAt = wx ? S.wechat?.startedAt : S.bridge?.startedAt;
+  const chanMs = Number(startedAt);
+  const upLabel = $('#status-uptime-label');
+  const up = $('#status-uptime');
+  if (Number.isFinite(chanMs) && chanMs > 0) {
+    if (upLabel) upLabel.textContent = wx ? '微信已运行' : '桥接已运行';
+    if (up) up.textContent = fmtDuration(Date.now() - chanMs);
+  } else {
+    if (upLabel) upLabel.textContent = 'BOT 未运行';
+    if (up) up.textContent = '—';
+  }
+
+  // 两档模型各自能不能用
+  const slots = S.modelSlots?.[platform()] ?? {};
+  const ready = (x) => !!(x && x.baseUrl && x.model);
+  const chatOk = ready(slots.chat);
+  const workOk = ready(slots.work);
+
+  // 两档都没配时，桥接其实还在用模型池顶着 —— 别谎报「未配置」
+  const poolN = S.pool?.enabled ? (S.pool.free ?? 0) + (S.pool.paid ?? 0) : 0;
+
+  const mode = $('#status-mode');
+  if (mode) {
+    mode.textContent = workOk
+      ? '闲聊 + 指令'
+      : chatOk
+        ? '普通聊天'
+        : poolN
+          ? `普通聊天 · 池 ${poolN}`
+          : '未配置';
+  }
+
+  const slotBox = $('#status-slots');
+  if (slotBox) {
+    const card = (name, data, good, note) => `
+      <div class="status-slot${good ? ' is-ok' : ''}">
+        <div class="status-slot-head">
+          <span class="status-slot-name">${name}</span>
+          <span class="status-slot-tag">${good ? '已配置' : '未配置'}</span>
+        </div>
+        <div class="status-slot-model">${good ? esc(data.model) : poolN ? '模型池' : '—'}</div>
+        <div class="status-slot-note">${note}</div>
+      </div>`;
+    // 两档的差别要一直看得见，所以说明文字不随配置状态变
+    slotBox.innerHTML =
+      card('普通聊天', slots.chat ?? {}, chatOk, '只说话，不给工具') +
+      card('LLMs', slots.work ?? {}, workOk, '能执行指令、读文件');
+  }
+
+  const svcBox = $('#status-services');
+  if (svcBox) {
+    const row = (svc, act, name, on, note) => `
+      <div class="status-svc">
+        <span class="led${on ? ' on' : ''}"></span>
+        <span class="status-svc-name">${name}</span>
+        <span class="status-svc-state">${on ? '运行中' : '未运行'}</span>
+        <span class="status-svc-note">${note}</span>
+        <span class="status-svc-actions">
+          <button class="btn btn-sm${on ? '' : ' btn-primary'}" data-svc="${svc}" data-act="${act}">${on ? '停止' : '启动'}</button>
+        </span>
+      </div>`;
+    const chanBtn = (act, label) =>
+      `<button class="btn btn-sm${act === 'start' && !ok ? ' btn-primary' : ''}" data-svc="${wx ? 'wechat' : 'bridge'}" data-act="${act}">${label}</button>`;
+    svcBox.innerHTML = (wx
+      ? row('wechat', wechat ? 'stop' : 'start', '微信通道', wechat, 'iLink 收发消息')
+      : row('napcat', napcat ? 'stop' : 'start', 'NapCat', napcat, 'QQ 登录通道') +
+        row('bridge', bridge ? 'stop' : 'start', 'QQ 桥接', bridge, '收发消息、调模型'))
+      + `<div class="status-svc-chan">
+          ${chanBtn('start', '启动本通道')}
+          ${chanBtn('stop', '停止本通道')}
+          <span class="hint">只影响当前通道；首页「一键全开」不受影响。</span>
+        </div>`;
+  }
+}
+
+/** 首页两张通道卡的状态灯。数据来自同一份 /api/state，不额外请求。 */
+function renderHomeCards() {
+  if (!S) return;
+
+  const qqLed = $('#home-led-qq');
+  if (qqLed) {
+    const napcat = S.napcat?.reachable === true;
+    const bridge = S.bridge?.running === true;
+    qqLed.className = `led${bridge || napcat ? ' on' : ''}`;
+    $('#home-state-qq').textContent = bridge ? '运行中' : napcat ? '通道就绪' : '未运行';
+  }
+
+  const wxLed = $('#home-led-wx');
+  if (wxLed) {
+    const running = S.wechat?.running === true;
+    const logged = S.wechat?.loggedIn === true;
+    wxLed.className = `led${running || logged ? ' on' : ''}`;
+    $('#home-state-wx').textContent = logged ? '已登录' : running ? '等待扫码' : '未登录';
+  }
+}
+
+function renderOverview() {
+  if (!S) return;
+  const n = S.napcat ?? {};
+  const b = S.bridge ?? {};
+  const m = S.matrix ?? {};
+
+  /* NapCat */
+  const napcatOn = n.reachable === true;
+  setLed('#led-napcat', napcatOn ? 'on' : '');
+  $('#svc-napcat').classList.toggle('is-on', napcatOn);
+  $('#state-napcat').textContent = napcatOn ? '已连接' : n.dir ? '未连接' : '没配目录';
+  $('#meta-napcat').textContent = n.dir ? `${n.port} 端口 · QQ ${n.qq || '未填'}${n.bundled ? ' · 自带版' : ''}` : '去「高级 → 路径与端口」填 NapCat 目录';
+
+  /* QQ 桥接 */
+  const bridgeOn = b.running === true || Boolean(b.externalPid);
+  setLed('#led-bridge', bridgeOn ? 'on' : '');
+  $('#svc-bridge').classList.toggle('is-on', bridgeOn);
+  $('#state-bridge').textContent = b.running ? '运行中' : b.externalPid ? '运行中（别处启动）' : '未运行';
+  $('#meta-bridge').textContent = bridgeOn
+    ? `pid ${b.pid ?? b.externalPid} · 起于 ${fmtTime(b.startedAt)}${b.exitCode != null ? ` · 上次退出 code ${b.exitCode}` : ''}`
+    : '桥接没跑，QQ 收不到也回不了';
+
+  /* 模型 API */
+  setLed('#led-matrix', m.alive ? 'on' : '');
+  $('#svc-matrix').classList.toggle('is-on', Boolean(m.alive));
+  $('#state-matrix').textContent = m.alive ? '运行中' : '未运行';
+  $('#meta-matrix').textContent = m.alive
+    ? `${m.url ?? '—'}${m.version ? ` · v${m.version}` : ''}`
+    : '桥接启动时会自己拉起它';
+
+  /* 看护开关 */
+  const watch = S.automation?.watch ?? {};
+  $$('[data-watch]').forEach((el) => {
+    el.checked = watch[el.dataset.watch] === true;
+  });
+
+
+  /* 更新横幅 */
+  const appNew = S.updates?.app?.found && S.updates.app.found !== S.updates.app.reminded;
+  $('#banner-app').hidden = !appNew;
+  if (appNew) {
+    $('#banner-app-title').textContent = `软件有新版本 ${S.updates.app.found}（当前 v${S.version}）`;
+    $('#banner-app-sub').textContent = '下载完成后本程序会自动关闭并安装，装完自动重开。';
+  }
+  const ncNew = S.updates?.napcat?.found && S.updates.napcat.found !== S.updates.napcat.reminded;
+  $('#banner-napcat').hidden = !ncNew;
+  if (ncNew) {
+    $('#banner-napcat-title').textContent = `NapCat 有新版本 ${S.updates.napcat.found}`;
+    $('#banner-napcat-sub').textContent = '会下载到旁边一个新目录再切过去，旧目录保留，装完重启 NapCat。';
+  }
+
+  // 精简安装包：本机没有 NapCat，也没自带 —— 直接给一个下载入口，别让人自己去翻发布页
+  const ncMissing = !S.napcat?.bundled && !S.napcat?.dir && !napcatInstallSkipped;
+  $('#banner-napcat-install').hidden = !ncMissing;
+
+  renderWizard();
+}
+
+/* ── 微信总览 ────────────────────────────────────────── */
+let hookCache = null;
+
+async function loadWxOverview() {
+  await refreshState();
+  hookCache = await api('/api/wechat/hook');
+  renderWxOverview();
+}
+
+function renderWxOverview() {
+  if (!S) return;
+  const w = S.wechat ?? {};
+  const on = w.running === true;
+
+  setLed('#wxo-led', w.loggedIn ? 'on' : on ? 'warn pulse' : '');
+  $('#wxo-state').textContent = w.loggedIn ? '已登录' : on ? '等待扫码' : '未启动';
+  $('#wxo-meta').textContent = w.loggedIn
+    ? `机器人 ${w.botId ?? '—'} · 登录于 ${w.loginTime ? new Date(w.loginTime).toLocaleString('zh-CN') : '—'}`
+    : on
+      ? '二维码在右侧，请使用微信扫码；完成后状态将变为「已登录」'
+      : '启动后扫码登录；微信与 QQ 相互独立';
+
+  // 二维码面板是从 QQ 总览挪过来的，id 没变
+  const qrBox = $('#wx-qr-panel');
+  if (w.qr) {
+    qrBox.hidden = false;
+    $('#wx-qr-img').src = w.qr;
+    $('#wx-qr-status').textContent = w.qrStatus === 'scanned' ? '已扫码，请在手机上确认' : '等待扫码（二维码四分钟过期）';
+  } else {
+    qrBox.hidden = true;
+  }
+
+  const h = hookCache && hookCache.ok !== false ? hookCache : null;
+  if (h) {
+    const enabled = h.enabled === true;
+    const badge = $('#wxo-hook-state');
+    badge.textContent = enabled ? '已开启' : '未开启';
+    badge.className = `badge${enabled ? ' accent' : ''}`;
+    $('#wxo-hook-url').textContent = h.url || '未配置';
+    $('#wxo-hook-secret').textContent = h.secret ? '已设置' : '未设置';
+    $('#wxo-hook-events').textContent = (h.events ?? []).join(' / ') || '—';
+  }
+}
+
+$('#wxo-refresh').addEventListener('click', () => loadWxOverview());
+$('#wxo-goto-hook').addEventListener('click', () => showPage('hook'));
+$('#wxo-hook-test').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '发送中…', async () => {
+    const r = await post('/api/wechat/hook/test');
+    if (r.ok === false) return setResult('#wxo-hook-result', r.error ?? '发送失败', 'err');
+    setResult('#wxo-hook-result', `对端返回 HTTP ${r.status}，连接正常`, 'ok');
+  });
+});
+
+function renderWizard() {
+  if (!S) return;
+  const hasKey = (S.secrets ?? []).some((s) => s.set);
+  const hasSource = Boolean(S.backend?.modelApi?.baseUrl && S.backend?.modelApi?.model);
+  const running = Boolean(S.bridge?.running || S.wechat?.running);
+  const steps = [
+    {
+      title: '让 QQ 能登录',
+      desc: S.napcat?.reachable ? 'NapCat 已连上' : '配好 NapCat 目录后点「启动」，再用面板扫码',
+      done: S.napcat?.reachable === true,
+      go: () => showPage('advanced')
+    },
+    {
+      title: '接一个模型',
+      desc: hasKey ? '已经有 API key 了' : '在「API 与模型」页粘一个 key 进来',
+      done: hasKey || hasSource,
+      go: () => showPage('models')
+    },
+    {
+      title: '选模型',
+      desc: hasSource ? `当前：${S.backend.modelApi.model}` : '选厂商 + 模型名，或者把模型加进模型池',
+      done: hasSource,
+      go: () => showPage('models')
+    },
+    {
+      title: '把服务开起来',
+      desc: running ? '已经有服务在跑了' : '点上面的「一键全开」',
+      done: running,
+      go: () => $('#btn-up').click()
+    }
+  ];
+
+  const firstOpen = steps.findIndex((s) => !s.done);
+  $('#wizard').innerHTML = steps
+    .map((s, i) => {
+      const cls = s.done ? 'done' : i === firstOpen ? 'current' : '';
+      return `<div class="wizard-step ${cls}">
+        <span class="wizard-num">${s.done ? '✓' : i + 1}</span>
+        <div class="wizard-body">
+          <strong>${esc(s.title)}</strong>
+          <span>${esc(s.desc)}</span>
+        </div>
+        ${s.done ? '' : `<button class="btn btn-sm btn-ghost" data-wizard="${i}">去这一步</button>`}
+      </div>`;
+    })
+    .join('');
+
+  $$('#wizard [data-wizard]').forEach((b) => {
+    b.addEventListener('click', () => steps[Number(b.dataset.wizard)].go());
+  });
+}
+
+async function loadOverview() {
+  await refreshState();
+  renderOverview();
+  // 微信在等扫码时刷得勤一点，扫完好立刻变成「已登录」
+  if (S?.wechat?.running && !S?.wechat?.loggedIn) startWxPoll();
+}
+
+let wxPoll = null;
+function startWxPoll() {
+  if (wxPoll) return;
+  wxPoll = setInterval(async () => {
+    const st = await api('/api/state');
+    if (!st || st.ok === false) return;
+    S = st;
+    renderShell();
+    if (currentPage === 'overview') {
+      renderOverview();
+      renderHomeCards();
+    } else if (currentPage === 'wx-overview') {
+      renderWxOverview();
+    }
+    if (!st.wechat?.running || st.wechat?.loggedIn) {
+      clearInterval(wxPoll);
+      wxPoll = null;
+    }
+  }, 2500);
+}
+
+/* 服务启停 */
+async function svcAction(kind, act) {
+  const paths = {
+    napcat: { start: '/api/napcat/start', stop: '/api/napcat/stop' },
+    bridge: { start: '/api/bridge/start', stop: '/api/bridge/stop' },
+    wechat: { start: '/api/wechat/start', stop: '/api/wechat/stop' }
+  };
+  const path = paths[kind]?.[act];
+  if (!path) return;
+  if (act === 'stop') {
+    const ok = await confirmBox({
+      title: `停止${kind === 'napcat' ? ' NapCat' : kind === 'bridge' ? ' QQ 桥接' : '微信 Bot'}？`,
+      text: '停了之后这条线就不收发消息了，重新启动要再点一次。'
+    });
+    if (!ok) return;
+  }
+  const out = platform() === 'wechat' ? '#wxo-result' : '#up-result';
+  setResult(out, act === 'start' ? '正在启动…' : '正在停止…', 'busy');
+  const r = await post(path);
+  setResult(out, r.ok === false ? r.error : '已执行', r.ok === false ? 'err' : 'ok');
+  await new Promise((res) => setTimeout(res, 1200));
+  await refreshState();
+}
+
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-svc]');
+  if (b) svcAction(b.dataset.svc, b.dataset.act);
+  const g = e.target.closest('[data-goto]');
+  if (g) showPage(g.dataset.goto);
+});
+
+$('#btn-up').addEventListener('click', async () => {
+  // QQ 的总览只开 QQ 这条线，别顺手把微信也拉起来
+  const wx = platform() === 'wechat';
+  const ok = await confirmBox({
+    title: '一键全开？',
+    text: wx
+      ? '将启动微信 Bot；若桥接未运行会一并启动（模型 API 由桥接提供）。已在运行的会跳过。'
+      : '将启动 NapCat 与 QQ 桥接；微信侧不受影响，如需启动请前往「微信 → 总览」。',
+    okLabel: '开'
+  });
+  if (!ok) return;
+  setResult('#up-result', '正在启动…', 'busy');
+  const r = await post('/api/up', { scope: wx ? 'wechat' : 'qq' });
+  setResult('#up-result', r.ok === false ? r.error ?? '有服务没起来，看日志' : '已拉起', r.ok === false ? 'err' : 'ok');
+  await new Promise((res) => setTimeout(res, 1500));
+  await refreshState();
+});
+
+$('#btn-down').addEventListener('click', async () => {
+  const wx = platform() === 'wechat';
+  const ok = await confirmBox({
+    title: wx ? '停止微信 Bot？' : '全部停止？',
+    text: wx
+      ? '仅停止微信 Bot，QQ 侧不受影响；若已开启看护，手动停止不会被立即重新拉起。'
+      : '将停止 NapCat 与 QQ 桥接；若微信 Bot 正在运行，其使用的模型 API 也会随之中断。',
+    okLabel: wx ? '停' : '全停',
+    danger: true
+  });
+  if (!ok) return;
+  setResult('#up-result', '正在停止…', 'busy');
+  const r = await post('/api/down', { scope: wx ? 'wechat' : 'qq' });
+  setResult('#up-result', r.ok === false ? r.error : '已停止', r.ok === false ? 'err' : 'ok');
+  await new Promise((res) => setTimeout(res, 1500));
+  await refreshState();
+});
+
+$('#btn-refresh').addEventListener('click', () => loadOverview());
+$('#btn-goto-backend').addEventListener('click', () => showPage('backend'));
+
+$('#btn-napcat-panel').addEventListener('click', async () => {
+  const r = await api('/api/napcat/panel');
+  if (!r.ok) return toast(r.error ?? '拿不到 NapCat 面板地址');
+  window.open(r.url, '_blank');
+});
+
+$$('[data-watch]').forEach((el) => {
+  el.addEventListener('change', async () => {
+    const key = el.dataset.watch;
+    await post('/api/automation', { watch: { [key]: el.checked } });
+    toast(el.checked ? `看护已开启：${key} 断开后自动重启` : `看护已关：${key}`);
+    await refreshState();
+  });
+});
+
+
+/* 更新：只提醒，装不装由人点 */
+$('#btn-app-dismiss').addEventListener('click', async () => {
+  await post('/api/app/update/dismiss');
+  toast('这个版本不再提醒');
+  await refreshState();
+});
+
+$('#btn-napcat-dismiss').addEventListener('click', async () => {
+  await post('/api/napcat/update/dismiss');
+  toast('这个版本不再提醒');
+  await refreshState();
+});
+
+/* 精简包：本机没有 NapCat 时横幅上的「下载并装好」 */
+let napcatInstallSkipped = false;
+
+$('#btn-napcat-install-later').addEventListener('click', () => {
+  napcatInstallSkipped = true;
+  $('#banner-napcat-install').hidden = true;
+});
+
+$('#btn-napcat-install').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  const info = await api('/api/napcat/install');
+  if (info.ok === false) return toast(info.error ?? '查不到最新版（网络？）');
+  const asset = info.asset;
+  if (!asset) return toast('发行版里没找到 Shell 包，去「高级」页调一下匹配规则');
+  const ok = await confirmBox({
+    title: `下载并安装 NapCat ${info.tag}？`,
+    text: '会从 GitHub 下最新版 Shell 包，解压到用户目录（不动安装目录），装完把路径填好。',
+    list: [`安装包：${asset.name}（${fmtBytes(asset.size)}）`, '下载完成后需手动点击「启动」，再通过面板扫码登录', '下不动的话，「高级」页可以填镜像前缀'],
+    okLabel: '下载并装好'
+  });
+  if (!ok) return;
+  await busy(btn, '下载中…', async () => {
+    const r = await post('/api/napcat/install', {});
+    if (r.ok === false) {
+      toast(r.error ?? '装不上');
+      return;
+    }
+    toast(`NapCat ${r.tag} 装好了`);
+    await refreshState();
+  });
+});
+
+$('#btn-app-update').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  const info = await api('/api/app/update');
+  if (info.ok === false) return toast(info.error ?? '检查失败');
+  if (!info.updateAvailable) return toast('已经是最新版');
+  const asset = info.picked;
+  if (!asset) return toast('发行版里没找到安装包（资产名要含 Setup 并以 .exe 结尾）');
+  const ok = await confirmBox({
+    title: `安装 ${info.tag}？`,
+    text: '下载完成后本程序会自动关闭，安装程序静默装到原来的位置，装完自动重开。',
+    list: [`安装包：${asset.name}（${fmtBytes(asset.size)}）`, '当前版本会先退出，聊天服务会中断几秒', '配置和人格都在项目目录里，不受影响'],
+    okLabel: '下载并安装'
+  });
+  if (!ok) return;
+  await busy(btn, '下载中…', async () => {
+    const r = await post('/api/app/update/apply', { assetUrl: asset.url });
+    if (r.ok === false) toast(r.error ?? '安装失败');
+    else toast('安装程序已启动，本程序马上退出');
+  });
+});
+
+$('#btn-napcat-update').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  const info = await api('/api/napcat/update');
+  if (info.ok === false) return toast(info.error ?? '检查失败');
+  if (!info.updateAvailable) return toast('NapCat 已经是最新版');
+  if (!info.assets?.length) return toast('这个发行版没有可下载的资产');
+  // 让用户从资产列表里挑，默认选中按规则匹配到的那个 —— 规则可能挑错
+  const choices = info.assets.map((a) => ({
+    value: a.url,
+    label: `${a.name}（${fmtBytes(a.size)}）${info.picked?.url === a.url ? ' · 推荐' : ''}`
+  }));
+  const pick = await openModal({
+    title: `NapCat ${info.tag}：选要装的包`,
+    text: `当前：${info.current || '未知'}。推荐项是按「Shell 压缩包」规则挑的，挑错了装不上会提示。`,
+    choices
+  });
+  if (!pick) return;
+  const asset = info.assets.find((a) => a.url === pick);
+  const ok = await confirmBox({
+    title: '开始安装 NapCat？',
+    text: '会下载、解压到旁边一个新目录，然后把配置指过去并重启 NapCat。原目录保留，随时能退回去。',
+    list: [`安装包：${asset.name}（${fmtBytes(asset.size)}）`, 'NapCat 会重启一次，可能要重新确认登录'],
+    okLabel: '下载并安装'
+  });
+  if (!ok) return;
+  await busy(btn, '下载中…', async () => {
+    const r = await post('/api/napcat/update/apply', { assetUrl: asset.url });
+    if (r.ok === false) toast(r.error ?? '安装失败');
+    else toast(`已更新到 ${r.tag}${r.restarted ? '，NapCat 已重启' : ''}`);
+    await refreshState();
+  });
+});
+
+/* ── 4. API 与模型 ──────────────────────────────────── */
+
+let poolDraft = null;
+let sourceDraft = null;
+
+function providerById(id) {
+  return (S?.providers ?? []).find((p) => p.id === id) ?? null;
+}
+
+function secretSet(env) {
+  if (!env) return false;
+  return (S?.secrets ?? []).some((s) => s.env === env && s.set);
+}
+
+function renderProviders(s) {
+  const sel = $(`#${s}-provider`);
+  const list = S?.providers ?? [];
+  sel.innerHTML =
+    `<option value="">自定义 / 中转站</option>` +
+    list.map((p) => `<option value="${esc(p.id)}">${esc(p.label)}${p.needsKey ? '' : '（无需 key）'}</option>`).join('');
+}
+
+function applyProvider(s, id) {
+  const p = providerById(id);
+  $(`#${s}-provider-note`).textContent = p?.note ?? (p ? '' : '自己填地址：要填到 /v1 为止，例如 https://your-relay.com/v1');
+  if (!p) return;
+  if (p.protocol) $(`#${s}-protocol`).value = p.protocol;
+  if (p.baseUrl) $(`#${s}-baseUrl`).value = p.baseUrl;
+  if (p.models?.length && !$(`#${s}-model`).value.trim()) $(`#${s}-model`).value = p.models[0];
+  updateKeyHint(s);
+}
+
+function updateKeyHint(s) {
+  const p = providerById($(`#${s}-provider`).value);
+  const env = p?.keyEnv;
+  if (!env) {
+    $(`#${s}-key-hint`).textContent = '自定义接入：key 会存进 secrets.json，界面上只显示有没有，不回显内容。';
+    return;
+  }
+  const set = secretSet(env);
+  $(`#${s}-key-hint`).textContent = set
+    ? `已保存 ${env}（留空 = 继续用已存的）`
+    : `还没存 ${env}。粘进来保存一次就行，之后留空。`;
+}
+
+function renderLocalServers(s) {
+  const box = $(`#${s}-local-servers`);
+  const list = S?.localModelServers ?? [];
+  if (!list.length) {
+    box.innerHTML = '<span class="hint">没探测到本机模型服务。</span>';
+    return;
+  }
+  box.innerHTML = list
+    .map(
+      (x) => `<button class="btn btn-sm ${x.running ? '' : 'btn-ghost'}" data-local="${esc(x.id)}" ${x.running ? '' : 'disabled'}>
+        <span class="led ${x.running ? 'on' : ''}" style="margin-right:2px"></span>${esc(x.label)}${x.running ? ` · ${x.models.length} 个模型` : x.installed ? ' · 没在跑' : ' · 没装'}
+      </button>`
+    )
+    .join('');
+  $$(`#${s}-local-servers [data-local]`).forEach((b) => {
+    b.addEventListener('click', () => {
+      const x = list.find((y) => y.id === b.dataset.local);
+      if (!x) return;
+      $(`#${s}-protocol`).value = 'openai';
+      $(`#${s}-baseUrl`).value = x.baseUrl;
+      $(`#${s}-provider`).value = '';
+      if (x.models[0]) $(`#${s}-model`).value = x.models[0];
+      if (!$(`#${s}-apiKey`).value) $(`#${s}-apiKey`).value = 'local';
+      toast(`已填入 ${x.label} 的地址`);
+      updateKeyHint(s);
+    });
+  });
+}
+
+function collectSource(s) {
+  const el = (name) => document.getElementById(`${s}-${name}`);
+  const num = (name) => {
+    const raw = (el(name)?.value ?? '').trim();
+    if (raw === '') return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const out = {
+    provider: el('provider').value || undefined,
+    protocol: el('protocol').value,
+    baseUrl: el('baseUrl').value.trim(),
+    model: el('model').value.trim(),
+    temperature: num('temperature'),
+    maxTokens: num('maxTokens'),
+    maxHistory: num('maxHistory'),
+    timeoutMs: num('timeoutMs'),
+    maxContextChars: num('maxContextChars'),
+    anthropicVersion: el('anthropicVersion').value.trim() || undefined,
+    allowTools: el('modelAllowTools')?.checked === true,
+    maxToolRounds: num('maxToolRounds'),
+    workspaceDir: el('workspaceDir')?.value.trim() || undefined
+  };
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
+  return out;
+}
+
+function fillSource(s, ma) {
+  const m = ma ?? {};
+  const el = (name) => document.getElementById(`${s}-${name}`);
+  renderProviders(s);
+  el('provider').value = m.provider ?? '';
+  el('protocol').value = m.protocol ?? 'openai';
+  el('baseUrl').value = m.baseUrl ?? '';
+  el('model').value = m.model ?? '';
+  el('temperature').value = m.temperature ?? '';
+  el('maxTokens').value = m.maxTokens ?? '';
+  el('maxHistory').value = m.maxHistory ?? '';
+  el('timeoutMs').value = m.timeoutMs ?? '';
+  el('maxContextChars').value = m.maxContextChars ?? '';
+  el('anthropicVersion').value = m.anthropicVersion ?? '';
+  if (el('modelAllowTools')) el('modelAllowTools').checked = m.allowTools === true;
+  if (el('maxToolRounds')) el('maxToolRounds').value = m.maxToolRounds ?? '';
+  if (el('workspaceDir')) el('workspaceDir').value = m.workspaceDir ?? '';
+  if (el('model-tools-warn')) el('model-tools-warn').hidden = m.allowTools !== true;
+  applyProvider(s, m.provider ?? '');
+  updateKeyHint(s);
+}
+
+/* ── 模型用途：普通聊天 / LLMs ────────────────────────────────────────
+ * 两块同时显示，各有自己的表单和保存按钮 —— 不是切换模式，也不是开关。
+ * 配置落在 config.json 的 backend.profiles 下，QQ 和微信各一套。
+ */
+const SLOT_DEFS = [
+  { key: 'chat', title: '普通聊天', hint: '只说话，不给工具。群里闲聊用这一档。', tools: false },
+  { key: 'work', title: 'LLMs', hint: '能执行指令、读工作区文件。建议配强一些的模型。', tools: true }
+];
+
+async function loadModelProfiles() {
+  const r = await api('/api/model-profiles');
+  if (r?.ok) {
+    modelProfiles = r.profiles ?? { qq: {}, wechat: {} };
+    modelProfilesLoaded = true;
+  }
+}
+
+function profileOf(slot) {
+  return modelProfiles?.[platform()]?.[slot] ?? null;
+}
+
+/** 从模板克隆出两块面板，插进 #slot-panels。只跑一次。 */
+function buildSlotPanels() {
+  const tpl = document.getElementById('tpl-source-panel');
+  const box = document.getElementById('slot-panels');
+  if (!tpl || !box || box.childElementCount) return;
+
+  for (const def of SLOT_DEFS) {
+    const frag = tpl.content.cloneNode(true);
+    const panel = frag.querySelector('.panel');
+    panel.id = `panel-slot-${def.key}`;
+    panel.dataset.slot = def.key;
+
+    panel.querySelector('.panel-head h2').textContent = def.title;
+    panel.querySelector('.panel-head .hint').textContent = def.hint;
+
+    // id 与 for 统一加前缀，两块互不干扰
+    panel.querySelectorAll('[id]').forEach((el) => { el.id = `${def.key}-${el.id}`; });
+    panel.querySelectorAll('[for]').forEach((el) => {
+      const f = el.getAttribute('for');
+      if (f) el.setAttribute('for', `${def.key}-${f}`);
+    });
+
+    // 普通聊天不给工具：整块拿掉，不留一个配了也不生效的开关
+    if (!def.tools) panel.querySelector(`#${def.key}-tools-block`)?.remove();
+    // 说明已经写在板块标题上，模板里那条不需要
+    panel.querySelector(`#${def.key}-chat-slot-note`)?.remove();
+
+    const save = panel.querySelector(`#${def.key}-btn-save-model`);
+    if (save) save.textContent = `保存${def.title}`;
+
+    // 默认选中第一块，让人一眼看出这是两块独立配置
+    if (def.key === SLOT_DEFS[0].key) panel.classList.add('is-active');
+
+    box.appendChild(frag);
+  }
+}
+
+/** 把两块表单的内容收进草稿 */
+function stashAllSlots() {
+  if (!modelProfilesLoaded) return;
+  const pf = platform();
+  if (!modelProfiles[pf]) modelProfiles[pf] = {};
+  for (const def of SLOT_DEFS) {
+    const v = collectSource(def.key);
+    if (v.baseUrl || v.model) modelProfiles[pf][def.key] = v;
+    else delete modelProfiles[pf][def.key];
+  }
+}
+
+/** 把草稿填回两块表单 */
+function fillAllSlots() {
+  for (const def of SLOT_DEFS) fillSource(def.key, profileOf(def.key));
+}
+
+/* 两块面板各自绑定：所有 id 都带前缀，互不干扰。只绑一次。 */
+function bindSlotEvents() {
+  if (bindSlotEvents.done) return;
+  bindSlotEvents.done = true;
+  for (const def of SLOT_DEFS) {
+    const s = def.key;
+    const el = (n) => document.getElementById(`${s}-${n}`);
+    const res = `#${s}-test-result`;
+
+    el('provider')?.addEventListener('change', (e) => applyProvider(s, e.target.value));
+
+    el('modelAllowTools')?.addEventListener('change', (e) => {
+      const w = el('model-tools-warn');
+      if (w) w.hidden = !e.target.checked;
+    });
+
+    el('btn-toggle-key')?.addEventListener('click', (e) => {
+      const input = el('apiKey');
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      e.target.closest('button').textContent = show ? '隐藏' : '显示';
+    });
+
+    el('btn-models')?.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button');
+      await busy(btn, '…', async () => {
+        const payload = collectSource(s);
+        const key = el('apiKey').value.trim();
+        if (key) payload.apiKey = key;
+        const r = await post('/api/models', payload);
+        if (r.ok === false) return setResult(res, r.error, 'err');
+        const models = r.models ?? [];
+        if (!models.length) return setResult(res, '服务端没返回模型列表', 'err');
+        const pick = await openModal({
+          title: `这个地址下有 ${models.length} 个模型`,
+          text: '点一个填进「模型」。',
+          choices: models.slice(0, 200).map((m) => ({ value: m, label: m }))
+        });
+        if (pick) {
+          el('model').value = pick;
+          toast(`已选 ${pick}`);
+        }
+        setResult(res, `拉到 ${models.length} 个模型`, 'ok');
+      });
+    });
+
+    el('btn-test')?.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button');
+      await busy(btn, '测试中…', async () => {
+        const payload = collectSource(s);
+        const key = el('apiKey').value.trim();
+        if (key) payload.apiKey = key;
+        const r = await post('/api/test', payload);
+        if (r.ok === false) return setResult(res, r.error, 'err');
+        setResult(res, `通了：${r.model} · 首字 ${r.firstCharMs ?? '—'}ms · 共 ${r.totalMs}ms`, 'ok');
+      });
+    });
+
+    el('btn-save-model')?.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button');
+      await busy(btn, '保存中…', async () => {
+        const data = collectSource(s);
+        if (!data.baseUrl || !data.model) {
+          return setResult(res, '至少要填「接口地址」和「模型」', 'err');
+        }
+        const key = el('apiKey').value.trim();
+        const p = providerById(el('provider').value);
+        if (key && p?.keyEnv) {
+          const sr = await post('/api/secrets', { [p.keyEnv]: key });
+          if (sr.ok === false) return setResult(res, sr.error ?? '保存 key 失败', 'err');
+        }
+        // 普通聊天不给工具：把可能残留的开关一并清掉，否则存进去也不生效
+        if (s === 'chat') {
+          data.allowTools = false;
+          delete data.maxToolRounds;
+          delete data.workspaceDir;
+        }
+
+        const pf = platform();
+        if (!modelProfiles[pf]) modelProfiles[pf] = {};
+        modelProfiles[pf][s] = data;
+
+        const r = await post('/api/model-profiles', { profiles: modelProfiles });
+        if (r.ok === false) return setResult(res, r.error, 'err');
+        el('apiKey').value = '';
+        if (r.regenerated === false) {
+          return setResult(res, `已保存，但重新生成配置失败：${r.regenError ?? '看日志'}`, 'err');
+        }
+        setResult(res, '已保存，配置已重新生成；重启桥接后生效', 'saved-pending');
+        await refreshState();
+        await loadModelProfiles();
+      });
+    });
+  }
+
+  // 点哪块哪块高亮，另一块退回灰色
+  document.getElementById('slot-panels')?.addEventListener('click', (e) => {
+    const p = e.target.closest('.panel[data-slot]');
+    if (!p) return;
+    document.querySelectorAll('#slot-panels > .panel').forEach((x) => {
+      x.classList.toggle('is-active', x === p);
+    });
+  });
+}
+
+/* 模型池 */
+function renderPool() {
+  if (!poolDraft) return;
+  const row = (id, list) => `
+    <div class="pool-item" data-id="${esc(id)}" data-list="${list}">
+      <span class="pool-name">${esc(id)}</span>
+      <button class="btn btn-sm btn-ghost" data-move="up" title="上移">↑</button>
+      <button class="btn btn-sm btn-ghost" data-move="down" title="下移">↓</button>
+      <button class="btn btn-sm btn-ghost" data-remove="1" title="移出">✕</button>
+    </div>`;
+
+  const draw = (listName) => {
+    const box = $(`#pool-${listName}`);
+    const list = poolDraft[listName] ?? [];
+    box.innerHTML = list.length ? list.map((id) => row(id, listName)).join('') : '<div class="empty">还没有</div>';
+  };
+  draw('free');
+  draw('paid');
+
+  // 后端给的是 [{id, until, kind, detail}]，老版本可能直接给字符串
+  const spent = (poolDraft.spent ?? []).map((s) => (typeof s === 'string' ? { id: s } : s));
+  $('#pool-spent-group').hidden = spent.length === 0;
+  $('#pool-spent').innerHTML = spent
+    .map(
+      (s) => `<div class="pool-item is-spent" data-id="${esc(s.id)}">
+        <span class="pool-name">${esc(s.id)}</span>
+        <span class="pool-tag">${esc(s.kind === 'quota' ? '额度用完' : '暂停中')}</span>
+        <button class="btn btn-sm" data-restore="${esc(s.id)}">拿回来</button>
+      </div>`
+    )
+    .join('');
+
+  $$('#pool-free [data-move], #pool-paid [data-move], #pool-free [data-remove], #pool-paid [data-remove]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const item = b.closest('.pool-item');
+      const listName = item.dataset.list;
+      const id = item.dataset.id;
+      const list = poolDraft[listName];
+      const i = list.indexOf(id);
+      if (b.dataset.remove) list.splice(i, 1);
+      else if (b.dataset.move === 'up' && i > 0) [list[i - 1], list[i]] = [list[i], list[i - 1]];
+      else if (b.dataset.move === 'down' && i < list.length - 1) [list[i + 1], list[i]] = [list[i], list[i + 1]];
+      renderPool();
+    });
+  });
+
+  $$('#pool-spent [data-restore]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const r = await post('/api/model-pool/restore', { id: b.dataset.restore });
+      toast(r.note ?? (r.ok ? '已解除' : r.error ?? '失败'));
+      await loadModels();
+    });
+  });
+
+  // 用量
+  const usage = poolDraft.usage ?? {};
+  const rows = Object.entries(usage);
+  $('#pool-usage').innerHTML = rows.length
+    ? rows
+        .sort((a, b) => (b[1].calls ?? 0) - (a[1].calls ?? 0))
+        .slice(0, 12)
+        .map(([id, u]) => `${esc(id)} — 调用 ${u.calls ?? 0} 次，出 ${u.outputTokens ?? u.completionTokens ?? 0} / 入 ${u.inputTokens ?? u.promptTokens ?? 0} token`)
+        .join('<br />')
+    : '还没有调用记录。';
+}
+
+$('#poolEnabled').addEventListener('change', () => {
+  if (poolDraft) poolDraft.enabled = $('#poolEnabled').checked;
+});
+$('#poolAllowPaid').addEventListener('change', () => {
+  if (poolDraft) poolDraft.allowPaid = $('#poolAllowPaid').checked;
+});
+
+$$('[data-add]').forEach((b) => {
+  b.addEventListener('click', () => {
+    const listName = b.dataset.add;
+    const input = $(`#pool-add-${listName}`);
+    const id = input.value.trim();
+    if (!id) return;
+    if (!poolDraft[listName].includes(id)) poolDraft[listName].push(id);
+    input.value = '';
+    renderPool();
+  });
+});
+
+$('#btn-save-pool').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  await busy(btn, '保存中…', async () => {
+    const r = await post('/api/model-pool', {
+      enabled: $('#poolEnabled').checked,
+      allowPaid: $('#poolAllowPaid').checked,
+      exhaustedNotice: $('#poolNotice').value,
+      free: poolDraft.free,
+      paid: poolDraft.paid
+    });
+    if (r.ok === false) return setResult('#pool-result', r.error ?? '保存失败', 'err');
+    const extra = r.bridgeRestarted ? '，桥接已重启' : '，下次桥接启动生效';
+    setResult('#pool-result', `已保存${extra}`, 'saved');
+  });
+});
+
+/* 批量导入 */
+let impReport = null;
+
+function renderImportReport(report) {
+  const box = $('#imp-report');
+  if (!report?.length) {
+    box.innerHTML = '';
+    return;
+  }
+  const provOpts = (cur) =>
+    `<option value="">（不指定）</option>` +
+    (S?.providers ?? []).map((p) => `<option value="${esc(p.id)}" ${p.id === cur ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
+
+  box.innerHTML = `<table class="table" style="margin-top:14px">
+    <thead><tr><th>行</th><th>内容</th><th>识别为</th><th>存成</th><th>依据</th></tr></thead>
+    <tbody>
+      ${report
+        .map(
+          (r) => `<tr data-index="${r.index}">
+            <td class="mono">${r.index + 1}</td>
+            <td class="mono" title="${esc(r.line)}">${esc(r.line.slice(0, 46))}${r.line.length > 46 ? '…' : ''}</td>
+            <td><select data-imp="provider">${provOpts(r.provider)}</select></td>
+            <td><input data-imp="env" value="${esc(r.env ?? '')}" placeholder="环境变量名" spellcheck="false" /></td>
+            <td style="font-size:11.5px;color:var(--text-3)">
+              ${r.dup ? '<span class="badge err">已存在</span> ' : ''}
+              ${r.confidence === 'low' ? '<span class="badge warn">存疑</span> ' : ''}
+              ${esc(r.reason ?? '')}
+            </td>
+          </tr>`
+        )
+        .join('')}
+    </tbody>
+  </table>`;
+}
+
+function collectImportItems() {
+  return $$('#imp-report tr[data-index]').map((tr) => ({
+    index: Number(tr.dataset.index),
+    provider: $('[data-imp="provider"]', tr).value,
+    env: $('[data-imp="env"]', tr).value.trim()
+  }));
+}
+
+$('#btn-imp-scan').addEventListener('click', async (e) => {
+  const text = $('#imp-text').value;
+  if (!text.trim()) return setResult('#imp-result', '先粘点东西进来', 'err');
+  await busy(e.target.closest('button'), '识别中…', async () => {
+    const r = await post('/api/providers/import', { text, apply: false });
+    if (r.ok === false) return setResult('#imp-result', r.error, 'err');
+    impReport = r.report ?? [];
+    renderImportReport(impReport);
+    const good = impReport.filter((x) => x.env && !x.dup).length;
+    setResult('#imp-result', `识别 ${impReport.length} 行，可直接导入 ${good} 行 —— 确认无误后点击「确认写入」`, 'ok');
+  });
+});
+
+$('#btn-imp-apply').addEventListener('click', async (e) => {
+  const text = $('#imp-text').value;
+  if (!text.trim()) return setResult('#imp-result', '先粘点东西进来', 'err');
+  const items = impReport ? collectImportItems() : [];
+  const ok = await confirmBox({
+    title: '写入这些 key？',
+    text: '会把 key 存进 secrets.json（明文，和现有 key 放一起）。已经存在的 key 会跳过。',
+    list: impReport ? impReport.filter((x) => !x.dup).slice(0, 6).map((x) => `${x.env || '（未指定）'} ← ${x.keyMasked}`) : [],
+    okLabel: '写入'
+  });
+  if (!ok) return;
+  await busy(e.target.closest('button'), '写入中…', async () => {
+    const r = await post('/api/providers/import', { text, apply: true, items });
+    if (r.ok === false) return setResult('#imp-result', r.error, 'err');
+    setResult('#imp-result', `写入了 ${r.applied} 条`, 'saved');
+    await refreshState();
+    await loadModels();
+  });
+});
+
+async function loadModels() {
+  if (!S) await refreshState();
+  buildSlotPanels();
+  bindSlotEvents();
+  await loadModelProfiles();
+  fillAllSlots();
+  for (const def of SLOT_DEFS) renderLocalServers(def.key);
+
+  const p = await api('/api/model-pool');
+  if (p.ok !== false) {
+    poolDraft = { ...p, spent: p.spent ?? [] };
+    $('#poolEnabled').checked = p.enabled !== false;
+    $('#poolAllowPaid').checked = p.allowPaid === true;
+    $('#poolNotice').value = p.exhaustedNotice ?? '';
+    renderPool();
+  }
+
+  await loadPrice();
+}
+
+/* ── 价目表 ─────────────────────────────────────────── */
+
+/* 一份本地草稿，输入即改草稿；点保存才发请求。
+ * 名字是配置里的键，所以那一格只读 —— 想改名就是删除一条再添加一条。 */
+let priceDraft = { models: {}, fallbackModel: '', peakMultiplier: null };
+
+async function loadPrice() {
+  const r = await api('/api/pricing');
+  if (r.ok === false) return;
+  priceDraft = {
+    models: { ...(r.models ?? {}) },
+    fallbackModel: r.fallbackModel ?? '',
+    peakMultiplier: r.peakMultiplier
+  };
+  $('#price-builtin').innerHTML = (r.builtin ?? [])
+    .map((b) => `<option value="${esc(b.name)}">${esc(b.label)}</option>`)
+    .join('');
+  $('#price-fallback').value = r.fallbackModel ?? '';
+  $('#price-peak').value = r.peakMultiplier ?? '';
+  renderPrice();
+}
+
+function renderPrice() {
+  const host = $('#price-rows');
+  const head = `<div class="price-row head">
+    <span>模型名</span><span>显示名</span><span>命中</span><span>未命中</span><span>写缓存</span><span>输出</span><span></span>
+  </div>`;
+  const names = Object.keys(priceDraft.models);
+  if (!names.length) {
+    host.innerHTML = `${head}<div class="price-empty">还没有自定义价格 —— 现在全按内置表算。</div>`;
+    return;
+  }
+
+  const num = (name, k, m) =>
+    `<input data-price="${esc(name)}" data-k="${k}" type="number" step="0.01" min="0"
+      value="${m[k] ?? ''}" placeholder="—" />`;
+
+  host.innerHTML =
+    head +
+    names
+      .map((name) => {
+        const m = priceDraft.models[name] ?? {};
+        return `<div class="price-row">
+          <input class="price-name" value="${esc(name)}" readonly />
+          <input class="price-label-cell" data-price="${esc(name)}" data-k="label" value="${esc(m.label ?? name)}" spellcheck="false" />
+          ${num(name, 'cacheHit', m)}${num(name, 'cacheMiss', m)}${num(name, 'cacheWrite', m)}${num(name, 'output', m)}
+          <button class="btn-del" data-price-del="${esc(name)}" title="删掉这条">×</button>
+        </div>`;
+      })
+      .join('');
+
+  $$('#price-rows input[data-price]').forEach((el) => {
+    el.addEventListener('input', () => {
+      const name = el.dataset.price;
+      const k = el.dataset.k;
+      if (!priceDraft.models[name]) priceDraft.models[name] = {};
+      if (k === 'label') priceDraft.models[name].label = el.value;
+      else priceDraft.models[name][k] = el.value.trim() === '' ? null : Number(el.value);
+    });
+  });
+
+  $$('#price-rows [data-price-del]').forEach((b) => {
+    b.addEventListener('click', () => {
+      delete priceDraft.models[b.dataset.priceDel];
+      renderPrice();
+    });
+  });
+}
+
+$('#btn-price-add').addEventListener('click', () => {
+  const input = $('#price-add-name');
+  const name = input.value.trim();
+  if (!name) return;
+  if (!priceDraft.models[name]) {
+    priceDraft.models[name] = { label: name, cacheHit: null, cacheMiss: null, cacheWrite: null, output: null };
+  }
+  input.value = '';
+  renderPrice();
+  $('#price-rows').lastElementChild?.scrollIntoView({ block: 'nearest' });
+});
+
+$('#btn-save-price').addEventListener('click', async (e) => {
+  const models = {};
+  for (const [name, m] of Object.entries(priceDraft.models)) {
+    const off = {};
+    for (const k of ['cacheHit', 'cacheMiss', 'cacheWrite', 'output']) {
+      const v = Number(m[k]);
+      // 空着就是不写这一项，让桥接按内置规则补（比如 cacheWrite 跟随 cacheMiss）
+      if (m[k] !== null && m[k] !== undefined && m[k] !== '' && Number.isFinite(v)) off[k] = v;
+    }
+    models[name] = { label: String(m.label ?? '').trim() || name, off };
+  }
+
+  const peakRaw = $('#price-peak').value.trim();
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/pricing', {
+      models,
+      fallbackModel: $('#price-fallback').value.trim(),
+      peakMultiplier: peakRaw === '' ? null : Number(peakRaw)
+    });
+    if (r.ok === false) return setResult('#price-result', r.error ?? '保存失败', 'err');
+    setResult('#price-result', `存了 ${r.count} 条${r.needRestart ? ' · 重启桥接后生效' : ''}`, r.needRestart ? 'saved-pending' : 'saved');
+    await loadPrice();
+  });
+});
+
+/* ── 5. 后端 ────────────────────────────────────────── */
+
+let currentType = 'matrix';
+
+function selectType(type, { fromClick = false } = {}) {
+  currentType = type;
+  $$('#type-grid .type-card').forEach((c) => c.classList.toggle('is-active', c.dataset.type === type));
+  $('#panel-matrix').hidden = type !== 'matrix';
+  $('#panel-modelapi').hidden = type !== 'model-api';
+  $('#panel-cli').hidden = type !== 'cli';
+  $('#panel-ui').hidden = type !== 'ui';
+  if (fromClick) setResult('#oc-result', '', '');
+}
+
+$$('#type-grid .type-card').forEach((c) => {
+  c.addEventListener('click', () => selectType(c.dataset.type, { fromClick: true }));
+});
+
+function renderMatrixInfo(m) {
+  const rows = [
+    ['实例状态', m?.alive ? '运行中' : '未运行'],
+    ['地址', m?.url ?? '—'],
+    ['进程号', m?.pid ?? '—'],
+    ['版本', m?.version ?? '—'],
+    ['运行数据', m?.file ?? '—']
+  ];
+  // 路径里带引擎自己的目录名，界面上不能露出来 —— 统一过一遍翻译层
+  $('#oc-info').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(plainify(v))}</dd>`).join('');
+}
+
+async function loadMatrix() {
+  const r = await api(`/api/matrix?platform=${platform()}`);
+  if (r.ok === false) return;
+  $('#ocBaseUrl').value = r.baseUrl ?? '';
+  $('#ocStateDir').value = r.stateDir ?? '';
+  $('#sessionCwd').value = r.sessionCwd ?? '';
+  $('#ocDeleteArchived').checked = r.deleteArchived === true;
+  $('#agentPreset').value = r.agentPreset ?? 'qq-chat';
+  $('#workspaceTitle').value = r.workspaceTitle ?? '';
+  renderMatrixInfo(r.instance);
+}
+
+$('#btn-save-oc').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post(`/api/matrix?platform=${platform()}`, {
+      baseUrl: $('#ocBaseUrl').value,
+      stateDir: $('#ocStateDir').value,
+      sessionCwd: $('#sessionCwd').value,
+      deleteArchived: $('#ocDeleteArchived').checked,
+      agentPreset: $('#agentPreset').value,
+      workspaceTitle: $('#workspaceTitle').value
+    });
+    if (r.ok === false) return setResult('#oc-result', r.error, 'err');
+    setResult('#oc-result', '已保存（改动方案要重启桥接才生效）', 'saved-pending');
+    await loadMatrix();
+  });
+});
+
+$('#btn-use-oc').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '切换中…', async () => {
+    const r = await post('/api/backend', { backend: { type: 'matrix' } });
+    if (r.ok === false) return setResult('#oc-result', r.error, 'err');
+    setResult('#oc-result', '已启用 API 实例，重启桥接后生效', 'saved-pending');
+    await refreshState();
+    await loadBackend();
+  });
+});
+
+function renderModelApiSummary() {
+  const ma = S?.backend?.modelApi ?? {};
+  const rows = [
+    ['厂商', providerById(ma.provider)?.label ?? ma.provider ?? '自定义'],
+    ['接口地址', ma.baseUrl || '—'],
+    ['模型', ma.model || '—'],
+    ['协议', ma.protocol ?? 'openai'],
+    ['只读工具', ma.allowTools ? '开' : '关']
+  ];
+  $('#ma-summary').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+  $('#ma-warn').hidden = Boolean(ma.baseUrl && ma.model);
+}
+
+$('#btn-goto-models').addEventListener('click', () => showPage('models'));
+
+$('#btn-use-ma').addEventListener('click', async (e) => {
+  const ma = S?.backend?.modelApi ?? {};
+  if (!ma.baseUrl || !ma.model) return setResult('#ma-result', '先去「API 与模型」把地址和模型填好', 'err');
+  await busy(e.target.closest('button'), '切换中…', async () => {
+    const r = await post('/api/backend', { backend: { type: 'model-api', modelApi: ma } });
+    if (r.ok === false) return setResult('#ma-result', r.error, 'err');
+    setResult('#ma-result', '已启用直连模型 API，重启桥接后生效', 'saved-pending');
+    await refreshState();
+    await loadBackend();
+  });
+});
+
+/* CLI */
+function currentDriver() {
+  return (S?.cliDrivers ?? []).find((d) => d.id === $('#cliDriver').value) ?? null;
+}
+
+function renderCliDrivers() {
+  const list = S?.cliDrivers ?? [];
+  $('#cliDriver').innerHTML = list.map((d) => `<option value="${esc(d.id)}">${esc(d.label)}${d.verified ? '' : '（未核实）'}</option>`).join('');
+  $('#cli-installed').innerHTML = list
+    .map(
+      (d) => `<button class="btn btn-sm ${d.installed ? '' : 'btn-ghost'}" data-driver="${esc(d.id)}" ${d.installed ? '' : 'disabled'}>
+        <span class="led ${d.installed ? 'on' : ''}" style="margin-right:2px"></span>${esc(d.label)} · ${d.installed ? '已安装' : '没找到'}
+      </button>`
+    )
+    .join('');
+  $$('#cli-installed [data-driver]').forEach((b) => {
+    b.addEventListener('click', () => {
+      $('#cliDriver').value = b.dataset.driver;
+      renderCliOptions({});
+    });
+  });
+  $('#unverified-count').textContent = String((S?.unverifiedClis ?? []).length);
+  $('#unverified-list').innerHTML = (S?.unverifiedClis ?? [])
+    .map((u) => `<li>${esc(u.label ?? u.id ?? u)}${u.note ? ` —— ${esc(u.note)}` : ''}</li>`)
+    .join('');
+}
+
+function renderCliOptions(saved = {}) {
+  const schema = currentDriver()?.optionsSchema ?? [];
+  const host = $('#cli-options');
+  if (!schema.length) {
+    host.innerHTML = '<span class="hint">这个驱动没有额外参数。</span>';
+    return;
+  }
+  host.innerHTML = schema
+    .map((f) => {
+      const value = saved[f.key] ?? f.default ?? '';
+      if (f.type === 'bool') {
+        return `<label class="switch-row">
+          <input type="checkbox" data-opt="${esc(f.key)}" ${value ? 'checked' : ''} />
+          <span><strong>${esc(f.label)}</strong>${f.hint ? `<em>${esc(f.hint)}</em>` : ''}</span>
+        </label>`;
+      }
+      if (f.type === 'select') {
+        const opts = (f.options ?? [])
+          .map((o) => `<option value="${esc(o)}" ${String(value) === String(o) ? 'selected' : ''}>${esc(o || '（默认）')}</option>`)
+          .join('');
+        return `<div class="field"><label>${esc(f.label)}</label><select data-opt="${esc(f.key)}">${opts}</select>${
+          f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ''
+        }</div>`;
+      }
+      return `<div class="field">
+        <label>${esc(f.label)}</label>
+        <input data-opt="${esc(f.key)}" type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(String(value))}"
+          placeholder="${esc(String(f.default ?? ''))}" spellcheck="false" />
+        ${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ''}
+      </div>`;
+    })
+    .join('');
+}
+
+function collectCliOptions() {
+  const out = {};
+  $$('#cli-options [data-opt]').forEach((el) => {
+    const key = el.dataset.opt;
+    if (el.type === 'checkbox') {
+      // 布尔值必须显式存：不写等于"用默认"，而有些默认是 true（比如自动批准）
+      out[key] = el.checked;
+      return;
+    }
+    const raw = el.value.trim();
+    if (raw === '') return;
+    const n = Number(raw);
+    out[key] = el.type === 'number' && Number.isFinite(n) ? n : raw;
+  });
+  return out;
+}
+
+$('#cliDriver').addEventListener('change', () => renderCliOptions({}));
+$('#allowTools').addEventListener('change', (e) => {
+  $('#tools-warn').hidden = !e.target.checked;
+});
+
+$('#btn-save-cli').addEventListener('click', async (e) => {
+  const id = $('#customId').value.trim();
+  const bin = $('#customBin').value.trim();
+  const cli = {
+    driver: $('#cliDriver').value,
+    allowTools: $('#allowTools').checked,
+    timeoutMs: Number($('#cliTimeoutMs').value) || undefined,
+    options: collectCliOptions()
+  };
+  if (id && bin) {
+    cli.customDriver = {
+      id,
+      label: id,
+      bin,
+      promptFlag: $('#customPromptFlag').value.trim() || '-p',
+      extraArgs: splitIds($('#customExtraArgs').value)
+    };
+  } else if (id || bin) {
+    return setResult('#cli-result', '自定义驱动要「标识」和「可执行文件」都填', 'err');
+  }
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/backend', { backend: { type: 'cli', cli } });
+    if (r.ok === false) return setResult('#cli-result', r.error, 'err');
+    setResult('#cli-result', '已保存，重启桥接后生效', 'saved-pending');
+    await refreshState();
+    await loadBackend();
+  });
+});
+
+/* 前台客户端 */
+function collectUi() {
+  const num = (id) => {
+    const raw = $(id).value.trim();
+    if (raw === '') return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  return {
+    process: $('#uiProcess').value.trim(),
+    titleRegex: $('#uiTitle').value.trim(),
+    inputMode: $('#uiInputMode').value,
+    sendKeys: $('#uiSendKeys').value.trim() || '{ENTER}',
+    sendButtonRegex: $('#uiSendButtonRegex').value.trim() || '^发送$|^Send$',
+    copyButtonRegex: $('#uiCopyButtonRegex').value.trim(),
+    readMode: $('#uiInputMode').value,
+    clickInputPct: $('#uiClickInputPct').value.trim(),
+    clickReadPct: $('#uiClickReadPct').value.trim(),
+    minWaitMs: num('#uiMinWaitMs'),
+    maxWaitMs: num('#uiMaxWaitMs'),
+    idleGuardMs: num('#uiIdleGuardMs'),
+    stopRegex: $('#uiStopRegex').value.trim()
+  };
+}
+
+$('#btn-save-ui').addEventListener('click', async (e) => {
+  const ui = collectUi();
+  if (!ui.process && !ui.titleRegex) return setResult('#ui-result', '「进程名」和「窗口标题正则」至少填一个', 'err');
+  await busy(e.target.closest('button'), '切换中…', async () => {
+    const r = await post('/api/backend', { backend: { type: 'ui', ui } });
+    if (r.ok === false) return setResult('#ui-result', r.error, 'err');
+    setResult('#ui-result', '已启用前台客户端，重启桥接后生效', 'saved-pending');
+    await refreshState();
+    await loadBackend();
+  });
+});
+
+async function loadBackend() {
+  if (!S) await refreshState();
+  const type = S?.backend?.type === 'model-api' ? 'model-api' : S?.backend?.type === 'cli' ? 'cli' : S?.backend?.type === 'ui' ? 'ui' : 'matrix';
+  selectType(type);
+  renderMatrixInfo(S?.matrix);
+  renderModelApiSummary();
+  renderCliDrivers();
+
+  const cli = S?.backend?.cli ?? {};
+  if (cli.driver) $('#cliDriver').value = cli.driver;
+  $('#cliTimeoutMs').value = cli.timeoutMs ?? '';
+  $('#allowTools').checked = cli.allowTools === true;
+
+  const uiCfg = S?.backend?.ui ?? {};
+  $('#uiProcess').value = uiCfg.process ?? '';
+  $('#uiTitle').value = uiCfg.titleRegex ?? '';
+  $('#uiInputMode').value = uiCfg.inputMode ?? 'auto';
+  $('#uiSendKeys').value = uiCfg.sendKeys ?? '{ENTER}';
+  $('#uiSendButtonRegex').value = uiCfg.sendButtonRegex ?? '^发送$|^Send$';
+  $('#uiCopyButtonRegex').value = uiCfg.copyButtonRegex ?? '';
+  $('#uiClickInputPct').value = uiCfg.clickInputPct ?? '';
+  $('#uiClickReadPct').value = uiCfg.clickReadPct ?? '';
+  $('#uiMinWaitMs').value = uiCfg.minWaitMs ?? '';
+  $('#uiMaxWaitMs').value = uiCfg.maxWaitMs ?? '';
+  $('#uiIdleGuardMs').value = uiCfg.idleGuardMs ?? '';
+  $('#uiStopRegex').value = uiCfg.stopRegex ?? '';
+  $('#tools-warn').hidden = !$('#allowTools').checked;
+  if (cli.customDriver) {
+    $('#customId').value = cli.customDriver.id ?? '';
+    $('#customBin').value = cli.customDriver.bin ?? '';
+    $('#customPromptFlag').value = cli.customDriver.promptFlag ?? '';
+    $('#customExtraArgs').value = (cli.customDriver.extraArgs ?? []).join(',');
+  }
+  renderCliOptions(cli.options ?? {});
+  await loadMatrix();
+}
+
+/* ── 6. 聊天 ────────────────────────────────────────── */
+
+let roleNames = [];
+
+function setAccessMode(mode) {
+  $$('input[name="accessMode"]').forEach((r) => { r.checked = r.value === mode; });
+}
+
+function renderRoleOptions(selected) {
+  const sel = $('#role');
+  sel.innerHTML =
+    `<option value="">（不用人格卡）</option>` +
+    roleNames.map((n) => `<option value="${esc(n)}" ${n === selected ? 'selected' : ''}>${esc(n)}</option>`).join('');
+}
+
+function renderRoleList(active) {
+  const box = $('#role-list');
+  if (!roleNames.length) {
+    box.innerHTML = '<div class="empty">还没有人格卡</div>';
+    return;
+  }
+  box.innerHTML = roleNames
+    .map(
+      (n) => `<div class="list-row ${n === active ? 'is-active' : ''}" data-role="${esc(n)}">
+        <div class="row-main"><div class="row-title">${esc(n)}</div></div>
+      </div>`
+    )
+    .join('');
+  $$('#role-list [data-role]').forEach((row) => {
+    row.addEventListener('click', () => showRoleCard(row.dataset.role));
+  });
+}
+
+const ROLE_TEMPLATE = (name) => `# 角色卡：${name || '名字'}
+
+## 一、你是谁
+（名字、身份、和对方是什么关系。两三句就够，不要写履历。）
+
+## 二、说话风格
+- 句子短，一条消息不超过两行。
+- 常用词：（列举几个她会用的词）
+- 不要：不要总结、不要客服腔、不要"作为 AI"、不要列 1234。
+
+## 三、性格与反应
+- 被夸的时候：
+- 被怼的时候：
+- 不知道的时候：
+（写具体反应，不要写"温柔""开朗"这种形容词。）
+
+## 四、梗与背景（可选）
+（她经历过什么、有什么执念、什么话题会让她话变多。）
+
+## 五、回复示例
+对方：在干嘛
+你：躺着。你呢
+
+对方：今天好累
+你：那就别干了，过来陪我说话
+`;
+
+async function showRoleCard(name, { force = false } = {}) {
+  if (!name) return;
+  if (!force && !/^[\w\u4e00-\u9fa5][\w\u4e00-\u9fa5 .\-]*$/.test(name)) {
+    return setResult('#role-edit-result', '名字里有不能用的字符', 'err');
+  }
+  const r = await api(`/api/role/file?name=${encodeURIComponent(name)}`);
+  if (r.ok === false) {
+    // 不存在就起一张模板卡（还没落盘）
+    $('#role-name').value = name;
+    $('#role-content').value = ROLE_TEMPLATE(name);
+    $('#role-content-hint').textContent = '这是新卡，还没保存。改完点「保存内容」。';
+    renderRoleList(name);
+    return;
+  }
+  $('#role-name').value = r.name;
+  $('#role-content').value = r.content;
+  $('#role-content-hint').textContent = `${r.chars} 字符 / 上限 ${r.limit}${r.chars > r.limit ? '（超了会被截断）' : ''}`;
+  renderRoleList(r.name);
+}
+
+$('#btn-role-new').addEventListener('click', () => {
+  const name = $('#role-name').value.trim();
+  if (!name) return setResult('#role-edit-result', '先填个名字', 'err');
+  showRoleCard(name, { force: true });
+});
+
+$('#btn-role-template').addEventListener('click', () => {
+  const name = $('#role-name').value.trim();
+  $('#role-content').value = ROLE_TEMPLATE(name);
+  $('#role-content-hint').textContent = '模板已填入，照着自己的角色改，改完点「保存内容」。';
+});
+
+$('#btn-role-save').addEventListener('click', async (e) => {
+  const name = $('#role-name').value.trim();
+  const content = $('#role-content').value;
+  if (!name) return setResult('#role-edit-result', '先填个名字', 'err');
+  if (!content.trim()) return setResult('#role-edit-result', '内容不能是空的', 'err');
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/role/file', { name, content });
+    if (r.ok === false) return setResult('#role-edit-result', r.error, 'err');
+    setResult('#role-edit-result', r.created ? '已新建' : '已保存（旧内容已备份）', 'saved');
+    await loadChat();
+    await showRoleCard(name);
+  });
+});
+
+$('#btn-role-del').addEventListener('click', async (e) => {
+  const name = $('#role-name').value.trim();
+  if (!name) return setResult('#role-edit-result', '先选一张卡', 'err');
+  const ok = await confirmBox({
+    title: `删除「${name}」？`,
+    text: '旧内容会先备份到 state/role-backups，但界面上就找不回来了。正在被 QQ 或微信用着的卡删不掉。',
+    okLabel: '删除',
+    danger: true
+  });
+  if (!ok) return;
+  await busy(e.target.closest('button'), '删除中…', async () => {
+    const r = await post('/api/role/file/delete', { name });
+    if (r.ok === false) return setResult('#role-edit-result', r.error, 'err');
+    setResult('#role-edit-result', '已删除（备份留在 state/role-backups）', 'saved');
+    $('#role-name').value = '';
+    $('#role-content').value = '';
+    await loadChat();
+  });
+});
+
+/* 自动整理 */
+$('#btn-organize').addEventListener('click', async (e) => {
+  const text = $('#organize-text').value;
+  if (!text.trim()) return setResult('#organize-result', '先粘点素材进来', 'err');
+  const ok = await confirmBox({
+    title: '整理成人格卡？',
+    text: '会把这段素材发给你自己配置的模型服务商，调一次模型整理成标准卡片。结果只填进上面的内容框，不会自动保存。',
+    list: ['素材只发给你自己的服务商，本程序不留存', '整理结果可继续修改，修改后点击「保存内容」'],
+    okLabel: '开始整理'
+  });
+  if (!ok) return;
+  await busy(e.target.closest('button'), '整理中…（约需十几秒）', async () => {
+    const r = await post('/api/role/organize', { text });
+    if (r.ok === false) return setResult('#organize-result', r.error, 'err');
+    $('#role-content').value = r.card;
+    $('#role-content-hint').textContent = `整理完成，${r.card.length} 字符。过目改完再点「保存内容」。`;
+    setResult('#organize-result', '整理好了，看上面的内容框', 'saved');
+    $('#role-content').scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
+});
+
+async function loadChat() {
+  if (!S) await refreshState();
+  const p = platform();
+  const [chat, role, roles, matrix] = await Promise.all([
+    api(`/api/chat?platform=${p}`),
+    api(`/api/role?platform=${p}`),
+    api('/api/roles'),
+    api(`/api/matrix?platform=${p}`)
+  ]);
+
+  if (chat.ok !== false) {
+    setAccessMode(chat.mode === 'all' ? 'all' : 'list');
+    $('#ownerQQ').value = chat.ownerQQ ?? '';
+    $('#allowPrivate').value = (chat.allow?.private ?? []).join(', ');
+    $('#allowGroups').value = (chat.allow?.groups ?? []).join(', ');
+    $('#denyPrivate').value = (chat.deny?.private ?? []).join(', ');
+    $('#denyGroups').value = (chat.deny?.groups ?? []).join(', ');
+    $('#maxInjectChars').value = chat.maxInjectChars ?? '';
+    $('#injectMode').value = chat.injectMode ?? 'session';
+  }
+
+  if (roles.ok !== false) {
+    roleNames = roles.roles ?? [];
+    renderRoleOptions(role?.role ?? '');
+    renderRoleList(role?.role ?? '');
+  }
+
+  if (role.ok !== false) {
+    $('#silentMode').checked = role.mode === 'silent';
+  }
+
+  if (matrix.ok !== false) {
+    $('#agentPreset').value = matrix.agentPreset ?? 'qq-chat';
+    $('#workspaceTitle').value = matrix.workspaceTitle ?? '';
+  }
+
+  // 工具表只有 QQ 这一套；微信那边由 Hook 决定，不显示这块
+  if (p === 'qq') await loadTools();
+}
+
+$('#btn-save-chat').addEventListener('click', async (e) => {
+  const mode = $('input[name="accessMode"]:checked')?.value ?? 'all';
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post(`/api/chat?platform=${platform()}`, {
+      mode,
+      ownerQQ: $('#ownerQQ').value.trim() || null,
+      allow: { private: splitIds($('#allowPrivate').value), groups: splitIds($('#allowGroups').value) },
+      deny: { private: splitIds($('#denyPrivate').value), groups: splitIds($('#denyGroups').value) },
+      allowAllWhenEmpty: mode === 'all',
+      maxInjectChars: $('#maxInjectChars').value.trim() || undefined,
+      injectMode: $('#injectMode').value
+    });
+    if (r.ok === false) return setResult('#chat-result', r.error, 'err');
+    setResult('#chat-result', '已保存，重启桥接后生效', 'saved-pending');
+    await loadChat();
+  });
+});
+
+$('#btn-save-role').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post(`/api/role?platform=${platform()}`, {
+      role: $('#role').value || null,
+      mode: $('#silentMode').checked ? 'silent' : 'active',
+      maxInjectChars: $('#maxInjectChars').value.trim() || undefined,
+      injectMode: $('#injectMode').value
+    });
+    if (r.ok === false) return setResult('#role-result', r.error, 'err');
+    // 默认方案 / 会话标题按平台存，一起写
+    await post(`/api/matrix?platform=${platform()}`, {
+      agentPreset: $('#agentPreset').value,
+      workspaceTitle: $('#workspaceTitle').value
+    });
+    setResult('#role-result', '已保存', 'saved');
+    await loadChat();
+  });
+});
+
+/* ── 7. 消息 ────────────────────────────────────────── */
+
+let msgData = null;
+let msgFilter = null;
+
+function renderMessages() {
+  if (!msgData) return;
+  const p = platform();
+  const list = msgData.contacts ?? [];
+  const entries = (msgData.entries ?? []).filter((e) => !msgFilter || e.conv === msgFilter);
+
+  $('#msg-note').textContent = msgData.missing
+    ? p === 'wechat'
+      ? '还没有微信活动记录 —— 微信 Bot 启动并收发消息后显示'
+      : '还没有 QQ 活动记录 —— 桥接启动并收发消息后显示'
+    : `最近 ${entries.length} 条${msgFilter ? '（只看这个联系人）' : ''}`;
+
+  $('#msg-contacts').innerHTML = list.length
+    ? `<div class="list-row ${msgFilter ? '' : 'is-active'}" data-conv=""><div class="row-main"><div class="row-title">全部</div><div class="row-sub">${(msgData.entries ?? []).length} 条</div></div></div>` +
+      list
+        .map(
+          (c) => `<div class="list-row ${msgFilter === c.conv ? 'is-active' : ''}" data-conv="${esc(c.conv)}">
+            <div class="row-main">
+              <div class="row-title">${esc(c.label)}</div>
+              <div class="row-sub">${c.kind === 'group' ? '群 ' : ''}${esc(c.target)} · ${c.count} 条${c.last ? ` · ${esc(c.last)}` : ''}</div>
+            </div>
+          </div>`
+        )
+        .join('')
+    : '<div class="empty">还没有联系人</div>';
+
+  $$('#msg-contacts [data-conv]').forEach((row) => {
+    row.addEventListener('click', () => {
+      msgFilter = row.dataset.conv || null;
+      renderMessages();
+    });
+  });
+
+  $('#msg-stream').innerHTML = entries.length
+    ? entries
+        .map(
+          (e) => `<div class="msg ${e.self ? 'self' : ''}">
+            <div class="msg-head"><span class="msg-who">${esc(e.self ? '机器人' : e.who)}</span><span>${esc(e.clock)}</span></div>
+            <div class="msg-text">${esc(e.text)}</div>
+          </div>`
+        )
+        .join('')
+    : '<div class="empty">这段时间没有消息</div>';
+  $('#msg-stream').scrollTop = $('#msg-stream').scrollHeight;
+}
+
+async function loadMessages() {
+  if (!S) await refreshState();
+  msgData = await api(`/api/messages?platform=${platform()}&limit=400`);
+  if (msgData.ok === false) msgData = { entries: [], contacts: [], missing: true };
+  renderMessages();
+  renderSumContacts();
+  await loadHub();
+  await loadHook();
+  await loadSchedules();
+  // 发送目标跟着平台换
+  if (platform() === 'wechat') $('#btn-send-dry').hidden = false;
+}
+
+$('#btn-msg-refresh').addEventListener('click', () => loadMessages());
+
+/* ── 省流总结 ───────────────────────────────────────────────────────────
+ * 数据源和消息流是同一份活动日志；联系人下拉直接用消息页拉好的 contacts。
+ * 模型调用在服务端（/api/summarize），前端只管选联系人、点按钮、看结果。 */
+function renderSumContacts() {
+  const sel = $('#sum-contact');
+  if (!sel) return;
+  const list = (msgData?.contacts ?? []).filter((c) => c.count > 0);
+  const prev = sel.value;
+  sel.innerHTML = list.length
+    ? list.map((c) => `<option value="${esc(c.conv)}">${esc(c.label)}（${c.count} 条）</option>`).join('')
+    : '<option value="">（还没有聊天记录）</option>';
+  if (prev && list.some((c) => c.conv === prev)) sel.value = prev;
+}
+
+$('#btn-summarize')?.addEventListener('click', async (e) => {
+  const conv = $('#sum-contact').value;
+  if (!conv) return setResult('#sum-result', '还没有可总结的聊天记录', 'err');
+  await busy(e.target.closest('button'), '总结中…', async () => {
+    const r = await post('/api/summarize', { platform: platform(), conv, count: Number($('#sum-count').value) });
+    if (r.ok === false) {
+      $('#sum-out').hidden = true;
+      return setResult('#sum-result', r.error ?? '总结失败', 'err');
+    }
+    setResult('#sum-result', `总结好了（基于 ${r.count} 条）`, 'ok');
+    const out = $('#sum-out');
+    out.hidden = false;
+    out.textContent = r.summary;
+  });
+});
+
+/* ── Webhook 通知枢纽 ─────────────────────────────────────────────────── */
+let hubToken = '';
+
+function renderHubSample() {
+  const el = $('#hub-sample');
+  if (!el) return;
+  el.textContent =
+    `curl -X POST ${location.origin}/hook/notify/${hubToken}` +
+    ' -H "content-type: application/json"' +
+    ' -d "{\"text\":\"构建失败了，快回来看\"}"';
+}
+
+async function loadHub() {
+  if (!$('#hub-enabled')) return;
+  const r = await api('/api/notify');
+  if (r.ok === false) return;
+  hubToken = r.token ?? '';
+  $('#hub-enabled').checked = r.enabled !== false;
+  $('#hub-url').value = `${location.origin}/hook/notify/${hubToken}`;
+  $('#hub-default-platform').value = r.default?.platform === 'wechat' ? 'wechat' : 'qq';
+  $('#hub-default-to').value = r.default?.to ?? '';
+  const m = r.mirror ?? {};
+  $('#hub-mirror-enabled').checked = m.enabled === true;
+  $('#hub-mirror-from').value = m.from ?? '';
+  $('#hub-mirror-keyword').value = m.keyword ?? '';
+  $('#hub-mirror-platform').value = m.platform === 'wechat' ? 'wechat' : 'qq';
+  $('#hub-mirror-to').value = m.to ?? '';
+  renderHubSample();
+}
+
+async function saveHub() {
+  const r = await post('/api/notify', {
+    enabled: $('#hub-enabled').checked,
+    default: { platform: $('#hub-default-platform').value, to: $('#hub-default-to').value.trim() },
+    mirror: {
+      enabled: $('#hub-mirror-enabled').checked,
+      from: $('#hub-mirror-from').value.trim(),
+      keyword: $('#hub-mirror-keyword').value.trim(),
+      platform: $('#hub-mirror-platform').value,
+      to: $('#hub-mirror-to').value.trim()
+    }
+  });
+  if (r.ok === false) return setResult('#hub-result', r.error ?? '保存失败', 'err');
+  hubToken = r.token ?? hubToken;
+  renderHubSample();
+  setResult('#hub-result', '已保存', 'ok');
+}
+
+['hub-enabled', 'hub-default-platform', 'hub-default-to', 'hub-mirror-enabled', 'hub-mirror-from', 'hub-mirror-keyword', 'hub-mirror-platform', 'hub-mirror-to']
+  .forEach((id) => $(`#${id}`)?.addEventListener('change', () => saveHub()));
+
+$('#btn-hub-copy')?.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText($('#hub-url').value);
+    toast(t('已复制'));
+  } catch {
+    $('#hub-url').select();
+    toast(t('复制不了，已选中文字，请手动 Ctrl+C'));
+  }
+});
+
+$('#btn-hub-regen')?.addEventListener('click', async (e) => {
+  const ok = await confirmBox({
+    title: '换通知口令？',
+    text: '旧地址立刻失效，拿到旧地址的程序要换成新地址。',
+    okLabel: '换'
+  });
+  if (!ok) return;
+  await busy(e.target.closest('button'), '…', async () => {
+    const r = await post('/api/notify/regenerate');
+    if (r.ok === false) return setResult('#hub-result', r.error ?? '操作失败', 'err');
+    hubToken = r.token;
+    $('#hub-url').value = `${location.origin}/hook/notify/${hubToken}`;
+    renderHubSample();
+    setResult('#hub-result', '口令已换', 'ok');
+  });
+});
+
+$('#btn-hub-test')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '发送中…', async () => {
+    const r = await post('/api/notify/test', {
+      platform: $('#hub-default-platform').value,
+      to: $('#hub-default-to').value.trim()
+    });
+    if (r.ok === false) return setResult('#hub-result', r.error ?? '发送失败', 'err');
+    setResult('#hub-result', '发出去了，去 QQ / 微信里看一眼', 'ok');
+  });
+});
+
+/* ── 插件（高级页） ───────────────────────────────────────────────────── */
+async function loadPluginsUi() {
+  const el = $('#plugins-list');
+  if (!el) return;
+  const r = await api('/api/plugins');
+  if (r.ok === false) {
+    el.innerHTML = '<div class="empty">读不到插件目录</div>';
+    return;
+  }
+  $('#plugins-note').textContent = `${r.dir} · ${r.files.length} 个文件`;
+  el.innerHTML = r.files.length
+    ? r.files
+        .map(
+          (f) => `<div class="list-row"><div class="row-main"><div class="row-title">${esc(f.file)}</div><div class="row-sub">${esc(f.desc || '（文件第一行注释会显示在这里）')}</div></div></div>`
+        )
+        .join('')
+    : '<div class="empty">还没有插件 —— 把 .js 放进 plugins\ 目录，重启桥接或点「重新装载」</div>';
+}
+
+$('#btn-plugins-reload')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '装载中…', async () => {
+    const r = await post('/api/plugins');
+    if (r.ok === false) return setResult('#plugins-result', r.error ?? '装载失败', 'err');
+    setResult('#plugins-result', `已重新装载 ${r.count ?? 0} 个插件${r.errors?.length ? `，${r.errors.length} 个失败` : ''}`, r.errors?.length ? 'err' : 'ok');
+    await loadPluginsUi();
+  });
+});
+
+/* ── 交流空间 ────────────────────────────────────────────────────────────
+ * 一屏两栏：左边是收发的原文（跟「消息与任务」同一个数据源，但只读、不分联系人），
+ * 右边是后台日志的实时流。日志流全局只连一条（connectLogs），这里只是多挂一个窗格。
+ * ──────────────────────────────────────────────────────────────────────── */
+
+let exData = null;
+let exBusy = false;
+
+function renderExchange() {
+  if (!exData) return;
+  const p = platform();
+  const entries = exData.entries ?? [];
+  if (note) {
+    note.textContent = exData.missing
+      ? '还没有记录 —— QQ 或微信机器人收发过消息后才有'
+      : `最近 ${entries.length} 条（QQ ${exData.qqN ?? 0} · 微信 ${exData.wxN ?? 0}）`;
+  }
+
+  const stream = $('#ex-stream');
+  if (!stream) return;
+  if (!entries.length) {
+    stream.innerHTML = '<div class="empty">两个机器人都还没有消息</div>';
+    return;
+  }
+
+  stream.innerHTML = entries
+    .map(
+      (e) => `<div class="ex-msg${e.self ? ' self' : ''}">
+        <div class="ex-msg-head">
+          <span class="ex-who">${esc(e.self ? '机器人' : e.who)}</span>
+          <span class="ex-conv">${e.platform === 'wechat' ? '微信 · ' : 'QQ · '}${e.kind === 'group' ? '群 ' : ''}${esc(e.target)}</span>
+          <span class="ex-clock">${esc(e.clock)}</span>
+        </div>
+        <div class="ex-msg-text">${esc(e.text)}</div>
+      </div>`
+    )
+    .join('');
+  stream.scrollTop = stream.scrollHeight;
+}
+
+async function loadExchange(silent = false) {
+  if (exBusy) return;
+  exBusy = true;
+  try {
+    // QQ 与微信两个机器人的收发都汇总在这一页，按时间交错排列
+    const [qq, wx] = await Promise.all([
+      api('/api/messages?platform=qq&limit=150'),
+      api('/api/messages?platform=wechat&limit=150')
+    ]);
+    const pick = (r) => (r && r.ok !== false ? (r.entries ?? []) : []);
+    const tag = (list, pf) => list.map((e) => ({ ...e, platform: pf }));
+    const merged = [...tag(pick(qq), 'qq'), ...tag(pick(wx), 'wechat')]
+      .sort((a, b) => (a.clock < b.clock ? -1 : a.clock > b.clock ? 1 : 0));
+    const qqN = merged.filter((e) => e.platform === 'qq').length;
+    exData = { entries: merged, missing: merged.length === 0, qqN, wxN: merged.length - qqN };
+    renderExchange();
+
+    const hint = $('#ex-send-hint');
+    if (hint) hint.textContent = p === 'wechat' ? '发给微信会话（iLink 得在跑）' : '发给 QQ 好友（NapCat 得在跑）';
+    const target = $('#ex-target');
+    if (target) target.placeholder = p === 'wechat' ? '微信会话 id' : 'QQ 号';
+  } finally {
+    exBusy = false;
+  }
+  if (!silent) setResult('#ex-send-result', '', '');
+}
+
+$('#btn-ex-refresh')?.addEventListener('click', () => loadExchange());
+
+// 勾选状态变了要整块重画，不然只影响之后新来的行
+$('#ex-only-msg')?.addEventListener('change', renderExLog);
+
+// 只在停在这一页、并且没关自动刷新时才轮询
+setInterval(() => {
+  if (currentPage !== 'exchange') return;
+  if ($('#ex-live')?.checked === false) return;
+  loadExchange(true);
+}, 4000);
+
+$('#btn-ex-send')?.addEventListener('click', async (e) => {
+  const to = $('#ex-target').value.trim();
+  const text = $('#ex-text').value;
+  if (!to) return setResult('#ex-send-result', '先填发给谁', 'err');
+  if (!text.trim()) return setResult('#ex-send-result', '没有内容', 'err');
+
+  const p = platform();
+  await busy(e.target.closest('button'), '发送中…', async () => {
+    const r = p === 'wechat'
+      ? await post('/api/wechat/push', { to, text })
+      : await post('/api/qq/send', { qq: to, text });
+    if (r.ok === false) return setResult('#ex-send-result', r.error ?? r.output ?? '发送失败', 'err');
+    setResult('#ex-send-result', '已发出', 'ok');
+    $('#ex-text').value = '';
+    await loadExchange(true);
+  });
+});
+
+/* 主动发送 */
+$('#btn-send-pick').addEventListener('click', async () => {
+  const p = platform();
+  let choices = [];
+  if (p === 'wechat') {
+    choices = (msgData?.contacts ?? []).map((c) => ({ value: c.target, label: `${c.label}（${c.target}）` }));
+  } else {
+    const r = await api('/api/qq/contacts');
+    if (r.ok === false) return toast(r.error ?? '拿不到联系人');
+    const friends = (r.friends ?? []).map((f) => ({ value: f.id, label: `好友 ${f.remark || f.id}` }));
+    const groups = (r.groups ?? []).map((g) => ({ value: g.id, label: `群 ${g.name || g.id}` }));
+    choices = [...friends, ...groups];
+    if (!choices.length) return toast('NapCat 没在跑，拿不到好友列表 —— 直接填号也行');
+  }
+  if (!choices.length) return toast('没有可选的联系人');
+  const pick = await openModal({ title: '选一个发送目标', text: '好友和群都在这里。', choices: choices.slice(0, 300) });
+  if (pick) $('#send-target').value = pick;
+});
+
+$('#btn-send').addEventListener('click', async (e) => {
+  const p = platform();
+  const to = $('#send-target').value.trim();
+  const text = $('#send-text').value;
+  if (!to) return setResult('#send-result', '先填发给谁', 'err');
+  if (!text.trim()) return setResult('#send-result', '没有要发的内容', 'err');
+  const ok = await confirmBox({
+    title: '确认发送？',
+    text: p === 'wechat' ? `将通过微信向 ${to} 发送一条消息。` : `将通过 QQ 向 ${to} 发送一条消息。`,
+    list: [text.slice(0, 120) + (text.length > 120 ? '…' : '')],
+    okLabel: '发送'
+  });
+  if (!ok) return;
+  await busy(e.target.closest('button'), '发送中…', async () => {
+    const r = p === 'wechat'
+      ? await post('/api/wechat/push', { to, text })
+      : await post('/api/qq/send', { qq: to, text });
+    if (r.ok === false) return setResult('#send-result', r.error ?? r.output ?? '发送失败', 'err');
+    setResult('#send-result', '已发出', 'ok');
+    await loadMessages();
+  });
+});
+
+$('#btn-send-dry').addEventListener('click', async (e) => {
+  const to = $('#send-target').value.trim();
+  const text = $('#send-text').value;
+  if (!to) return setResult('#send-result', '先填发给谁', 'err');
+  await busy(e.target.closest('button'), '预览中…', async () => {
+    const r = await post('/api/wechat/push', { to, text, dryRun: true });
+    setResult('#send-result', r.ok === false ? r.error ?? '预览失败' : `预览通过（不碰微信）。分条结果看日志。`, r.ok === false ? 'err' : 'ok');
+  });
+});
+
+/* 定时任务 */
+function renderSchedules() {
+  const list = S?.automation?.schedules ?? [];
+  const box = $('#sched-list');
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">还没有定时任务</div>';
+    return;
+  }
+  box.innerHTML = list
+    .map(
+      (t, i) => `<div class="panel tight" data-task="${i}" style="margin-bottom:8px">
+        <div class="field-row three" style="gap:10px">
+          <div class="field" style="margin:0">
+            <label>名字</label>
+            <input data-t="name" value="${esc(t.name ?? '')}" placeholder="早安推送" spellcheck="false" />
+          </div>
+          <div class="field" style="margin:0">
+            <label>做什么</label>
+            <select data-t="kind">
+              <option value="wechat-push" ${t.kind === 'wechat-push' ? 'selected' : ''}>微信发送</option>
+              <option value="qq-send" ${t.kind === 'qq-send' ? 'selected' : ''}>QQ 发送</option>
+              <option value="restart-all" ${t.kind === 'restart-all' ? 'selected' : ''}>整条链路重启</option>
+            </select>
+          </div>
+          <div class="field" style="margin:0">
+            <label>发给谁</label>
+            <input data-t="target" value="${esc(t.target ?? '')}" placeholder="id / QQ 号" spellcheck="false" />
+          </div>
+        </div>
+        <div class="field-row three" style="gap:10px;margin-top:8px">
+          <div class="field" style="margin:0">
+            <label>频率</label>
+            <select data-t="everyType">
+              <option value="daily" ${t.every?.type !== 'interval' ? 'selected' : ''}>每天固定时间</option>
+              <option value="interval" ${t.every?.type === 'interval' ? 'selected' : ''}>每隔一段时间</option>
+            </select>
+          </div>
+          <div class="field" style="margin:0">
+            <label>时间 / 间隔</label>
+            <input data-t="everyValue" value="${esc(t.every?.type === 'interval' ? t.every?.minutes ?? 30 : t.every?.time ?? '09:00')}" spellcheck="false" />
+            <span class="hint">每天写 09:00；间隔写分钟数</span>
+          </div>
+          <div class="field" style="margin:0;display:flex;align-items:flex-end;gap:8px">
+            <label class="svc-watch" style="border:0;padding:0;flex:1"><input type="checkbox" data-t="enabled" ${t.enabled ? 'checked' : ''} /> 启用</label>
+            <button class="btn btn-sm btn-danger" data-t="del">删除</button>
+          </div>
+        </div>
+        <div class="field" style="margin-top:8px">
+          <label>内容</label>
+          <input data-t="text" value="${esc(t.text ?? '')}" placeholder="要发的话（重启任务不用填）" spellcheck="false" />
+        </div>
+        ${
+          t.lastRun
+            ? `<div class="hint">上次：${new Date(Number(t.lastRun)).toLocaleString('zh-CN')} · ${t.lastResult?.ok ? '成功' : `失败 ${esc(t.lastResult?.detail ?? '')}`}</div>`
+            : ''
+        }
+      </div>`
+    )
+    .join('');
+
+  $$('#sched-list [data-t="del"]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const card = b.closest('[data-task]');
+      card.remove();
+      toast('已从列表移除，点「保存任务」才真的删掉');
+    });
+  });
+}
+
+function collectSchedules() {
+  return $$('#sched-list [data-task]').map((card) => {
+    const v = (k) => $(`[data-t="${k}"]`, card);
+    const type = v('everyType').value;
+    const raw = v('everyValue').value.trim();
+    return {
+      name: v('name').value.trim(),
+      enabled: v('enabled').checked,
+      kind: v('kind').value,
+      target: v('target').value.trim(),
+      text: v('text').value,
+      every: type === 'interval' ? { type: 'interval', minutes: Number(raw) || 30 } : { type: 'daily', time: raw || '09:00' }
+    };
+  });
+}
+
+$('#btn-sched-add').addEventListener('click', () => {
+  const list = S?.automation?.schedules ?? [];
+  list.push({ name: '', enabled: false, kind: 'wechat-push', target: '', text: '', every: { type: 'daily', time: '09:00' } });
+  S.automation.schedules = list;
+  renderSchedules();
+});
+
+$('#btn-sched-save').addEventListener('click', async (e) => {
+  const schedules = collectSchedules();
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/automation', { schedules });
+    if (r.ok === false) return setResult('#sched-result', r.error, 'err');
+    setResult('#sched-result', `已保存 ${schedules.length} 条`, 'saved');
+    await refreshState();
+    renderSchedules();
+  });
+});
+
+async function loadSchedules() {
+  if (!S) await refreshState();
+  renderSchedules();
+}
+
+/* 微信 Webhook */
+const HOOK_HINT = {
+  default: '固定字段：event / at / bot / from / text / kinds。自己写个小服务收最省事。',
+  onebot: '输出标准 OneBot v11 事件（post_type=message），NoneBot2、Koishi、AstrBot 这类框架直接能收。',
+  template: '自己写 JSON 骨架，把占位符换成真实内容 —— 适配 wxhelper、WeChatFerry 这类自定义回调格式。'
+};
+
+async function loadHook() {
+  const h = await api('/api/wechat/hook');
+  if (h.ok === false) return;
+  $('#hookEnabled').checked = h.enabled === true;
+  $('#hookUrl').value = h.url ?? '';
+  $('#hookSecret').value = h.secret ?? '';
+  $('#hookFormat').value = h.format ?? 'default';
+  $('#hookTemplate').value = h.template ?? '';
+  $('#hook-template-field').hidden = (h.format ?? 'default') !== 'template';
+  $('#hook-format-hint').textContent = HOOK_HINT[h.format ?? 'default'] ?? '';
+  $$('input[name="hookEvent"]').forEach((c) => {
+    c.checked = (h.events ?? []).includes(c.value);
+  });
+}
+
+$('#hookFormat').addEventListener('change', (e) => {
+  $('#hook-template-field').hidden = e.target.value !== 'template';
+  $('#hook-format-hint').textContent = HOOK_HINT[e.target.value] ?? '';
+});
+
+$('#btn-hook-save').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/wechat/hook', {
+      enabled: $('#hookEnabled').checked,
+      url: $('#hookUrl').value.trim(),
+      secret: $('#hookSecret').value,
+      format: $('#hookFormat').value,
+      template: $('#hookTemplate').value,
+      events: $$('input[name="hookEvent"]').filter((c) => c.checked).map((c) => c.value)
+    });
+    if (r.ok === false) return setResult('#hook-result', r.error, 'err');
+    setResult('#hook-result', '已保存', 'saved');
+  });
+});
+
+$('#btn-hook-test').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '发送中…', async () => {
+    const r = await post('/api/wechat/hook/test');
+    if (r.ok === false) return setResult('#hook-result', r.error ?? '测试失败', 'err');
+    setResult('#hook-result', `对端返回 HTTP ${r.status}，连接正常`, 'ok');
+  });
+});
+
+/* ── 8. 高级 ────────────────────────────────────────── */
+
+let optGroups = null;
+let optBaseline = {};
+
+function renderOptions() {
+  const host = $('#options-groups');
+  if (!optGroups) return;
+  const q = $('#opt-filter').value.trim().toLowerCase();
+  const groups = optGroups.filter((g) => {
+    if (!q) return true;
+    if (g.title.toLowerCase().includes(q)) return true;
+    return g.items.some((i) => (i.label + i.path + (i.hint ?? '')).toLowerCase().includes(q));
+  });
+
+  host.innerHTML = groups
+    .map(
+      (g) => `<div class="panel tight" data-group="${esc(g.id)}">
+        <div class="panel-head"><h2>${esc(g.title)}</h2><span class="hint">${esc(g.hint ?? '')}</span></div>
+        ${g.items.map((i) => renderOption(i)).join('')}
+      </div>`
+    )
+    .join('') || '<div class="empty">没有匹配的设置项</div>';
+}
+
+function renderOption(item) {
+  const v = optBaseline[item.path];
+  const val = v === undefined || v === null ? '' : v;
+  const path = esc(item.path);
+  if (item.type === 'bool') {
+    return `<label class="switch-row">
+      <input type="checkbox" data-path="${path}" data-type="bool" ${val === true ? 'checked' : ''} />
+      <span><strong>${esc(item.label)}</strong>${item.hint ? `<em>${esc(item.hint)}</em>` : ''}</span>
+    </label>`;
+  }
+  if (item.type === 'select') {
+    return `<div class="field">
+      <label>${esc(item.label)}</label>
+      <select data-path="${path}" data-type="select">
+        ${(item.options ?? [])
+          .map((o) => `<option value="${esc(o.value)}" ${String(val) === String(o.value) ? 'selected' : ''}>${esc(o.label)}</option>`)
+          .join('')}
+      </select>
+      ${item.hint ? `<span class="hint">${esc(item.hint)}</span>` : ''}
+    </div>`;
+  }
+  if (item.type === 'list') {
+    const text = Array.isArray(val) ? val.join(', ') : val;
+    return `<div class="field">
+      <label>${esc(item.label)}</label>
+      <input data-path="${path}" data-type="list" value="${esc(text)}" placeholder="${esc((item.default ?? []).join(', '))}" spellcheck="false" />
+      ${item.hint ? `<span class="hint">${esc(item.hint)}</span>` : ''}
+    </div>`;
+  }
+  // 口令一类的字段用密码框：这些页面会被人从背后看到
+  const inputType = item.type === 'number' ? 'number' : item.secret ? 'password' : 'text';
+  return `<div class="field">
+    <label>${esc(item.label)}</label>
+    <input data-path="${path}" data-type="${item.type}" type="${inputType}"
+      value="${esc(val)}" placeholder="${esc(item.default ?? '')}" spellcheck="false" autocomplete="off"
+      ${item.step ? `step="${item.step}"` : ''} ${item.min != null ? `min="${item.min}"` : ''} ${item.max != null ? `max="${item.max}"` : ''} />
+    ${item.hint ? `<span class="hint">${esc(item.hint)}</span>` : ''}
+  </div>`;
+}
+
+$('#opt-filter').addEventListener('input', () => renderOptions());
+
+$('#btn-save-options').addEventListener('click', async (e) => {
+  const values = {};
+  $$('#options-groups [data-path]').forEach((el) => {
+    const path = el.dataset.path;
+    const type = el.dataset.type;
+    let value;
+    if (type === 'bool') value = el.checked;
+    else if (type === 'list') value = splitIds(el.value);
+    else if (type === 'number') {
+      const raw = el.value.trim();
+      value = raw === '' ? null : Number(raw);
+      if (value !== null && !Number.isFinite(value)) return;
+    } else value = el.value.trim() === '' ? null : el.value;
+    if (JSON.stringify(value) !== JSON.stringify(optBaseline[path] ?? null)) values[path] = value;
+  });
+
+  const count = Object.keys(values).length;
+  if (!count) return setResult('#options-result', '没有改动', 'busy');
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/options', { values });
+    if (r.ok === false) return setResult('#options-result', r.error, 'err');
+    const extra = r.bridgeRestarted ? '，桥接已重启' : '';
+    setResult('#options-result', `改了 ${r.changed ?? count} 项${extra}`, 'saved');
+    await loadOptions();
+  });
+});
+
+async function loadOptions() {
+  const r = await api('/api/options');
+  if (r.ok === false) return;
+  optGroups = r.groups ?? [];
+  optBaseline = r.values ?? {};
+  renderOptions();
+}
+
+/* ── 组件（要下载的东西） ────────────────────────────── */
+
+let componentPoll = null;
+let componentDoneKey = '';
+
+async function loadComponents() {
+  const r = await api('/api/components');
+  if (r.ok === false) return;
+  renderComponents(r.components ?? [], r.job ?? null);
+
+  clearTimeout(componentPoll);
+  if (r.job && !r.job.done) componentPoll = setTimeout(loadComponents, 900);
+}
+
+function renderComponents(list, job) {
+  const host = $('#component-list');
+  if (!list.length) {
+    host.innerHTML = '<div class="empty">没检测到组件清单</div>';
+    return;
+  }
+
+  host.innerHTML = list
+    .map((c) => {
+      const running = Boolean(job && !job.done && job.id === c.id);
+      const pct = Math.max(0, Math.min(100, Number(job?.pct) || 0));
+      const state = running ? `${job.note ?? '下载中'} ${pct}%` : c.note;
+      const btn = running
+        ? '<button class="btn btn-sm" disabled>安装中</button>'
+        : `<button class="btn btn-sm ${c.installed ? '' : 'btn-primary'}" data-comp-install="${esc(c.id)}">${c.installed ? '重新装' : '装载'}</button>`;
+      return `<div class="comp-item">
+        <div class="comp-main">
+          <div class="comp-name">${esc(c.name)}<span class="comp-need">${esc(c.need)}</span></div>
+          <div class="comp-detail">${esc(c.detail)}</div>
+          ${c.where ? `<div class="comp-where">${esc(c.where)}</div>` : ''}
+          ${running ? `<div class="comp-bar"><i style="width:${pct}%"></i></div>` : ''}
+          ${running ? `<div class="comp-note">${esc(job.note ?? '')} — 别关这个窗口，下完会自动配好</div>` : ''}
+        </div>
+        <div class="comp-side">
+          <span class="comp-state ${c.installed ? 'is-ok' : ''}">${esc(state)}</span>
+          ${btn}
+        </div>
+      </div>`;
+    })
+    .join('');
+
+  $$('#component-list [data-comp-install]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const id = b.dataset.compInstall;
+      const c = list.find((x) => x.id === id);
+      const ok = await confirmBox({
+        title: `要装 ${c?.name ?? id} 吗？`,
+        text: `从官方发布页下载${c?.size ? ` ${c.size}` : ''}，装到软件自己的目录里。下完自动配好路径，不用再手填。`,
+        okLabel: '开始下载'
+      });
+      if (!ok) return;
+      await busy(b, '启动中…', async () => {
+        const r = await post('/api/components', { id });
+        if (r.ok === false) return setResult('#component-result', r.error ?? '起不来', 'err');
+        setResult('#component-result', `开始下载 ${c?.name ?? id}…`, 'busy');
+        await loadComponents();
+      });
+    });
+  });
+
+  // 同一轮安装只提示一次：轮询会反复渲染，不记一下会刷屏
+  if (job?.done) {
+    const key = `${job.id}:${job.startedAt}`;
+    if (key !== componentDoneKey) {
+      componentDoneKey = key;
+      if (job.error) setResult('#component-result', `装失败了：${job.error}`, 'err');
+      else {
+        setResult('#component-result', '装好了', 'ok');
+        toast('装好了');
+      }
+    }
+  }
+}
+
+$('#btn-components-refresh').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '检测中…', async () => {
+    await loadComponents();
+    setResult('#component-result', '已重新检测', 'ok');
+  });
+});
+
+/* 从本地 zip 装：国内直连下不动时的兜底，走的是和下载一样的安装逻辑。 */
+$('#btn-components-local').addEventListener('click', () => $('#component-file').click());
+
+$('#component-file').addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  e.target.value = ''; // 选同一个文件也能再触发
+  if (!file) return;
+
+  const pick = await openModal({
+    title: '这个包是哪个组件的？',
+    text: `${file.name}（${(file.size / 1048576).toFixed(1)} MB）`,
+    choices: [
+      { value: 'ffmpeg', label: 'ffmpeg（包里有 bin/ffmpeg.exe）' },
+      { value: 'napcat', label: 'NapCat（包里有 NapCatWinBootMain.exe）' }
+    ]
+  });
+  if (!pick) return;
+
+  setResult('#component-result', `上传中 0%`, 'busy');
+  const r = await uploadComponent(pick, file, (pct) => setResult('#component-result', `上传中 ${pct}%`, 'busy'));
+  if (r.ok === false) return setResult('#component-result', r.error ?? '装失败', 'err');
+  setResult('#component-result', '装好了', 'ok');
+  toast('装好了');
+  await loadComponents();
+});
+
+/** 上传 zip 并让服务端就地安装。fetch 没有上传进度，所以用 XHR。 */
+function uploadComponent(id, file, onProgress) {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/components/upload');
+    xhr.setRequestHeader('content-type', 'application/octet-stream');
+    xhr.setRequestHeader('x-component-id', id);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      try {
+        resolve(JSON.parse(xhr.responseText));
+      } catch {
+        resolve({ ok: false, error: `服务端没回话（HTTP ${xhr.status}）` });
+      }
+    };
+    xhr.onerror = () => resolve({ ok: false, error: '上传失败' });
+    xhr.onabort = () => resolve({ ok: false, error: '上传被取消' });
+    xhr.send(file);
+  });
+}
+
+/* 路径与更新设置 */
+async function loadSettings() {
+  const r = await api('/api/settings');
+  if (r.ok === false) return;
+  $('#bridgeRoot').value = r.bridgeRoot ?? '';
+  $('#root-hint').textContent = `默认：${r.defaultRoot ?? '—'}`;
+  const n = r.napcat ?? {};
+  $('#napcatDir').value = n.dir ?? '';
+  $('#napcatQQ').value = n.qq ?? '';
+  $('#napcatWsPort').value = n.wsPort ?? '';
+  $('#napcatHttpPort').value = n.httpPort ?? '';
+  $('#napcatExe').value = n.exe ?? '';
+  $('#napcatWaitMs').value = n.waitMs ?? '';
+  $('#upd-napcat-mode').value = n.updateMode ?? 'off';
+  $('#upd-napcat-repo').value = n.updateRepo ?? '';
+  $('#upd-napcat-asset').value = n.updateAsset ?? '';
+  $('#upd-napcat-mirror').value = n.updateMirror ?? '';
+  const a = r.app ?? {};
+  $('#upd-app-mode').value = a.updateMode ?? 'notify';
+  $('#upd-repo').value = a.updateRepo ?? '';
+}
+
+$('#btn-save-settings').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/settings', {
+      bridgeRoot: $('#bridgeRoot').value.trim(),
+      napcat: {
+        dir: $('#napcatDir').value.trim(),
+        qq: $('#napcatQQ').value.trim(),
+        wsPort: $('#napcatWsPort').value.trim(),
+        httpPort: $('#napcatHttpPort').value.trim(),
+        exe: $('#napcatExe').value.trim(),
+        waitMs: $('#napcatWaitMs').value.trim()
+      }
+    });
+    if (r.ok === false) return setResult('#settings-result', r.error, 'err');
+    setResult('#settings-result', '已保存（重开服务后生效）', 'saved-pending');
+    await refreshState();
+    await loadSettings();
+  });
+});
+
+$('#btn-save-updates').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/settings', {
+      app: { updateMode: $('#upd-app-mode').value, updateRepo: $('#upd-repo').value.trim() },
+      napcat: {
+        updateMode: $('#upd-napcat-mode').value,
+        updateRepo: $('#upd-napcat-repo').value.trim(),
+        updateAsset: $('#upd-napcat-asset').value.trim(),
+        updateMirror: $('#upd-napcat-mirror').value.trim()
+      }
+    });
+    if (r.ok === false) return setResult('#upd-result', r.error, 'err');
+    setResult('#upd-result', '已保存', 'saved');
+  });
+});
+
+$('#btn-check-updates').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '检查中…', async () => {
+    const [app, nc] = await Promise.all([api('/api/app/update'), api('/api/napcat/update')]);
+    const parts = [];
+    if (app.ok === false) parts.push(`软件：${app.error}`);
+    else parts.push(app.updateAvailable ? `软件有新版本 ${app.tag}` : `软件已是最新（v${app.current}）`);
+    if (nc.ok === false) parts.push(`NapCat：${nc.error}`);
+    else parts.push(nc.updateAvailable ? `NapCat 有新版本 ${nc.tag}` : `NapCat 已是最新（${nc.current || '未知'}）`);
+    const anyNew = app.updateAvailable || nc.updateAvailable;
+    setResult('#upd-result', parts.join(' · '), anyNew ? 'ok' : 'busy');
+    await refreshState();
+  });
+});
+
+/* 原始配置 */
+let rawFile = 'config';
+
+async function loadRaw() {
+  const r = await api(`/api/raw?file=${rawFile}`);
+  if (r.ok === false) return setResult('#raw-result', r.error, 'err');
+  $('#raw-editor').value = r.content ?? '';
+  $('#raw-path').textContent = r.path ?? '—';
+  setResult('#raw-result', r.exists ? '' : '这个文件还不存在，保存时会新建', r.exists ? '' : 'busy');
+}
+
+$$('#raw-tabs .tab').forEach((b) => {
+  b.addEventListener('click', () => {
+    $$('#raw-tabs .tab').forEach((x) => x.classList.toggle('is-active', x === b));
+    rawFile = b.dataset.raw;
+    loadRaw();
+  });
+});
+
+$('#btn-raw-load').addEventListener('click', () => loadRaw());
+
+$('#btn-raw-save').addEventListener('click', async (e) => {
+  const content = $('#raw-editor').value;
+  try {
+    JSON.parse(content);
+  } catch (error) {
+    return setResult('#raw-result', `不是合法 JSON：${error.message}`, 'err');
+  }
+  const ok = await confirmBox({
+    title: `覆盖 ${rawFile}.json？`,
+    text: '旧内容会先备份到 state/config-backups。写坏了服务可能起不来，但能从备份恢复。',
+    okLabel: '写入',
+    danger: rawFile === 'secrets'
+  });
+  if (!ok) return;
+  await busy(e.target.closest('button'), '写入中…', async () => {
+    const r = await post(`/api/raw?file=${rawFile}`, { content });
+    if (r.ok === false) return setResult('#raw-result', r.error, 'err');
+    setResult('#raw-result', '已保存（部分设置要重启服务才生效）', 'saved-pending');
+    await refreshState();
+  });
+});
+
+$('#btn-selftest').addEventListener('click', async (e) => {
+  const ma = S?.backend?.modelApi;
+  const payload = ma ?? {};
+  if (!payload.baseUrl || !payload.model) return setResult('#selftest-result', '先配好「模型来源」再自检', 'err');
+  await busy(e.target.closest('button'), '自检中…', async () => {
+    const r = await post('/api/test', payload);
+    if (r.ok === false) return setResult('#selftest-result', r.error, 'err');
+    setResult('#selftest-result', `通了：${r.model} · 首字 ${r.firstCharMs ?? '—'}ms · 回复「${String(r.reply ?? '').slice(0, 40)}」`, 'ok');
+  });
+});
+
+async function loadAdvanced() {
+  if (!S) await refreshState();
+  await Promise.all([loadSettings(), loadOptions(), loadComponents(), loadPluginsUi()]);
+  await loadRaw();
+}
+
+/* ── 8. 手机（Android 通知转发） ─────────────────────── */
+
+let phoneData = null;
+
+/** SmsForwarder 的变量名以它界面上那排按钮为准；这里给的是最常见的一套。 */
+const PHONE_SNIPPET = '{"app":"{{app名称}}","from":"{{通知标题}}","text":"{{通知内容}}"}';
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // 老内核 / 非安全上下文下 clipboard 不可用，退回临时 textarea
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+async function loadPhone() {
+  phoneData = await api('/api/phone');
+  if (phoneData.ok === false) {
+    setResult('#phone-result', phoneData.error ?? '读不到手机推送设置', 'err');
+    phoneData = null;
+    return;
+  }
+  renderPhone();
+}
+
+function phoneFirstUrl() {
+  return phoneData?.urls?.[0]?.url ?? '';
+}
+
+function renderPhone() {
+  const d = phoneData;
+  if (!d) return;
+
+  $('#phoneEnabled').checked = d.enabled === true;
+  $('#phoneNotifyAi').checked = d.notifyAi === true;
+  $('#phonePort').value = d.port ?? '';
+  $('#phoneToken').value = d.token ?? '';
+
+  const listening = Number(d.listening) > 0;
+  const state = $('#phone-state');
+  if (!d.enabled) state.textContent = '没启用';
+  else if (listening) state.textContent = `正在 ${d.listening} 端口等推送`;
+  else state.textContent = '开了，但端口没起来 —— 换个端口再保存一次';
+
+  // 地址
+  const box = $('#phone-urls');
+  if (!d.enabled) {
+    box.innerHTML = '<div class="empty">还没启用</div>';
+  } else if (!d.urls?.length) {
+    box.innerHTML = '<div class="empty">没找到局域网地址 —— 电脑是不是没连 WiFi / 网线？</div>';
+  } else {
+    box.innerHTML = d.urls
+      .map(
+        (u) => `<div class="url-row">
+          <span class="url-if" title="${esc(u.name)}">${esc(u.name)}</span>
+          <span class="url-text" title="${esc(u.url)}">${esc(u.url)}</span>
+          <button class="btn btn-sm" data-copy="${esc(u.url)}">复制</button>
+        </div>`
+      )
+      .join('');
+  }
+
+  // 防火墙命令
+  const fw = `netsh advfirewall firewall add rule name="DualHabitat 手机推送" dir=in action=allow protocol=TCP localport=${d.port}`;
+  $('#phone-fw-cmd').textContent = fw;
+  $('#phone-fw-note').hidden = d.enabled !== true;
+
+  renderPhoneQr(d);
+
+  // 配置片段
+  $('#phone-snippet').textContent = PHONE_SNIPPET;
+  const sample = phoneFirstUrl() || `http://电脑的局域网IP:${d.port}/hook/${d.token || '口令'}`;
+  $('#phone-curl').textContent =
+    `curl -X POST ${sample} -H "content-type: application/json" -d '{"app":"短信","from":"10086","text":"测试"}'`;
+
+  renderPhoneRecent();
+}
+
+/**
+ * 二维码：扫的是 /setup/<token>（一页配置说明），不是空的 POST 端点。
+ * 用 qrcode.js（MIT，56KB）自己画到 canvas —— 不联网、不依赖外部服务。
+ */
+function renderPhoneQr(d) {
+  const box = $('#phone-qr');
+  if (!box) return;
+  const target = d?.urls?.[0]?.setup;
+  if (!d?.enabled || !target || typeof window.qrcode !== 'function') {
+    box.innerHTML = `<div class="empty">${d?.enabled ? '拿不到局域网地址' : '启用后出现二维码'}</div>`;
+    return;
+  }
+  try {
+    const qr = window.qrcode(0, 'M');
+    qr.addData(target);
+    qr.make();
+    const count = qr.getModuleCount();
+    const quiet = 4;
+    // 每个模块至少 4px：再小手机相机就吃力了。164 是卡片的显示宽度，正好 1:1 不缩放。
+    const scale = Math.max(4, Math.floor(164 / (count + quiet * 2)));
+    const size = (count + quiet * 2) * scale;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#000';
+    for (let r = 0; r < count; r += 1) {
+      for (let c = 0; c < count; c += 1) {
+        if (qr.isDark(r, c)) ctx.fillRect((c + quiet) * scale, (r + quiet) * scale, scale, scale);
+      }
+    }
+    canvas.className = 'qr-canvas';
+    canvas.id = 'phone-qr-canvas';
+    box.innerHTML = '';
+    box.appendChild(canvas);
+    const cap = document.createElement('div');
+    cap.className = 'qr-cap';
+    cap.textContent = '扫码打开配置页';
+    box.appendChild(cap);
+  } catch {
+    box.innerHTML = '<div class="empty">二维码生成失败，用上面的地址手动填</div>';
+  }
+}
+
+function renderPhoneRecent() {
+  const list = phoneData?.recent ?? [];
+  const box = $('#phone-recent');
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">还没收到过</div>';
+    return;
+  }
+  box.innerHTML = list
+    .map(
+      (r) => `<div class="recent-item">
+        <span class="ri-time">${fmtTime(r.at)}</span>
+        <span class="ri-app" title="${esc(r.app)}">${esc(r.app)}</span>
+        <span class="ri-text">${r.from ? `<b>${esc(r.from)}</b> · ` : ''}${esc(r.text)}</span>
+      </div>`
+    )
+    .join('');
+}
+
+$('#btn-phone-save').addEventListener('click', async (e) => {
+  const port = Number($('#phonePort').value);
+  if ($('#phoneEnabled').checked && (!Number.isFinite(port) || port < 1024 || port > 65535)) {
+    return setResult('#phone-result', '端口填 1024~65535 之间的数字', 'err');
+  }
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/phone', {
+      enabled: $('#phoneEnabled').checked,
+      notifyAi: $('#phoneNotifyAi').checked,
+      port: Number.isFinite(port) ? port : undefined
+    });
+    if (r.ok === false) return setResult('#phone-result', r.error ?? '保存失败', 'err');
+    if (r.enabled && r.running === false) {
+      setResult('#phone-result', `已保存，但端口 ${r.port} 起不来：${r.error ?? '被占用'} —— 换一个再存`, 'err');
+    } else if (r.enabled) {
+      setResult('#phone-result', `已启用，正在 ${r.port} 端口等推送`, 'saved');
+    } else {
+      setResult('#phone-result', '已关掉，端口不再监听', 'saved');
+    }
+    await loadPhone();
+  });
+});
+
+$('#btn-phone-token').addEventListener('click', async (e) => {
+  const ok = await confirmBox({
+    title: '换一个新口令？',
+    text: '换完手机上填的地址也要跟着改，旧地址立刻失效。',
+    okLabel: '换'
+  });
+  if (!ok) return;
+  await busy(e.target.closest('button'), '换…', async () => {
+    const r = await post('/api/phone', { regenerate: true, enabled: $('#phoneEnabled').checked });
+    if (r.ok === false) return setResult('#phone-result', r.error ?? '换不了', 'err');
+    setResult('#phone-result', '新口令已生成，记得更新手机上的地址', 'saved');
+    await loadPhone();
+  });
+});
+
+$('#btn-phone-test').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '模拟中…', async () => {
+    const r = await post('/api/phone/test', {});
+    if (r.ok === false) return setResult('#phone-test-result', r.error ?? '模拟失败', 'err');
+    setResult('#phone-test-result', '收到了一条（看上面列表）', 'ok');
+    await loadPhone();
+  });
+});
+
+$('#btn-phone-notify-test').addEventListener('click', async (e) => {
+  if (!phoneData?.notifyAi) return setResult('#phone-test-result', '先把「让模型也看到」打开并保存', 'err');
+  await busy(e.target.closest('button'), '投递中…', async () => {
+    const r = await post('/api/phone/notify-test', {});
+    if (r.ok === false) return setResult('#phone-test-result', r.error ?? '投不进去', 'err');
+    setResult('#phone-test-result', `投进去了（${r.key}）—— 模型那边应该收到一条后台提醒`, 'ok');
+  });
+});
+
+$('#btn-phone-refresh').addEventListener('click', () => loadPhone());
+
+$('#btn-phone-copy').addEventListener('click', async (e) => {
+  const ok = await copyText($('#phone-snippet').textContent);
+  setResult('#phone-copy-result', ok ? '请求体已复制' : '复制失败，请手动选中复制', ok ? 'ok' : 'err');
+});
+
+$('#btn-phone-copy-url').addEventListener('click', async () => {
+  const url = phoneFirstUrl();
+  if (!url) return setResult('#phone-copy-result', '先启用，拿到地址再复制', 'err');
+  const ok = await copyText(url);
+  setResult('#phone-copy-result', ok ? '地址已复制' : '复制失败，请手动选中复制', ok ? 'ok' : 'err');
+});
+
+$('#btn-phone-fw-copy').addEventListener('click', async () => {
+  const ok = await copyText($('#phone-fw-cmd').textContent);
+  setResult('#phone-copy-result', ok ? '命令已复制，管理员 PowerShell 里粘贴运行' : '复制失败，请手动选中复制', ok ? 'ok' : 'err');
+});
+
+// 地址行里的「复制」是动态生成的，用事件委托
+$('#phone-urls').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-copy]');
+  if (!btn) return;
+  const ok = await copyText(btn.dataset.copy);
+  btn.textContent = ok ? '已复制' : '复制失败';
+  setTimeout(() => { btn.textContent = '复制'; }, 1600);
+});
+
+/* ── 9. 工具开关（聊天页 QQ） ────────────────────────── */
+
+let toolData = null;
+
+async function loadTools() {
+  toolData = await api('/api/tools');
+  if (!toolData || toolData.ok === false) {
+    setResult('#tools-result', toolData?.error ?? '读不到工具表', 'err');
+    return;
+  }
+  renderTools();
+}
+
+function toolBoxes() {
+  return $$('#tool-groups input[data-flag]');
+}
+
+function updateToolCounts() {
+  const on = toolBoxes().filter((el) => el.checked).length;
+  const total = toolBoxes().length;
+  $('#tools-count').textContent = `开着 ${on} / ${total}`;
+  for (const g of toolData?.groups ?? []) {
+    const box = $(`[data-count-for="${g.id}"]`);
+    if (!box) continue;
+    const items = g.items.map((it) => $(`#tool-groups input[data-flag="${it.flag}"]`)).filter(Boolean);
+    box.textContent = `${items.filter((el) => el.checked).length}/${items.length}`;
+  }
+}
+
+function renderTools() {
+  const { groups, values } = toolData;
+  $('#tool-groups').innerHTML = groups
+    .map((g) => {
+      const items = g.items
+        .map(
+          (it) => `<label class="tool-item">
+            <input type="checkbox" data-flag="${esc(it.flag)}" ${values[it.flag] ? 'checked' : ''} />
+            <span>
+              <span class="tool-label">${esc(it.label)}</span>
+              <span class="tool-tool">${esc(it.tool)}</span>
+              ${it.hint ? `<span class="tool-hint">${esc(it.hint)}</span>` : ''}
+            </span>
+          </label>`
+        )
+        .join('');
+      return `<div class="tool-group">
+        <div class="tool-group-head">
+          <b>${esc(g.title)}</b><span>${esc(g.hint ?? '')}</span>
+          <span class="tool-group-count" data-count-for="${esc(g.id)}"></span>
+        </div>
+        <div class="tool-items">${items}</div>
+      </div>`;
+    })
+    .join('');
+
+  if (toolData.chatOnly) {
+    setResult('#tools-result', '现在是「纯聊天」模式，模型一个工具都拿不到 —— 要开工具先把聊天页那个开关关掉', 'err');
+  }
+  updateToolCounts();
+}
+
+$('#tool-groups').addEventListener('change', () => updateToolCounts());
+
+$$('[data-tool-preset]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const kind = btn.dataset.toolPreset;
+    const std = toolData?.presets?.standard ?? {};
+    const readonlyOff = new Set(toolData?.presets?.readonlyOff ?? []);
+    for (const el of toolBoxes()) {
+      const flag = el.dataset.flag;
+      if (kind === 'all') el.checked = true;
+      else if (kind === 'readonly') el.checked = !readonlyOff.has(flag);
+      else el.checked = std[flag] !== false;
+    }
+    updateToolCounts();
+    setResult('#tools-result', '已按预设改好，点「保存工具开关」才写进去', '');
+  });
+});
+
+$('#btn-tools-save').addEventListener('click', async (e) => {
+  const values = {};
+  for (const el of toolBoxes()) values[el.dataset.flag] = el.checked;
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/tools', { values });
+    if (r.ok === false) return setResult('#tools-result', r.error ?? '保存失败', 'err');
+    if (!r.changed) return setResult('#tools-result', '和原来一样，没改', '');
+    setResult('#tools-result', `已保存 ${r.changed} 项 —— 点右边「重启桥接」才真正生效`, 'saved-pending');
+    $('#btn-tools-restart').hidden = false;
+    await loadTools();
+  });
+});
+
+$('#btn-tools-restart').addEventListener('click', async (e) => {
+  const ok = await confirmBox({
+    title: '重启桥接？',
+    text: 'QQ 会断开几秒，正在回的那条消息会中断。重启后新的工具表才生效。',
+    okLabel: '重启'
+  });
+  if (!ok) return;
+  await busy(e.target.closest('button'), '重启中…', async () => {
+    await post('/api/bridge/stop');
+    await new Promise((r) => setTimeout(r, 1200));
+    const r = await post('/api/bridge/start');
+    if (r.ok === false) return setResult('#tools-result', r.error ?? '起不来，看日志页', 'err');
+    setResult('#tools-result', '桥接已重启，新工具表生效', 'ok');
+    $('#btn-tools-restart').hidden = true;
+    await refreshState();
+  });
+});
+
+/* ── 启动 ───────────────────────────────────────────── */
+
+(async function boot() {
+  applyI18n();
+  initLogPanes();
+  connectLogs();
+  await refreshState();
+
+  // 一打开就是总览：不恢复上次停留的页面，否则会直接掉进某条通道里，
+  // 让人以为软件只剩那一半。
+  showPage('overview');
+})();

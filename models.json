@@ -1,0 +1,6 @@
+{
+  "_comment": "模型池：在桌面端「API 与模型」页配置；密钥在 secrets.json（不入库）",
+  "enabled": true,
+  "free": [],
+  "paid": []
+}

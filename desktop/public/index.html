@@ -1,0 +1,1842 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DualHabitat Matrix</title>
+<link rel="stylesheet" href="/style.css" />
+<script>
+  // 首屏绘制前把主题/模式/平台定下来，否则会先闪一下默认值再变。
+  // 内联在这里（而不是 app.js 里）就是为了抢这个时机。
+  (function () {
+    var d = document.documentElement;
+    try {
+      d.dataset.theme = localStorage.getItem('dhm-theme') === 'light' ? 'light' : 'dark';
+      // 简易 = 行话翻成人话、纯技术字段收起；高级 = 原始术语全在
+      d.dataset.mode = localStorage.getItem('dhm-mode') === 'advanced' ? 'advanced' : 'simple';
+      // 平台只影响「聊天 / 消息」两页显示哪一份配置，运行状态两边同屏
+      d.dataset.platform = localStorage.getItem('dhm-platform') === 'wechat' ? 'wechat' : 'qq';
+      // 首屏永远是总览（home），进了通道才切成 platform
+      d.dataset.view = 'home';
+      // 界面语言与整体字号同样要在首屏前定下来（字号用 zoom：布局大量用 px，改根字号无效）
+      d.dataset.lang = localStorage.getItem('dhm-lang') === 'en' ? 'en' : 'zh';
+      var dhmFont = parseFloat(localStorage.getItem('dhm-font') || '1');
+      if (dhmFont >= 0.8 && dhmFont <= 1.6) d.style.zoom = String(dhmFont);
+    } catch (e) {
+      d.dataset.theme = 'dark';
+      d.dataset.mode = 'simple';
+      d.dataset.platform = 'qq';
+      d.dataset.view = 'home';
+    }
+  })();
+</script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span class="brand-name"><b>ALANWINTER</b><em>DELANCE</em><i>DualHabitat Matrix</i></span>
+    </div>
+
+    <div class="pf-ribbon" id="pf-ribbon">
+      <span class="pf-ribbon-dot"></span>
+      <span id="pf-ribbon-text">QQ · NapCat 通道</span>
+    </div>
+
+    <!-- 回外层总览：进了通道之后才有这一条 -->
+    <button class="nav-back" id="nav-back" type="button">
+      <span class="nav-back-arrow">←</span><span data-i18n="选择通道">选择通道</span>
+    </button>
+
+    <!-- 平台切换：两边同时跑，互不影响。切过去连导航都不一样。 -->
+    <nav class="nav" id="nav"></nav>
+    <div class="platform-switch" id="platform-switch" role="group" aria-label="平台">
+      <button class="pf-btn is-active" data-platform="qq" aria-pressed="true">
+        <span class="pf-name">QQ</span>
+        <span class="pf-sub">NapCat</span>
+      </button>
+      <button class="pf-btn" data-platform="wechat" aria-pressed="false">
+        <span class="pf-name">微信</span>
+        <span class="pf-sub">iLink</span>
+      </button>
+    </div>
+
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="build-tag" id="build-tag">build —</div>
+      <div class="mini-status">
+        <span class="led" id="led"></span>
+        <span id="led-text">未运行</span>
+      </div>
+      <button class="foot-btn" id="btn-settings" title="设置：界面模式、语言、字体大小、外观、开机自启">
+        <span id="settings-icon">⚙</span><span class="foot-label" id="settings-label">设置</span>
+      </button>
+      <button class="foot-btn" id="btn-contact" title="联系方式与仓库地址">
+        <span id="contact-icon">🔗</span><span class="foot-label" id="contact-label">联系</span>
+      </button>
+    </div>
+  </aside>
+
+  <main id="main">
+
+    <!-- ══════════════════ 总览 ══════════════════ -->
+    <section class="page" id="page-overview">
+      <header class="page-head">
+        <h1 data-i18n="选择通道">选择通道</h1>
+        <p data-i18n="两条通道各跑各的进程，能同时开。点卡片进去配置；下面的状态灯是实时读数，不用进去看。">两条通道各跑各的进程，能同时开。点卡片进去配置；下面的状态灯是实时读数，不用进去看。</p>
+      </header>
+
+      <div class="home-cards">
+        <button class="home-card" data-enter="qq">
+          <span class="home-card-tag">QQ · NapCat</span>
+          <span class="home-card-name">QQ</span>
+          <span class="home-card-desc" data-i18n="群聊、私聊、人格与工具">群聊、私聊、人格与工具</span>
+          <span class="home-card-state">
+            <span class="led" id="home-led-qq"></span>
+            <span id="home-state-qq">未运行</span>
+          </span>
+        </button>
+        <button class="home-card" data-enter="wechat">
+          <span class="home-card-tag">微信 · iLink</span>
+          <span class="home-card-name">微信</span>
+          <span class="home-card-desc" data-i18n="登录、Hook 与机器人">登录、Hook 与机器人</span>
+          <span class="home-card-state">
+            <span class="led" id="home-led-wx"></span>
+            <span id="home-state-wx">未登录</span>
+          </span>
+        </button>
+      </div>
+
+      <div class="banner" id="banner-app" hidden>
+        <span class="banner-icon">↑</span>
+        <div class="banner-text">
+          <strong id="banner-app-title">有新版本</strong>
+          <span id="banner-app-sub">下载后会自动关掉本程序并安装，装完自动重开。</span>
+        </div>
+        <div class="banner-actions">
+          <button class="btn btn-sm btn-primary" id="btn-app-update">下载并安装</button>
+          <button class="btn btn-sm btn-ghost" id="btn-app-dismiss">忽略这个版本</button>
+        </div>
+      </div>
+
+      <div class="banner" id="banner-napcat" hidden>
+        <span class="banner-icon">↑</span>
+        <div class="banner-text">
+          <strong id="banner-napcat-title">NapCat 有新版本</strong>
+          <span id="banner-napcat-sub">装完会重启 NapCat，可能要重新确认一下登录。</span>
+        </div>
+        <div class="banner-actions">
+          <button class="btn btn-sm btn-primary" id="btn-napcat-update">下载并安装</button>
+          <button class="btn btn-sm btn-ghost" id="btn-napcat-dismiss">忽略这个版本</button>
+        </div>
+      </div>
+
+      <div class="banner" id="banner-napcat-install" hidden>
+        <span class="banner-icon">↓</span>
+        <div class="banner-text">
+          <strong>这台机器上还没有 NapCat</strong>
+          <span id="banner-napcat-install-sub">QQ 那条链路要用它。点右边自动从 GitHub 下载最新版并装好，不用自己去翻发布页。</span>
+        </div>
+        <div class="banner-actions">
+          <button class="btn btn-sm btn-primary" id="btn-napcat-install">下载并装好</button>
+          <button class="btn btn-sm btn-ghost" id="btn-napcat-install-later">稍后</button>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button class="btn btn-primary" id="btn-up">一键全开</button>
+        <button class="btn" id="btn-down">全部停止</button>
+        <span class="spacer"></span>
+        <button class="btn btn-ghost btn-sm" id="btn-refresh">刷新状态</button>
+        <span class="result" id="up-result"></span>
+      </div>
+
+      <div class="cards">
+        <div class="svc" id="svc-napcat">
+          <div class="svc-top">
+            <span class="led" id="led-napcat"></span>
+            <span class="svc-name">NapCat</span>
+            <span class="svc-state" id="state-napcat">未连接</span>
+          </div>
+          <div class="svc-desc">QQ 的登录通道。它把 QQ 消息转成程序能读的接口，QQ 那条线全靠它。</div>
+          <div class="svc-meta" id="meta-napcat">—</div>
+          <div class="svc-actions">
+            <button class="btn btn-sm" data-svc="napcat" data-act="start">启动</button>
+            <button class="btn btn-sm btn-ghost" data-svc="napcat" data-act="stop">停止</button>
+            <button class="btn btn-sm btn-ghost" id="btn-napcat-panel">扫码 / 登录</button>
+          </div>
+          <label class="svc-watch"><input type="checkbox" data-watch="napcat" /> 断开后自动重启</label>
+        </div>
+
+        <div class="svc" id="svc-bridge">
+          <div class="svc-top">
+            <span class="led" id="led-bridge"></span>
+            <span class="svc-name">QQ 桥接</span>
+            <span class="svc-state" id="state-bridge">未运行</span>
+          </div>
+          <div class="svc-desc">收发 QQ 消息、调模型、管人格和记忆的那一层。QQ 能不能回话看它。</div>
+          <div class="svc-meta" id="meta-bridge">—</div>
+          <div class="svc-actions">
+            <button class="btn btn-sm" data-svc="bridge" data-act="start">启动</button>
+            <button class="btn btn-sm btn-ghost" data-svc="bridge" data-act="stop">停止</button>
+          </div>
+          <label class="svc-watch"><input type="checkbox" data-watch="bridge" /> 断开后自动重启</label>
+        </div>
+
+        <div class="svc" id="svc-matrix">
+          <div class="svc-top">
+            <span class="led" id="led-matrix"></span>
+            <span class="svc-name">模型 API</span>
+            <span class="svc-state" id="state-matrix">未运行</span>
+          </div>
+          <div class="svc-desc">本机的模型服务。桥接启动时自己拉起它，不单独开关；这里只看它在不在。</div>
+          <div class="svc-meta" id="meta-matrix">—</div>
+          <div class="svc-actions">
+            <button class="btn btn-sm btn-ghost" id="btn-goto-backend">换后端</button>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>刚开始用？四步</h2><span class="hint">每步做完了会打勾</span></div>
+        <div id="wizard"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>最近动态</h2><span class="hint">完整日志在「高级」页</span></div>
+        <pre class="log is-active" id="ov-log" style="position:static;height:150px;border-radius:6px;border:1px solid var(--line-soft)"></pre>
+      </div>
+    </section>
+
+    <!-- ══════════════════ 微信总览（只在微信平台出现） ══════════════════ -->
+    <section class="page" id="page-wx-overview" hidden>
+      <header class="page-head">
+        <h1 data-i18n="登录">登录</h1>
+        <p>通过微信官方 iLink 通道接入，与 QQ 完全独立。本页优先展示<strong>登录</strong>与 <strong>Hook</strong>。</p>
+      </header>
+
+      <div class="wx-hero">
+        <div class="wx-hero-main">
+          <div class="wx-hero-top">
+            <span class="led" id="wxo-led"></span>
+            <strong id="wxo-state">未启动</strong>
+            <span class="badge" id="wxo-badge">iLink</span>
+          </div>
+          <div class="wx-hero-meta" id="wxo-meta">启动后可扫码登录</div>
+        </div>
+        <div class="wx-hero-actions">
+          <button class="btn btn-primary" data-svc="wechat" data-act="start">启动</button>
+          <button class="btn" data-svc="wechat" data-act="stop">停止</button>
+          <button class="btn btn-ghost" id="wxo-refresh">刷新状态</button>
+          <span class="result" id="wxo-result"></span>
+        </div>
+      </div>
+
+      <div class="wx-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Hook</h2>
+            <span class="badge" id="wxo-hook-state">—</span>
+          </div>
+          <div class="wx-kv"><span>地址</span><code id="wxo-hook-url">未配置</code></div>
+          <div class="wx-kv"><span>口令</span><span id="wxo-hook-secret">未设置</span></div>
+          <div class="wx-kv"><span>事件</span><span id="wxo-hook-events">—</span></div>
+          <div class="actions">
+            <button class="btn btn-primary" id="wxo-goto-hook">配置 Hook</button>
+            <button class="btn" id="wxo-hook-test">发送测试</button>
+            <span class="result" id="wxo-hook-result"></span>
+          </div>
+        </div>
+
+      <div class="panel" id="wx-qr-panel" hidden>
+        <div class="panel-head"><h2>微信登录</h2><span class="hint" id="wx-qr-status">等扫码</span></div>
+        <div style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap">
+          <img id="wx-qr-img" alt="微信登录二维码" style="width:200px;height:200px;border-radius:8px;background:#fff;padding:8px" />
+          <div style="flex:1;min-width:200px">
+            <p class="hint" style="margin-top:0">
+              用要当机器人的那个微信号扫这张码。扫完手机上会显示登录状态，这里会自动跳成「已登录」。
+              二维码四分钟就过期，过期了重新点一次「启动」。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>快捷入口</h2><span class="hint">微信侧仅支持收发消息与图片，工具能力少于 QQ</span></div>
+        <div class="wx-quick">
+          <button class="wx-quick-item" data-goto="chat"><b>机器人</b><span>人格、注入频率与对话权限</span></button>
+          <button class="wx-quick-item" data-goto="messages"><b>消息</b><span>收发记录、主动发送、定时发送</span></button>
+          <button class="wx-quick-item" data-goto="phone"><b>手机</b><span>把手机通知转到电脑</span></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════ Hook（微信专属） ══════════════════ -->
+    <section class="page" id="page-hook" hidden>
+      <header class="page-head">
+        <h1>Hook</h1>
+        <p data-i18n="每收到或回复一条消息，都会按所选数据格式向指定地址推送一份 JSON。与 QQ 无关。">每收到或回复一条消息，都会按所选数据格式向指定地址推送一份 JSON。与 QQ 无关。</p>
+      </header>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>微信 Webhook</h2>
+          <span class="hint">每收到/回出一条消息就推一份 JSON 到你的地址</span>
+        </div>
+
+        <label class="switch-row">
+          <input type="checkbox" id="hookEnabled" />
+          <span>
+            <strong>启用 Webhook</strong>
+            <em>关着就什么都不推。开着但地址为空也不会推，不会报错。</em>
+          </span>
+        </label>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="hookUrl">推送地址</label>
+            <input id="hookUrl" placeholder="http://127.0.0.1:8080/wechat" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="hookSecret">口令（可选）</label>
+            <input id="hookSecret" placeholder="会放在 X-DHM-Secret 头里" spellcheck="false" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="hookFormat">数据格式</label>
+          <select id="hookFormat">
+            <option value="default">通用 JSON —— 自己写服务用这个</option>
+            <option value="onebot">OneBot v11 事件 —— 直接喂 NoneBot / Koishi</option>
+            <option value="template">自定义模板 —— 适配任意项目</option>
+          </select>
+          <span class="hint" id="hook-format-hint"></span>
+        </div>
+
+        <div class="field" id="hook-template-field" hidden>
+          <label for="hookTemplate">模板</label>
+          <textarea id="hookTemplate" rows="4" spellcheck="false" placeholder='{"text": {{text}}, "from": "{{from}}", "kind": "{{event}}"}'></textarea>
+          <span class="hint">占位符：<code>{{event}}</code> <code>{{from}}</code> <code>{{to}}</code> <code>{{text}}</code> <code>{{kinds}}</code> <code>{{at}}</code>。<code>{{text}}</code> 自带引号转义，写在 JSON 里不用再加引号。</span>
+        </div>
+
+        <div class="field">
+          <label>推哪些事件</label>
+          <label class="switch-row" style="padding:5px 0">
+            <input type="checkbox" name="hookEvent" value="message.received" />
+            <span><strong style="font-weight:500">收到消息</strong></span>
+          </label>
+          <label class="switch-row" style="padding:5px 0">
+            <input type="checkbox" name="hookEvent" value="message.replied" />
+            <span><strong style="font-weight:500">回复发出</strong></span>
+          </label>
+          <label class="switch-row" style="padding:5px 0">
+            <input type="checkbox" name="hookEvent" value="error" />
+            <span><strong style="font-weight:500">出错</strong></span>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-hook-save">保存</button>
+          <button class="btn" id="btn-hook-test">发送测试</button>
+          <span class="result" id="hook-result"></span>
+        </div>
+
+        <details class="help">
+          <summary>接别的微信 Hook 项目？看这里</summary>
+          <div class="help-body">
+            <p>GitHub 上活跃的微信 Hook 项目（wxhelper、WeChatFerry、WeChatPadPro 之类）各有各的回调格式，
+              这里用「数据格式」那三档把它们接起来：</p>
+            <ul>
+              <li><b>OneBot v11</b>：输出标准 <code>post_type=message</code> 事件，NoneBot2、Koishi、AstrBot 这类框架直接能收，不用改代码。</li>
+              <li><b>自定义模板</b>：自己写 JSON 骨架，插入 <code>{{from}}</code> <code>{{text}}</code> 等字段，按目标项目的文档拼接。</li>
+              <li><b>通用 JSON</b>：固定字段 <code>event / at / bot / from / text / kinds</code>，自己写个小服务最省事。</li>
+            </ul>
+            <p>推送是「发出去就不管」：对端 2xx 算成功，失败只记日志不重试，不会把消息卡住。</p>
+            <p class="mono" style="font-size:11.5px;color:var(--text-3)">
+              通用 JSON 示例：<br />
+              {"event":"message.received","at":"2026-10-20T03:12:00.000Z","bot":"xxx@im.bot","from":"wxid_abc","text":"你好","kinds":"文字"}
+            </p>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ══════════════════ API 与模型 ══════════════════ -->
+    <!-- ══════════════════ 当前状态 ══════════════════ -->
+    <section class="page" id="page-status" hidden>
+      <header class="page-head">
+        <h1 data-i18n="当前状态">当前状态</h1>
+        <p data-i18n="运行状态、运行时长与当前使用的模型档位。">运行状态、运行时长与当前使用的模型档位。</p>
+      </header>
+
+      <div class="status-hero" id="status-hero">
+        <div class="status-hero-main">
+          <span class="status-dot" id="status-dot"></span>
+          <div class="status-hero-text">
+            <strong id="status-title">未启动</strong>
+            <span id="status-sub">还没有服务在跑</span>
+          </div>
+        </div>
+        <div class="status-hero-meta">
+          <div class="status-meta-item">
+            <span id="status-uptime-label">已运行</span>
+            <b id="status-uptime">—</b>
+          </div>
+          <div class="status-meta-item">
+            <span>当前模式</span>
+            <b id="status-mode">—</b>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>模型两档</h2>
+          <span class="hint">分开配置，各用各的</span>
+        </div>
+        <div class="status-slots" id="status-slots"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>服务</h2>
+          <span class="hint">断开后自动重启的开关在首页</span>
+        </div>
+        <div class="status-services" id="status-services"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-models" hidden>
+      <header class="page-head">
+        <h1 data-i18n="API 与模型">API 与模型</h1>
+        <p data-i18n="这里管理模型供应商、密钥与切换顺序。批量粘贴多个 key，程序会自动识别厂商并分类，确认后即可保存。">这里管理模型供应商、密钥与切换顺序。批量粘贴多个 key，程序会自动识别厂商并分类，确认后即可保存。</p>
+      </header>
+
+      <!-- 两个用途板块由脚本从下面的模板克隆生成，HTML 里不写两份 -->
+      <div id="slot-panels"></div>
+
+      <!-- 批量导入 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>批量导入 API Key</h2>
+          <span class="hint">一行一条，认不出的会标「存疑」等你改</span>
+        </div>
+        <div class="field">
+          <label for="imp-text">粘贴内容</label>
+          <textarea id="imp-text" rows="6" spellcheck="false" placeholder="sk-xxxxxxxxxxxxxxxx&#10;https://api.deepseek.com/v1  sk-xxxxxxxx&#10;openrouter = sk-or-v1-xxxx&#10;# 以 # 开头的行会被跳过"></textarea>
+          <span class="hint">
+            支持的写法：只写 key（靠前缀认厂商）、<code>地址 + key</code>、<code>厂商 = key</code>、
+            <code>{"baseUrl":"…","key":"…"}</code>。认出来只是<b>建议</b>，下面那张表每一行都能改。
+          </span>
+        </div>
+        <div class="actions">
+          <button class="btn" id="btn-imp-scan">先识别（不写入）</button>
+          <button class="btn btn-primary" id="btn-imp-apply">确认写入</button>
+          <span class="result" id="imp-result"></span>
+        </div>
+        <div id="imp-report"></div>
+      </div>
+
+      <!-- 模型来源模板：脚本克隆两份，分别渲染成「纯聊天」和「聊天 + 指令」 -->
+      <template id="tpl-source-panel">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>模型来源</h2>
+            <span class="hint">选内置厂商，或自己填地址接中转站</span>
+          </div>
+
+        <div class="field">
+          <label for="provider">厂商</label>
+          <select id="provider"></select>
+          <span class="hint" id="provider-note"></span>
+        </div>
+
+        <div class="field">
+          <label>本机模型服务</label>
+          <div class="local-list" id="local-servers"><span class="hint">正在探测 11434 / 1234 / 8000 / 1337…</span></div>
+          <span class="hint">点击探测结果即可填入协议、地址与模型；本地服务无需真实 key，填写任意非空值即可。</span>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="protocol">协议</label>
+            <select id="protocol">
+              <option value="openai">OpenAI 兼容</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="gemini">Gemini</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="model">模型</label>
+            <div class="input-with-action">
+              <input id="model" placeholder="例如 deepseek-chat" spellcheck="false" />
+              <button class="btn btn-ghost" id="btn-models" title="问服务端要真实列表">拉取</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="baseUrl">接口地址</label>
+          <input id="baseUrl" placeholder="https://…/v1" spellcheck="false" />
+          <span class="hint">自定义接入要填到 <code>/v1</code> 为止</span>
+        </div>
+
+        <div class="field">
+          <label for="apiKey">API Key</label>
+          <div class="input-with-action">
+            <input id="apiKey" type="password" placeholder="留空则沿用已保存的值" spellcheck="false" />
+            <button class="btn btn-ghost" id="btn-toggle-key" title="显示/隐藏">显示</button>
+          </div>
+          <span class="hint" id="key-hint"></span>
+        </div>
+
+        <div class="panel-head sub"><h2>生成参数</h2><span class="hint">原样转给模型</span></div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="temperature">温度</label>
+            <input id="temperature" type="number" step="0.1" min="0" max="2" placeholder="0.8" />
+            <span class="hint">越高越放得开，群聊别开太高</span>
+          </div>
+          <div class="field">
+            <label for="maxTokens">单次最多出多少 token</label>
+            <input id="maxTokens" type="number" min="1" step="64" placeholder="1024" />
+            <span class="hint">太小会说话说一半</span>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="maxHistory">保留几条上下文</label>
+            <input id="maxHistory" type="number" min="0" step="2" placeholder="12" />
+            <span class="hint">不含本轮</span>
+          </div>
+          <div class="field">
+            <label for="timeoutMs">单轮超时（毫秒）</label>
+            <input id="timeoutMs" type="number" min="0" step="1000" placeholder="90000" />
+            <span class="hint">超时直接判定失败，避免群内等待</span>
+          </div>
+        </div>
+
+        <details class="help" data-adv>
+          <summary>更多参数</summary>
+          <div class="help-body">
+            <div class="field" style="margin-top:6px">
+              <label for="maxContextChars">上下文字符上限</label>
+              <input id="maxContextChars" type="number" min="0" step="1000" placeholder="24000" />
+              <span class="hint">粗估上限，超了从最早的消息开始丢</span>
+            </div>
+            <div class="field">
+              <label for="anthropicVersion">Anthropic 版本头</label>
+              <input id="anthropicVersion" placeholder="留空用协议默认值" spellcheck="false" />
+            </div>
+          </div>
+        </details>
+
+        <div id="tools-block">
+          <div class="panel-head sub"><h2>只读工具</h2><span class="hint">让它能看文件，但只能看</span></div>
+
+          <label class="switch-row">
+            <input type="checkbox" id="modelAllowTools" />
+            <span>
+              <strong>允许模型读工作区文件</strong>
+              <em>read_file / list_dir / search_text 三件套。没有写、没有 shell，路径锁在工作区里。</em>
+            </span>
+          </label>
+
+          <div class="note" id="model-tools-warn" hidden>
+            只读工具不会改你的文件；密钥文件、<code>.env</code>、<code>state/</code>、<code>node_modules/</code>
+            是硬编码拒绝的，不会进模型上下文。工具只在 OpenAI 兼容协议下可用。
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="maxToolRounds">工具轮次上限</label>
+              <input id="maxToolRounds" type="number" min="1" max="10" step="1" placeholder="4" />
+              <span class="hint">最后一轮强制不带工具，必须给答案</span>
+            </div>
+            <div class="field">
+              <label for="workspaceDir">工具工作区</label>
+              <input id="workspaceDir" placeholder="留空 = 会话目录 / 当前目录" spellcheck="false" />
+              <span class="hint">所有读取都锁在这个目录内</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="note" id="chat-slot-note">
+          这一档不给工具，模型只会说话。需要读文件、执行指令时，切到「聊天 + 指令」单独配置。
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-test">测试连通</button>
+          <button class="btn" id="btn-save-model">保存</button>
+          <span class="result" id="test-result"></span>
+        </div>
+        </div>
+      </template>
+
+      <!-- 模型池 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>模型池</h2>
+          <span class="hint">从上往下依次试，一个用光了换下一个</span>
+        </div>
+
+        <label class="switch-row">
+          <input type="checkbox" id="poolEnabled" />
+          <span>
+            <strong>启用模型池</strong>
+            <em>关掉就只用默认模型单发，不走自动切换。</em>
+          </span>
+        </label>
+
+        <label class="switch-row">
+          <input type="checkbox" id="poolAllowPaid" />
+          <span>
+            <strong>允许付费档</strong>
+            <em>关着时免费档全用完了就回下面那句话，不会偷偷花钱。开着才会降级到付费档。</em>
+          </span>
+        </label>
+
+        <div class="field" style="margin-top:12px">
+          <label for="poolNotice">全用完时回什么</label>
+          <input id="poolNotice" spellcheck="false" placeholder="我这会儿 API 连不上了，等会儿再聊吧。" />
+          <span class="hint">所有候选都试过了才会发这句，平时看不到。</span>
+        </div>
+
+        <div class="field">
+          <label>免费档</label>
+          <div id="pool-free"></div>
+          <div class="input-with-action" style="margin-top:7px">
+            <input id="pool-add-free" placeholder="厂商/模型，例如 bailian/qwen3.8-max" spellcheck="false" />
+            <button class="btn btn-ghost" data-add="free">添加</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>付费档</label>
+          <div id="pool-paid"></div>
+          <div class="input-with-action" style="margin-top:7px">
+            <input id="pool-add-paid" placeholder="厂商/模型" spellcheck="false" />
+            <button class="btn btn-ghost" data-add="paid">添加</button>
+          </div>
+        </div>
+
+        <div class="field" id="pool-spent-group" hidden>
+          <label>废池</label>
+          <div id="pool-spent"></div>
+          <span class="hint">额度用完被停用的模型，不会参与排队。点「拿回来」手动解除后才会回到上面。</span>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-save-pool">保存并重建配置</button>
+          <span class="result" id="pool-result"></span>
+        </div>
+
+        <details class="help">
+          <summary>用量怎么算的</summary>
+          <div class="help-body" id="pool-usage">还没有调用记录。</div>
+        </details>
+      </div>
+
+      <!-- 模型价格 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>模型价格</h2>
+          <span class="hint">元 / 百万 token</span>
+        </div>
+
+        <div id="price-rows"></div>
+
+        <div class="input-with-action" style="margin-top:9px">
+          <input id="price-add-name" placeholder="添加模型名，例如 deepseek-flash" spellcheck="false" list="price-builtin" />
+          <button class="btn btn-ghost" id="btn-price-add">加一条</button>
+        </div>
+        <datalist id="price-builtin"></datalist>
+
+        <div class="field-row" style="margin-top:14px">
+          <div class="field">
+            <label for="price-fallback">表里没有的模型按谁算</label>
+            <input id="price-fallback" placeholder="deepseek-flash" spellcheck="false" list="price-builtin" />
+          </div>
+          <div class="field">
+            <label for="price-peak">高峰时段倍数</label>
+            <input id="price-peak" type="number" step="0.1" min="1" placeholder="2" />
+            <span class="hint">工作日 9—12 点、14—18 点按这个倍数算</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-save-price">保存</button>
+          <span class="result" id="price-result"></span>
+        </div>
+
+        <details class="help">
+          <summary>为什么要填这个</summary>
+          <div class="help-body">花费统计不联网查价，只按这张表乘 token 数。换了中转模型、又没在这里加一条的话，会按兜底价算 —— 数字照样出得来，但不对。</div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ══════════════════ 后端 ══════════════════ -->
+    <section class="page" id="page-backend" hidden>
+      <header class="page-head">
+        <h1 data-i18n="后端">后端</h1>
+        <p data-i18n="决定聊天里的回复由谁来生成。三种只能选一种，选完点「启用这条后端」才生效。">决定聊天里的回复由谁来生成。三种只能选一种，选完点「启用这条后端」才生效。</p>
+      </header>
+
+      <div class="type-grid" id="type-grid">
+        <button class="type-card" data-type="matrix">
+          <span class="type-name">API 实例</span>
+          <span class="type-note">有工具 · 能记事 · 桥接自己拉起</span>
+        </button>
+        <button class="type-card" data-type="model-api">
+          <span class="type-name">直连模型 API</span>
+          <span class="type-note">最快 · 只读工具可开 · 适合群聊</span>
+        </button>
+        <button class="type-card" data-type="cli">
+          <span class="type-name">CLI Agent</span>
+          <span class="type-note">有工具 · 能读写文件 · 冷启动慢</span>
+        </button>
+        <button class="type-card" data-type="ui">
+          <span class="type-name">前台客户端</span>
+          <span class="type-note">驱动已登录的 AI 客户端窗口 · 不耗 API · 一次一个窗口</span>
+        </button>
+      </div>
+
+      <!-- API 实例 -->
+      <div class="panel" id="panel-matrix">
+        <div class="panel-head">
+          <h2>API 实例</h2>
+          <span class="hint">桥接自己拉起的独立实例，跟桌面 App 那份互不干扰</span>
+        </div>
+
+        <dl class="kv" id="oc-info"></dl>
+
+        <div class="field" style="margin-top:14px" data-adv>
+          <label for="ocBaseUrl">实例地址</label>
+          <input id="ocBaseUrl" placeholder="留空 = 自动拉起并发现桥接专用实例" spellcheck="false" />
+          <span class="hint">
+            留空最省事：桥接自己在隔离目录下起一个实例、自己管它的生死。
+            只有要接一个<b>已经在跑</b>的实例时才填，填了就由你负责那个实例的启停。
+          </span>
+        </div>
+
+        <div class="field" data-adv>
+          <label for="ocStateDir">隔离目录</label>
+          <input id="ocStateDir" placeholder="留空 = 项目下的 .oc/" spellcheck="false" />
+          <span class="hint">实例的配置、日志、会话都落在这儿。换目录 = 换一套完全独立的实例，配置不会互相污染。</span>
+        </div>
+
+        <div class="field" data-adv>
+          <label for="sessionCwd">会话工作目录</label>
+          <input id="sessionCwd" spellcheck="false" placeholder="必须是项目根" />
+          <span class="hint">必须填项目根目录：它只从会话目录里读配置，目录不对就看不到那些方案，桥接会拒绝建会话。</span>
+        </div>
+
+        <label class="switch-row">
+          <input type="checkbox" id="ocDeleteArchived" />
+          <span>
+            <strong>回合结束就删掉会话</strong>
+            <em>不删除会持续累积，列表难以维护；删除后无法恢复上下文。</em>
+          </span>
+        </label>
+
+        <div class="actions">
+          <button class="btn" id="btn-save-oc">保存</button>
+          <button class="btn btn-primary" id="btn-use-oc">启用这条后端</button>
+          <span class="result" id="oc-result"></span>
+        </div>
+      </div>
+
+      <!-- 直连模型 API 摘要 -->
+      <div class="panel" id="panel-modelapi" hidden>
+        <div class="panel-head">
+          <h2>直连模型 API</h2>
+          <span class="hint">地址、key、模型都在「API 与模型」页填</span>
+        </div>
+        <dl class="kv" id="ma-summary"></dl>
+        <div class="note" id="ma-warn" hidden>
+          还没配。直连模型 API 至少要有一个「接口地址」和一个「模型」名，否则启用会失败。
+        </div>
+        <div class="actions">
+          <button class="btn" id="btn-goto-models">去配置</button>
+          <button class="btn btn-primary" id="btn-use-ma">启用这条后端</button>
+          <span class="result" id="ma-result"></span>
+        </div>
+      </div>
+
+      <!-- CLI -->
+      <div class="panel" id="panel-cli" hidden>
+        <div class="panel-head">
+          <h2>CLI 驱动</h2>
+          <span class="hint">只有核实过参数的才能选</span>
+        </div>
+
+        <div class="field">
+          <label for="cliDriver">驱动</label>
+          <select id="cliDriver"></select>
+          <div class="local-list" id="cli-installed"></div>
+        </div>
+
+        <div class="field">
+          <label for="cliTimeoutMs">单轮超时（毫秒）</label>
+          <input id="cliTimeoutMs" type="number" min="0" step="1000" placeholder="600000" />
+          <span class="hint">CLI agent 冷启动较慢，可适当调大；群聊场景过大会造成等待。</span>
+        </div>
+
+        <label class="switch-row">
+          <input type="checkbox" id="allowTools" />
+          <span>
+            <strong>允许使用本地工具</strong>
+            <em>开启后这个 agent 能读写文件、执行命令。群里任何人都可能诱导它操作本机。</em>
+          </span>
+        </label>
+
+        <div class="note err" id="tools-warn" hidden>
+          这条开关绕过了硬边界。只在你信任群里每一个人时才打开。
+        </div>
+
+        <div class="panel-head sub"><h2>驱动参数</h2><span class="hint">跟着选中的驱动变</span></div>
+        <div id="cli-options"></div>
+
+        <details class="help" data-adv>
+          <summary>自己接一个 CLI（不认识的工具也能用）</summary>
+          <div class="help-body">
+            <div class="field-row" style="margin-top:6px">
+              <div class="field">
+                <label for="customId">标识</label>
+                <input id="customId" placeholder="my-agent" spellcheck="false" />
+              </div>
+              <div class="field">
+                <label for="customBin">可执行文件</label>
+                <input id="customBin" placeholder="my-agent.exe 或完整路径" spellcheck="false" />
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="customPromptFlag">发提示词用的参数</label>
+                <input id="customPromptFlag" placeholder="-p" spellcheck="false" />
+              </div>
+              <div class="field">
+                <label for="customExtraArgs">附加参数</label>
+                <input id="customExtraArgs" placeholder="--json,--quiet" spellcheck="false" />
+              </div>
+            </div>
+            <span class="hint">填了「标识 + 可执行文件」就走自定义驱动，上面选的驱动会被忽略。说不认识输出格式的 CLI，那种基本接不上。</span>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-save-cli">保存并启用</button>
+          <span class="result" id="cli-result"></span>
+        </div>
+
+        <details class="help" data-adv>
+          <summary>还没核实的工具（<span id="unverified-count">0</span> 个）</summary>
+          <div class="help-body"><ul id="unverified-list" style="margin:0;padding-left:18px"></ul></div>
+        </details>
+      </div>
+      <div class="panel" id="panel-ui" hidden>
+        <div class="panel-head">
+          <h2>前台客户端</h2>
+          <span class="hint">桥接把提示词打进一个已登录的 AI 客户端窗口，再把回答读回来</span>
+        </div>
+        <p class="hint" style="margin-top:0">
+          适合「人在手机上、电脑空着」的用法：不消耗任何 API，用客户端里的订阅出回答。
+          三个前提：① 这台电脑设置成「只关显示器、不锁屏、不睡眠」—— 锁屏后脚本够不着任何应用；
+          ② 一次只能跑一个窗口；③ 客户端改版后定位规则可能要调。
+        </p>
+        <div class="field-row">
+          <div class="field">
+            <label for="uiProcess">进程名（必填其一）</label>
+            <input id="uiProcess" placeholder="例如 OpenCode、ChatGPT" spellcheck="false" />
+            <span class="hint">任务管理器「名称」列那个词，不带 .exe。支持正则。</span>
+          </div>
+          <div class="field">
+            <label for="uiTitle">窗口标题正则（可选）</label>
+            <input id="uiTitle" placeholder="多个窗口时用来筛" spellcheck="false" />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="uiInputMode">发送方式</label>
+            <select id="uiInputMode">
+              <option value="auto">自动（先试 UIA 直写，不行就粘贴）</option>
+              <option value="uia">只用 UIA 直写（不碰焦点，最不打扰）</option>
+              <option value="keys">只用粘贴（抢焦点 + Ctrl+V + 发送键）</option>
+              <option value="clipboard">点击 + 全页复制（客户端没有可访问性树时用，如 WorkBuddy）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="uiSendKeys">发送键</label>
+            <input id="uiSendKeys" placeholder="{ENTER}" spellcheck="false" />
+            <span class="hint">有的客户端是 Ctrl+Enter，填 ^(ENTER)。</span>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="uiSendButtonRegex">发送按钮名（正则）</label>
+            <input id="uiSendButtonRegex" placeholder="^发送$|^Send$" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="uiCopyButtonRegex">复制回复按钮名（正则，强烈建议配）</label>
+            <input id="uiCopyButtonRegex" placeholder="OpenCode 填：复制回复" spellcheck="false" />
+            <span class="hint">配了它，答案直接点客户端自己的复制按钮拿，最干净。</span>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="uiClickInputPct">输入框点击位置（clipboard 路线用）</label>
+            <input id="uiClickInputPct" placeholder="42%,48%;50%,48%;50%,90%" spellcheck="false" />
+            <span class="hint">客户区百分比，多个用分号隔开依次试。新会话和会话中输入框位置不同，都配上。</span>
+          </div>
+          <div class="field">
+            <label for="uiClickReadPct">读屏点击位置</label>
+            <input id="uiClickReadPct" placeholder="50%,80%" spellcheck="false" />
+            <span class="hint">全页复制前点一下这里（点空白处，别点按钮）。</span>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="uiMinWaitMs">最短等待（毫秒）</label>
+            <input id="uiMinWaitMs" type="number" min="0" step="500" placeholder="6000" />
+          </div>
+          <div class="field">
+            <label for="uiMaxWaitMs">最长等待（毫秒）</label>
+            <input id="uiMaxWaitMs" type="number" min="10000" step="5000" placeholder="240000" />
+            <span class="hint">文本连续 3 轮不变才算完成；回答慢就调大。</span>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="uiIdleGuardMs">空闲保护（毫秒）</label>
+            <input id="uiIdleGuardMs" type="number" min="0" step="500" placeholder="5000" />
+            <span class="hint">粘贴路线抢焦点前，发现电脑刚有人动过就放弃这一轮。0 = 关闭保护。</span>
+          </div>
+          <div class="field">
+            <label for="uiStopRegex">「生成中」按钮名（可选）</label>
+            <input id="uiStopRegex" placeholder="停止|Stop" spellcheck="false" />
+            <span class="hint">配了它，按钮还在就继续等，比文本稳定判得更准。</span>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-save-ui">保存并启用这条后端</button>
+          <span class="result" id="ui-result"></span>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ══════════════════ 聊天 ══════════════════ -->
+    <section class="page" id="page-chat" hidden>
+      <header class="page-head">
+        <h1 data-i18n="对话与人格">对话与人格</h1>
+        <p data-i18n="谁能让机器人回话、用什么人格回。QQ 和微信各存一份配置，上面的平台按钮切的就是这一页。">谁能让机器人回话、用什么人格回。QQ 和微信各存一份配置，上面的平台按钮切的就是这一页。</p>
+      </header>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>谁能对话</h2>
+          <span class="hint" data-pf="qq">黑名单永远优先</span>
+          <span class="hint" data-pf="wechat">名单空着就先放行所有人，方便自己试；填了号就只理名单里的</span>
+        </div>
+
+        <label class="switch-row">
+          <input type="radio" name="accessMode" value="all" />
+          <span>
+            <strong>放行所有人（默认）</strong>
+            <em>谁说话都回，只有黑名单里的人不回。省事，代价是陌生人也能跟它搭话。</em>
+          </span>
+        </label>
+        <label class="switch-row">
+          <input type="radio" name="accessMode" value="list" />
+          <span>
+            <strong>只回白名单</strong>
+            <em>白名单之外一律不理，一个字都不回。名单里的人照样受黑名单限制。</em>
+          </span>
+        </label>
+
+        <div class="field" style="margin-top:14px">
+          <label for="ownerQQ"><span data-pf="qq">管理员 QQ</span><span data-pf="wechat">管理员微信</span></label>
+          <input id="ownerQQ" placeholder="你的 QQ 号" spellcheck="false" />
+          <span class="hint" data-pf="qq">仅该账号可使用 /role、/silent 等管理命令，且其私聊会话默认使用「工作档」。</span>
+          <span class="hint" data-pf="wechat">填微信号或 wxid。接上之后只有他能用管理命令。</span>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="allowPrivate">私聊白名单</label>
+            <input id="allowPrivate" placeholder="QQ 号，逗号分隔" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="allowGroups">群白名单</label>
+            <input id="allowGroups" placeholder="群号，逗号分隔" spellcheck="false" />
+          </div>
+        </div>
+        <span class="hint">只在「只回白名单」模式下才有意义。</span>
+
+        <div class="field-row" style="margin-top:13px">
+          <div class="field">
+            <label for="denyPrivate">私聊黑名单</label>
+            <input id="denyPrivate" placeholder="QQ 号，逗号分隔" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="denyGroups">群黑名单</label>
+            <input id="denyGroups" placeholder="群号，逗号分隔" spellcheck="false" />
+          </div>
+        </div>
+        <span class="hint">两种模式下都生效，命中就彻底不吭声（连报错都不回）。</span>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-save-chat">保存</button>
+          <span class="result" id="chat-result"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>人格</h2>
+          <span class="hint">来自 roles/ 目录，按平台各存一份</span>
+        </div>
+
+        <div class="field">
+          <label for="role">角色</label>
+          <select id="role"></select>
+          <span class="hint" data-pf="qq">按下面「角色卡注入频率」注入 —— <strong>改完人格会立刻重新注入一次</strong>；<strong>换角色会自动重开会话</strong>。</span>
+          <span class="hint" data-pf="wechat">微信这份只在<strong>建会话时注入一次</strong>；<strong>换角色会自动重开会话</strong>。只改内容不用重开。</span>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="agentPreset">默认方案</label>
+            <select id="agentPreset">
+              <option value="qq-chat">普通聊天</option>
+              <option value="qq-chat-v2">二代会话（带记忆）</option>
+              <option value="qq-work">管理员工作</option>
+            </select>
+            <span class="hint">群里说话用哪个方案（改完要重启桥接）</span>
+          </div>
+          <div class="field">
+            <label for="workspaceTitle">会话标题</label>
+            <input id="workspaceTitle" placeholder="聊天" spellcheck="false" />
+            <span class="hint">会话列表里显示的名字</span>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="maxInjectChars">人格注入上限（字符）</label>
+          <input id="maxInjectChars" type="number" min="500" step="500" placeholder="6000" />
+          <span class="hint">人格 + 记忆 + 黑话都从这里出，太小会丢设定。两个平台共用这一项。</span>
+        </div>
+
+        <div class="field">
+          <label for="injectMode">角色卡注入频率</label>
+          <select id="injectMode">
+            <option value="session">每会话只粘一次（最省，推荐）</option>
+            <option value="every3">每 3 轮粘一次（折中）</option>
+            <option value="every">每轮都粘一遍（最稳，最费）</option>
+          </select>
+          <span class="hint">角色卡约 5 千字符，占固定开销九成。「粘一次」后它留在会话历史里，其余轮次只发一句人设提醒；<strong>改过人格会立刻重新注入</strong>。这一项管 QQ 侧，微信侧固定为「每会话一次」；改完<strong>下一条消息生效</strong>。</span>
+        </div>
+
+        <label class="switch-row" data-pf="qq">
+          <input type="checkbox" id="silentMode" />
+          <span>
+            <strong>静默模式</strong>
+            <em>开着时群友的消息不投递给模型，只有管理员能对话。</em>
+          </span>
+        </label>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-save-role">保存人格设置</button>
+          <span class="result" id="role-result"></span>
+        </div>
+      </div>
+
+      <!-- 人格卡本体 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>人格卡</h2>
+          <span class="hint">只写「你是谁、怎么说话」，不写工具用法</span>
+        </div>
+
+        <div class="msg-layout" style="grid-template-columns:210px minmax(0,1fr)">
+          <div class="contacts" id="role-list"></div>
+          <div>
+            <div class="field">
+              <label for="role-name">名字</label>
+              <div class="input-with-action">
+                <input id="role-name" placeholder="例如 傲娇助手" spellcheck="false" />
+                <button class="btn btn-ghost" id="btn-role-new">打开 / 新建</button>
+              </div>
+              <span class="hint">名字 = 文件名。已存在就载入它，不存在就用模板起一张空卡（还没落盘，改完点保存）。不能带 <code>/ \ : * ? " &lt; &gt; |</code>。</span>
+            </div>
+            <div class="field">
+              <label for="role-content">内容（Markdown）</label>
+              <textarea id="role-content" rows="14" spellcheck="false" placeholder="## 一、你是谁&#10;…"></textarea>
+              <span class="hint" id="role-content-hint">左边选一张卡，或者在上面填名字点「打开 / 新建」。</span>
+            </div>
+            <div class="actions plain">
+              <button class="btn btn-primary" id="btn-role-save">保存内容</button>
+              <button class="btn" id="btn-role-template">填入参考模板</button>
+              <button class="btn btn-danger" id="btn-role-del">删除这张卡</button>
+              <span class="result" id="role-edit-result"></span>
+            </div>
+          </div>
+        </div>
+
+        <details class="help">
+          <summary>保存和删除会做什么</summary>
+          <div class="help-body">
+            <p>保存/删除前都会先把旧内容备份到 <code>state/role-backups/</code>，改坏了能捞回来。</p>
+            <p>改完内容还要在上面「人格」里选中它并保存，才算真正启用。正在被 QQ 或微信用着的卡不许删。</p>
+          </div>
+        </details>
+      </div>
+
+      <!-- 自动整理 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>导入素材，自动整理成人格卡</h2>
+          <span class="hint">调一次你自己的模型，只整理不保存</span>
+        </div>
+
+        <div class="field">
+          <label for="organize-text">原始素材</label>
+          <textarea id="organize-text" rows="7" spellcheck="false" placeholder="直接写：姓名、性格、语气、常用词、几句她可能说的话……&#10;不用排版，越具体越好。"></textarea>
+          <span class="hint">
+            程序会把它整理成标准五段式（你是谁 / 说话风格 / 性格与反应 / 梗与背景 / 回复示例），
+            结果填进上面的内容框，<b>你过目改完再保存</b> —— 不会直接写进 roles/。
+            素材只发给你自己配的模型服务商。
+          </span>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-organize">整理成人格卡</button>
+          <span class="result" id="organize-result"></span>
+        </div>
+      </div>
+
+      <!-- 工具开关：模型手里有什么牌，在这里给 -->
+      <div class="panel" data-pf="qq">
+        <div class="panel-head">
+          <h2>模型能用哪些工具</h2>
+          <span class="hint">关掉的工具模型调不到，它也不知道自己有这个功能</span>
+        </div>
+
+        <div class="tool-presets">
+          <button class="btn btn-sm" data-tool-preset="readonly">只看不说</button>
+          <button class="btn btn-sm" data-tool-preset="standard">出厂默认</button>
+          <button class="btn btn-sm" data-tool-preset="all">全部打开</button>
+          <span class="hint" id="tools-count">—</span>
+        </div>
+
+        <div id="tool-groups" data-adv></div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-tools-save">保存工具开关</button>
+          <button class="btn" id="btn-tools-restart" hidden>重启桥接</button>
+          <span class="result" id="tools-result"></span>
+        </div>
+
+        <details class="help">
+          <summary>为什么改了要重启桥接</summary>
+          <div class="help-body">
+            <p>工具清单是桥接<strong>启动时</strong>读进内存的。只写配置文件的话，界面上开关变了、
+              模型那边还是旧的一套 —— 最难查的那种「看着生效其实没生效」。</p>
+            <p>点击「重启桥接」会断开 QQ 几秒，重新连上后新工具表才生效。正在回复的那条消息会中断。</p>
+            <p>微信那边的工具面不走这里：它只有「收发消息 + 看图」，由微信 Hook 决定。</p>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ══════════════════ 消息 ══════════════════ -->
+    <section class="page" id="page-messages" hidden>
+      <header class="page-head">
+        <h1 data-i18n="消息与任务">消息与任务</h1>
+        <p data-i18n="查看最近消息、主动发送与定时发送。这里显示最近数百条活动记录，不是完整聊天存档。">查看最近消息、主动发送与定时发送。这里显示最近数百条活动记录，不是完整聊天存档。</p>
+      </header>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>消息流</h2>
+          <span class="hint" id="msg-note">按联系人看最近说了什么</span>
+          <span class="spacer" style="margin-left:auto"></span>
+          <button class="btn btn-ghost btn-sm" id="btn-msg-refresh">刷新</button>
+        </div>
+        <div class="msg-layout">
+          <div class="contacts" id="msg-contacts"></div>
+          <div class="msg-stream" id="msg-stream"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>省流总结</h2>
+          <span class="hint">把最近聊天喂给模型，出一份「我离开的这段时间发生了什么」</span>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="sum-contact">联系人</label>
+            <select id="sum-contact"></select>
+          </div>
+          <div class="field">
+            <label for="sum-count">范围</label>
+            <select id="sum-count">
+              <option value="50">最近 50 条</option>
+              <option value="100" selected>最近 100 条</option>
+              <option value="200">最近 200 条</option>
+            </select>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-summarize">生成省流版</button>
+          <span class="result" id="sum-result"></span>
+        </div>
+        <pre class="log" id="sum-out" hidden style="position:static;height:auto;max-height:280px;white-space:pre-wrap;user-select:text"></pre>
+        <span class="hint">总结走「API 与模型」页配的模型；群聊选群、私聊选人，范围越大越慢。</span>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>主动发送</h2>
+          <span class="hint" id="send-platform-hint">发给 QQ 好友（NapCat 得在跑）</span>
+        </div>
+
+        <div class="field">
+          <label for="send-target">发给谁</label>
+          <div class="input-with-action">
+            <input id="send-target" placeholder="QQ 号" spellcheck="false" />
+            <button class="btn btn-ghost" id="btn-send-pick">从联系人里选</button>
+          </div>
+          <span class="hint" id="send-target-hint">点右边能从好友/群列表里挑，也可以直接填号。</span>
+        </div>
+
+        <div class="field">
+          <label for="send-text">内容</label>
+          <textarea id="send-text" rows="4" spellcheck="false" placeholder="想说什么就写什么，太长会自动分条。"></textarea>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-send">发送</button>
+          <button class="btn btn-ghost" id="btn-send-dry" hidden>只预览不发送</button>
+          <span class="result" id="send-result"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>定时任务</h2>
+          <span class="hint">到点自动发送，或重启整条链路</span>
+        </div>
+        <div id="sched-list"></div>
+        <div class="actions">
+          <button class="btn" id="btn-sched-add">加一条任务</button>
+          <button class="btn btn-primary" id="btn-sched-save">保存任务</button>
+          <span class="result" id="sched-result"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Webhook 通知枢纽</h2>
+          <span class="hint">让电脑上的其他软件给你发 QQ / 微信通知：构建失败、下载完成、脚本报警…</span>
+        </div>
+
+        <label class="switch-row">
+          <input type="checkbox" id="hub-enabled" />
+          <span>
+            <strong>启用通知枢纽</strong>
+            <em>关着的时候，请求一律返回 404，什么都不发。改完点别处即自动保存。</em>
+          </span>
+        </label>
+
+        <div class="field">
+          <label for="hub-url">通知地址（把这个 URL 给别的软件用）</label>
+          <div class="input-with-action">
+            <input id="hub-url" readonly spellcheck="false" />
+            <button class="btn btn-ghost" id="btn-hub-copy">复制</button>
+            <button class="btn btn-ghost" id="btn-hub-regen">换口令</button>
+          </div>
+          <span class="hint">口令就是地址末尾那段 token；换口令后旧地址立刻失效。</span>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="hub-default-platform">默认发送到</label>
+            <select id="hub-default-platform">
+              <option value="qq">QQ</option>
+              <option value="wechat">微信</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="hub-default-to">默认目标</label>
+            <input id="hub-default-to" placeholder="QQ 号 / group:群号 / 微信用户 id" spellcheck="false" />
+          </div>
+        </div>
+        <span class="hint">请求里没写 platform / to 时用这两个默认值。QQ 发群要在号码前写 group:。</span>
+
+        <label class="switch-row">
+          <input type="checkbox" id="hub-mirror-enabled" />
+          <span>
+            <strong>转发规则：把微信消息转出去</strong>
+            <em>把微信 Webhook 的地址填成上面的通知地址，收到微信消息就按下面的条件转发（这就是「微信消息镜像到 QQ」）。</em>
+          </span>
+        </label>
+        <div class="field-row">
+          <div class="field">
+            <label for="hub-mirror-from">只转谁（留空 = 全部）</label>
+            <input id="hub-mirror-from" placeholder="微信用户 id" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="hub-mirror-keyword">只带关键词的（留空 = 全部）</label>
+            <input id="hub-mirror-keyword" placeholder="比如：报警" spellcheck="false" />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="hub-mirror-platform">转到</label>
+            <select id="hub-mirror-platform">
+              <option value="qq">QQ</option>
+              <option value="wechat">微信</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="hub-mirror-to">转发目标</label>
+            <input id="hub-mirror-to" placeholder="QQ 号 / group:群号 / 微信用户 id" spellcheck="false" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label>调用示例（curl）</label>
+          <pre class="code-sample" id="hub-sample"></pre>
+        </div>
+        <div class="actions">
+          <button class="btn" id="btn-hub-test">发一条测试通知</button>
+          <span class="result" id="hub-result"></span>
+        </div>
+        <span class="hint">主服务只监听本机（127.0.0.1）：本机脚本直接调；局域网设备要用，需要自行穿透。</span>
+      </div>
+
+    </section>
+
+    <!-- ══════════════════ 交流空间 ══════════════════ -->
+    <section class="page" id="page-exchange" hidden>
+      <header class="page-head">
+        <h1 data-i18n="交流空间">交流空间</h1>
+        <p data-i18n="QQ 与微信两个机器人的收发记录和后台日志都汇总在这一页。">QQ 与微信两个机器人的收发记录和后台日志都汇总在这一页。</p>
+      </header>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>传输内容</h2>
+          <span class="hint" id="ex-note">还没读到消息</span>
+          <span class="spacer" style="margin-left:auto"></span>
+          <label class="switch-inline">
+            <input type="checkbox" id="ex-live" checked />
+            <span>自动刷新</span>
+          </label>
+          <button class="btn btn-ghost btn-sm" id="btn-ex-refresh">刷新</button>
+        </div>
+
+        <div class="ex-layout">
+          <div class="ex-stream" id="ex-stream">
+            <div class="empty">正在读消息…</div>
+          </div>
+          <div class="ex-side">
+            <div class="ex-side-head">
+              <span>后台日志</span>
+              <label class="switch-inline">
+                <input type="checkbox" id="ex-only-msg" />
+                <span>只看消息</span>
+              </label>
+            </div>
+            <div class="log" id="ex-log"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>从这里说一句</h2>
+          <span class="hint" id="ex-send-hint">—</span>
+        </div>
+
+        <div class="field">
+          <label for="ex-target">发给谁</label>
+          <input id="ex-target" placeholder="QQ 号" spellcheck="false" />
+        </div>
+
+        <div class="field">
+          <label for="ex-text">内容</label>
+          <textarea id="ex-text" rows="3" spellcheck="false" placeholder="想说什么就写什么"></textarea>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-ex-send">发送</button>
+          <span class="result" id="ex-send-result"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════ 手机 ══════════════════ -->
+    <section class="page" id="page-phone" hidden>
+      <header class="page-head">
+        <h1 data-i18n="链接手机">链接手机</h1>
+        <p data-i18n="把手机上的通知转给电脑：短信、微信、QQ、快递取件码都行。手机端装一个转发 App，把这里的地址填进去就通了。">把手机上的通知转给电脑：短信、微信、QQ、快递取件码都行。手机端装一个转发 App，把这里的地址填进去就通了。</p>
+      </header>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>接收开关</h2>
+          <span class="hint" id="phone-state">—</span>
+        </div>
+
+        <label class="switch-row">
+          <input type="checkbox" id="phoneEnabled" />
+          <span>
+            <strong>在这台电脑上接收手机推送</strong>
+            <em>开着会在局域网开一个专用端口，只收推送，别的什么都不给。关掉就彻底不监听。</em>
+          </span>
+        </label>
+
+        <label class="switch-row">
+          <input type="checkbox" id="phoneNotifyAi" />
+          <span>
+            <strong>让模型也看到</strong>
+            <em>每条通知会作为一条「后台提醒」投进<b>管理员私聊</b>那一路会话 —— 模型能看到内容，
+              需要时会在 QQ 里跟你说一声。要桥接在跑、并且配了管理员 QQ。</em>
+          </span>
+        </label>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="phonePort">端口</label>
+            <input id="phonePort" type="number" min="1024" max="65535" step="1" placeholder="3210" />
+            <span class="hint">提示「端口被占用」就换一个，比如 3211。</span>
+          </div>
+          <div class="field">
+            <label for="phoneToken">口令</label>
+            <div class="input-with-action">
+              <input id="phoneToken" readonly spellcheck="false" />
+              <button class="btn btn-ghost" id="btn-phone-token">换一个</button>
+            </div>
+            <span class="hint">地址里带着它。同一个 WiFi 下别人不知道口令就塞不进来。</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-phone-save">保存并启用</button>
+          <span class="result" id="phone-result"></span>
+        </div>
+
+        <div class="note" id="phone-fw-note" hidden>
+          <span>Windows 第一次会弹「是否允许访问网络」，点<strong>允许</strong>。没弹、或者手机连不上，
+            用管理员身份开一次 PowerShell 跑下面这行，然后把电脑和手机都连回同一个 WiFi 再试。</span>
+          <div class="codebox" id="phone-fw-cmd" style="margin-top:8px"></div>
+          <div class="actions plain">
+            <button class="btn btn-sm" id="btn-phone-fw-copy">复制命令</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>填到手机上的地址</h2>
+          <span class="hint">手机和电脑必须在同一个 WiFi（同一个路由器）下</span>
+        </div>
+        <div class="qr-layout">
+          <div class="qr-box" id="phone-qr"><div class="empty">启用后出现二维码</div></div>
+          <div class="qr-side">
+            <div id="phone-urls"><div class="empty">还没启用</div></div>
+            <span class="hint" style="display:block;margin-top:8px">
+              手机相机扫左边这个码 → 打开一页配置说明 → 照着复制进去。打不开就把上面第一条地址手动敲进手机浏览器。
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>三步装好</h2>
+          <span class="hint">推荐 SmsForwarder：开源、不要 root、规则能按 App 和关键词过滤</span>
+        </div>
+
+        <ol class="steps">
+          <li>
+            <b>装 App</b>
+            <span>手机浏览器打开
+              <a href="https://github.com/pppscn/SmsForwarder/releases" target="_blank" rel="noreferrer">SmsForwarder 发布页</a>，
+              下最新那个 <code>.apk</code> 装上（会提示「未知来源」，允许一次）。</span>
+          </li>
+          <li>
+            <b>给权限</b>
+            <span>打开 App → 按它首页的引导，把<strong>通知使用权</strong>打开（系统设置里叫「通知使用权」或
+              「Notification access」）。要转短信的话再给短信权限。</span>
+          </li>
+          <li>
+            <b>建通道 + 建规则</b>
+            <span>「发送通道」→ 新增 → 选 <strong>Webhook</strong>：地址填上面那条、方法 POST、
+              内容类型 <code>application/json</code>、请求体粘贴下面这段。
+              然后「通知转发」→ 新增 → 勾上要转的 App（微信/短信/QQ…）→ 通道选刚建的那个。</span>
+          </li>
+        </ol>
+
+        <div class="field">
+          <label for="phone-snippet">请求体（整段复制）</label>
+          <pre class="codebox" id="phone-snippet"></pre>
+          <span class="hint">
+            <code>{{...}}</code> 这些是 App 里的变量，点它输入框旁边那排按钮插进去最保险 ——
+            变量名以你装的版本显示为准。<b>只填内容也行</b>：请求体直接写 <code>{{通知内容}}</code>，这边照样收。
+          </span>
+        </div>
+
+        <div class="actions">
+          <button class="btn" id="btn-phone-copy">复制请求体</button>
+          <button class="btn" id="btn-phone-copy-url">复制地址</button>
+          <span class="result" id="phone-copy-result"></span>
+        </div>
+
+        <details class="help">
+          <summary>用 message-mirror 或者自己写脚本？</summary>
+          <div class="help-body">
+            <p><b>message-mirror</b>（GitHub 上搜同名项目）：它默认就发
+              <code>{app, message_body, type}</code>，把地址填进去即可，请求体不用改。</p>
+            <p><b>自己写</b>：<code>POST</code> 到同一个地址，认这几个键名 ——
+              内容 <code>text / content / message_body / body / msg / message</code>，
+              来源 <code>from / sender / title / contact</code>，
+              App <code>app / packageName / package</code>。纯文本直接当内容。</p>
+            <p class="mono" style="font-size:11.5px;color:var(--text-3)" id="phone-curl"></p>
+          </div>
+        </details>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>最近收到</h2>
+          <span class="hint">最多留 60 条。同一个 WiFi 下真收到了，这里会立刻多一行</span>
+          <span class="spacer" style="margin-left:auto"></span>
+          <button class="btn btn-ghost btn-sm" id="btn-phone-refresh">刷新</button>
+        </div>
+        <div id="phone-recent"><div class="empty">还没收到过</div></div>
+        <div class="actions">
+          <button class="btn" id="btn-phone-test">本机模拟一条</button>
+          <button class="btn" id="btn-phone-notify-test">试一下模型那条路</button>
+          <span class="result" id="phone-test-result"></span>
+        </div>
+        <span class="hint">「本机模拟」只验证电脑这边收得下、显示得出来，<b>不能证明手机到电脑这段网络通</b>。
+          「试一下模型那条路」只看桥接在不在、管理员 QQ 配没配 —— 模型那边会收到一条真的后台提醒。</span>
+      </div>
+    </section>
+
+    <!-- ══════════════════ 高级 ══════════════════ -->
+    <section class="page" id="page-advanced" hidden>
+      <header class="page-head">
+        <h1 data-i18n="高级">高级</h1>
+        <p data-i18n="细项、路径、原始配置、日志。看不懂的别改 —— 留空就是默认值，斜杠后面写的是默认值。">细项、路径、原始配置、日志。看不懂的别改 —— 留空就是默认值，斜杠后面写的是默认值。</p>
+      </header>
+
+      <div class="panel">
+        <div class="panel-head"><h2>更新</h2><span class="hint">只提醒，装不装由你点</span></div>
+        <div class="field-row">
+          <div class="field">
+            <label for="upd-app-mode">软件本体</label>
+            <select id="upd-app-mode">
+              <option value="notify">检查到新版本就提醒</option>
+              <option value="off">不检查</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="upd-napcat-mode">NapCat</label>
+            <select id="upd-napcat-mode">
+              <option value="notify">检查到新版本就提醒</option>
+              <option value="off">不检查</option>
+            </select>
+          </div>
+        </div>
+        <div class="field" data-adv>
+          <label for="upd-repo">软件更新源</label>
+          <input id="upd-repo" placeholder="GitHub 仓库，owner/repo" spellcheck="false" />
+          <span class="hint">发行版里的资产名要含 <code>Setup</code> 并以 <code>.exe</code> 结尾。</span>
+        </div>
+        <div class="field-row" data-adv>
+          <div class="field">
+            <label for="upd-napcat-repo">NapCat 更新源</label>
+            <input id="upd-napcat-repo" placeholder="NapNeko/NapCatQQ" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="upd-napcat-mirror">下载镜像前缀</label>
+            <input id="upd-napcat-mirror" placeholder="https://ghproxy.cn/  （直连下不动时填）" spellcheck="false" />
+          </div>
+        </div>
+        <div class="field" data-adv>
+          <label for="upd-napcat-asset">资产匹配规则（正则）</label>
+          <input id="upd-napcat-asset" placeholder="Shell.*\.zip$" spellcheck="false" />
+          <span class="hint">发行版里挑哪个包来装。挑错了装不上，会提示你换一个。</span>
+        </div>
+        <div class="actions">
+          <button class="btn" id="btn-check-updates">立刻检查一次</button>
+          <button class="btn btn-primary" id="btn-save-updates">保存</button>
+          <span class="result" id="upd-result"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>组件</h2><span class="hint">要用才装，装进软件自己的目录</span></div>
+
+        <div id="component-list"><div class="empty">检测中…</div></div>
+
+        <div class="actions">
+          <button class="btn" id="btn-components-refresh">重新检测</button>
+          <button class="btn btn-ghost" id="btn-components-local">从本地 zip 装</button>
+          <input type="file" id="component-file" accept=".zip,application/zip" hidden />
+          <span class="result" id="component-result"></span>
+        </div>
+
+        <details class="help">
+          <summary>为什么不直接打包进安装包</summary>
+          <div class="help-body">NapCat 约 200 MB、ffmpeg 约 200 MB，全部打包会使安装包增至 1.6 GB，而多数用户仅需其中一个。点击即可从官方发布页下载并安装到用户目录，安装后路径会自动写入配置，无需手动填写。</div>
+          <div class="help-body">国内直连 GitHub 基本下不动，下载卡住时会提示。下好了本地 zip 的话，用上面的「从本地 zip 装」直接装，效果一样。</div>
+        </details>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>路径与端口</h2><span class="hint">指向你实际在跑的那份</span></div>
+
+        <div class="field">
+          <label for="bridgeRoot">桥接目录</label>
+          <input id="bridgeRoot" placeholder="C:\Users\…\DualHabitatMatrix" spellcheck="false" />
+          <span class="hint" id="root-hint">配置、日志、人格都从这个目录读</span>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="napcatDir">NapCat 目录</label>
+            <input id="napcatDir" placeholder="C:\Users\…\napcat-shell" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="napcatQQ">QQ 号</label>
+            <input id="napcatQQ" placeholder="快速登录用" spellcheck="false" />
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="napcatWsPort">WebSocket 端口</label>
+            <input id="napcatWsPort" type="number" min="1" max="65535" placeholder="3001" />
+            <span class="hint">只用来探活。桥接实际连的地址在下面「配置项 → 网关」。</span>
+          </div>
+          <div class="field">
+            <label for="napcatHttpPort">HTTP 端口</label>
+            <input id="napcatHttpPort" type="number" min="1" max="65535" placeholder="3000" />
+            <span class="hint">主动发 QQ 消息、拉好友列表走这个</span>
+          </div>
+        </div>
+
+        <div class="field-row" data-adv>
+          <div class="field">
+            <label for="napcatExe">启动器文件名</label>
+            <input id="napcatExe" placeholder="NapCatWinBootMain.exe" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="napcatWaitMs">等它起来的毫秒数</label>
+            <input id="napcatWaitMs" type="number" min="5000" max="600000" step="5000" placeholder="90000" />
+            <span class="hint">首次扫码登录要久一点</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-save-settings">保存</button>
+          <span class="result" id="settings-result"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>配置项</h2>
+          <span class="hint">留空 = 用默认值</span>
+        </div>
+        <div class="actions plain" style="margin-bottom:12px">
+          <input id="opt-filter" placeholder="搜设置项…（比如 概率 / 语音 / 表情）" spellcheck="false" style="max-width:260px" />
+          <button class="btn btn-primary" id="btn-save-options">保存全部改动</button>
+          <span class="result" id="options-result"></span>
+        </div>
+        <div id="options-groups"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>原始配置文件</h2>
+          <span class="hint">改错了会先备份到 state/config-backups</span>
+        </div>
+        <div class="tabs" id="raw-tabs">
+          <button class="tab is-active" data-raw="config">config.json</button>
+          <button class="tab" data-raw="models">models.json</button>
+          <button class="tab" data-raw="proxy">proxy.json</button>
+          <button class="tab" data-raw="secrets">secrets.json</button>
+        </div>
+        <div class="field">
+          <textarea id="raw-editor" rows="14" spellcheck="false" placeholder="点上面的标签载入…"></textarea>
+          <span class="hint mono" id="raw-path">—</span>
+        </div>
+        <div class="actions">
+          <button class="btn" id="btn-raw-load">重新载入</button>
+          <button class="btn btn-primary" id="btn-raw-save">保存这个文件</button>
+          <span class="result" id="raw-result"></span>
+        </div>
+        <div class="note warn">secrets.json 中为明文密钥。修改前请确认，请勿将内容粘贴到其他位置。</div>
+      </div>
+
+      <div class="panel flush">
+        <div class="term-wrap">
+          <div class="term-toolbar">
+            <div class="term-tabs" id="term-tabs">
+              <button class="term-tab is-active" data-pane="all">全部</button>
+              <button class="term-tab" data-pane="napcat">NapCat</button>
+              <button class="term-tab" data-pane="bridge">桥接</button>
+              <button class="term-tab" data-pane="wechat">微信</button>
+              <button class="term-tab" data-pane="app">软件</button>
+            </div>
+            <span style="margin-left:auto"></span>
+            <button class="btn btn-ghost btn-sm" id="btn-clear-log">清屏</button>
+            <label class="auto-scroll"><input type="checkbox" id="autoScroll" checked /> 自动滚动</label>
+          </div>
+          <div class="term-body">
+            <pre class="log is-active" id="log-all" data-pane="all"></pre>
+            <pre class="log" id="log-napcat" data-pane="napcat"></pre>
+            <pre class="log" id="log-bridge" data-pane="bridge"></pre>
+            <pre class="log" id="log-wechat" data-pane="wechat"></pre>
+            <pre class="log" id="log-app" data-pane="app"></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>插件</h2>
+          <span class="hint" id="plugins-note">放在桥接根目录 plugins\ 下的 .js，QQ 和微信都能用</span>
+        </div>
+        <div id="plugins-list"></div>
+        <div class="actions">
+          <button class="btn" id="btn-plugins-reload">重新装载</button>
+          <span class="result" id="plugins-result"></span>
+        </div>
+        <details>
+          <summary>插件怎么写？</summary>
+          <p class="hint" style="margin-top:6px">
+            ESM 模块，default 导出 <code>{ name, description, commands: [{ name, usage, description, run }] }</code>。
+            run 拿到 <code>ctx</code>（<code>ctx.reply(text)</code> 回消息、<code>ctx.platform</code>、<code>ctx.from</code>、<code>ctx.config</code>）和参数数组。
+            示例见 <code>plugins/example-hello.js</code>（装好就能发 /hello、/roll 试试）。
+            插件拥有与桥接进程相同的本机权限，只装信得过的代码。
+          </p>
+        </details>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>一键自检</h2><span class="hint">实际发送一次请求，验证是否正常返回</span></div>
+        <p class="hint" style="margin-top:0">不是测「能不能连上」，是测「模型会不会回话」—— 端点通但 key 错、模型名错，这里都会露出来。</p>
+        <div class="actions plain">
+          <button class="btn btn-primary" id="btn-selftest">开始自检</button>
+          <span class="result" id="selftest-result"></span>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 通用确认弹窗：所有「会动到东西」的动作都先过这一道 -->
+<div class="modal-mask" id="modal-mask">
+  <div class="modal">
+    <h3 id="modal-title">确认</h3>
+    <p id="modal-text"></p>
+    <ul id="modal-list" hidden></ul>
+    <div class="modal-actions">
+      <button class="btn" id="modal-cancel">取消</button>
+      <button class="btn btn-primary" id="modal-ok">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 设置面板：语言 / 字体大小 / 外观 / 开机自启。改动即时生效，没有「保存」按钮 -->
+<div class="modal-mask" id="settings-mask">
+  <div class="modal modal-wide">
+    <h3 data-i18n="设置">设置</h3>
+    <div class="set-row">
+      <label for="set-lang" data-i18n="语言">语言</label>
+      <select id="set-lang">
+        <option value="zh">简体中文</option>
+        <option value="en">English</option>
+      </select>
+    </div>
+    <div class="set-row">
+      <label for="set-mode" data-i18n="界面模式">界面模式</label>
+      <select id="set-mode">
+        <option value="simple" data-i18n="简易">简易</option>
+        <option value="advanced" data-i18n="高级">高级</option>
+      </select>
+    </div>
+    <div class="set-row">
+      <label for="set-font" data-i18n="字体大小">字体大小</label>
+      <select id="set-font">
+        <option value="0.9" data-i18n="小">小</option>
+        <option value="1" data-i18n="标准">标准</option>
+        <option value="1.12" data-i18n="大">大</option>
+        <option value="1.25" data-i18n="特大">特大</option>
+      </select>
+    </div>
+    <div class="set-row">
+      <label for="set-theme" data-i18n="外观">外观</label>
+      <select id="set-theme">
+        <option value="dark" data-i18n="深色">深色</option>
+        <option value="light" data-i18n="浅色">浅色</option>
+      </select>
+    </div>
+    <div class="set-row">
+      <label for="set-autostart" data-i18n="开机自启动">开机自启动</label>
+      <span class="set-switch">
+        <input type="checkbox" id="set-autostart" />
+        <span class="set-switch-hint" id="set-autostart-hint"></span>
+      </span>
+    </div>
+    <div class="set-note" data-i18n="常用界面文案支持英文，面板内的详细说明暂为中文，会逐步补齐。">常用界面文案支持英文，面板内的详细说明暂为中文，会逐步补齐。</div>
+    <div class="set-about" id="set-about"></div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" id="settings-done" data-i18n="完成">完成</button>
+    </div>
+  </div>
+</div>
+
+<!-- 联系方式与仓库地址 -->
+<div class="modal-mask" id="contact-mask">
+  <div class="modal modal-wide">
+    <h3 data-i18n="联系与仓库">联系与仓库</h3>
+    <p class="contact-intro" data-i18n="遇到问题、想提需求或参与开发，欢迎通过下面任意方式联系：">遇到问题、想提需求或参与开发，欢迎通过下面任意方式联系：</p>
+    <div class="contact-row">
+      <span class="contact-kind" data-i18n="邮箱">邮箱</span>
+      <code class="contact-value">2585175752@qq.com</code>
+      <button class="btn btn-ghost contact-copy" data-copy="2585175752@qq.com" data-i18n="复制">复制</button>
+    </div>
+    <div class="contact-row">
+      <span class="contact-kind" data-i18n="GitHub 仓库">GitHub 仓库</span>
+      <code class="contact-value" id="contact-repo">https://github.com/Delance-cn/DualHabitat-Matrix</code>
+      <button class="btn btn-ghost contact-copy" data-copy="https://github.com/Delance-cn/DualHabitat-Matrix" data-i18n="复制">复制</button>
+      <a class="btn" href="https://github.com/Delance-cn/DualHabitat-Matrix" target="_blank" rel="noopener" data-i18n="打开">打开</a>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="contact-done" data-i18n="完成">完成</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<script src="/qrcode.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,5423 @@
+/**
+ * desktop/server.mjs —— 桌面端的本地服务。
+ *
+ * 为什么不是一个纯前端包：这个软件要干的事（起子进程、读配置文件、发真请求测连通）
+ * 浏览器里做不了，必须有个本地后端。Electron 主进程直接 import 它起服务，
+ * 窗口 loadURL 到本地端口 —— 同源，省掉 CORS 和 preload 通信。
+ *
+ * 没有 Electron 也能单独跑：`node server.mjs`，浏览器打开 http://127.0.0.1:3200
+ */
+
+import http from 'node:http';
+import net from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { randomBytes } from 'node:crypto';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * 桥接源码的默认位置。
+ *
+ * 开发态：`desktop/` 的上一级就是项目根（src/ 在那儿）。
+ * 打包态：代码在 `resources/app/`，项目根不在包里 —— 桥接本体是 build-green.mjs
+ * 另外拷到 `resources/bridge/` 的，所以先认那个。不认的话，别人拿到包点「启动」
+ * 会得到 Cannot find module ...\src\bridge.js。
+ */
+const DEFAULT_ROOT = (() => {
+  const bundled = path.resolve(here, '..', 'bridge');
+  if (fs.existsSync(path.join(bundled, 'src', 'bridge.js'))) return bundled;
+  return path.resolve(here, '..');
+})();
+const PUBLIC = path.join(here, 'public');
+
+/**
+ * 后端代码从哪加载。
+ *
+ * 开发态读 `../src/backends/`（跟主项目共用一份源码）；
+ * 打包后 `../src` 在包外，读 `./vendor/backends/`（由 scripts/prepare-vendor.mjs 复制进来）。
+ * 两份内容完全一样，只是路径不同。
+ */
+const vendorBackends = path.join(here, 'vendor', 'backends');
+const backendsRoot = fs.existsSync(vendorBackends) ? vendorBackends : path.resolve(here, '..', 'src', 'backends');
+const loadBackend = (file) => import(pathToFileURL(path.join(backendsRoot, file)).href);
+
+const { listProviders, resolveProfile, listModels } = await loadBackend('providers.js');
+const { streamChat } = await loadBackend('protocols.js');
+const { DRIVERS, UNVERIFIED } = await loadBackend('cli/drivers.js');
+const { resolveBin } = await loadBackend('cli/engine.js');
+
+/**
+ * 桌面端自己的设置（不进版本库）。
+ * 为什么不放 config.json：那是桥接的配置，混进 UI 状态会互相污染。
+ *
+ * 路径由主进程通过 DHM_SETTINGS 注入 —— 打包后应用目录在 asar 里是只读的，
+ * 必须写到 userData。开发态没这个环境变量，就落在 desktop/ 下。
+ */
+const SETTINGS_FILE = process.env.DHM_SETTINGS || path.join(here, 'settings.json');
+
+/**
+ * 桥接的工作目录。
+ *
+ * 桌面端代码放在 A 目录，但真正在跑的那份可能在 B 目录（比如 C:\Users\<用户>\DualHabitatMatrix）。
+ * 所以所有配置路径都要跟着这里走，不能写死成 DEFAULT_ROOT。
+ */
+function getRoot() {
+  const settings = readJson(SETTINGS_FILE);
+  const raw = typeof settings.bridgeRoot === 'string' ? settings.bridgeRoot.trim() : '';
+  if (raw) {
+    // 用户可能粘贴成 C:/xxx 或带重复斜杠，path.resolve 会规范化成 Windows 形式
+    const resolved = path.resolve(raw);
+    if (fs.existsSync(resolved)) return resolved;
+  }
+  return DEFAULT_ROOT;
+}
+
+const configFile = () => path.join(getRoot(), 'config.json');
+const secretsFile = () => path.join(getRoot(), 'secrets.json');
+const exampleFile = () => path.join(getRoot(), 'config.example.json');
+
+const PORT = Number(process.env.DHM_DESKTOP_PORT ?? 3200);
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 一、配置读写
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+function readJson(file, fallback = {}) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    // PowerShell 5.1 的 `Set-Content -Encoding utf8` / 记事本"UTF-8"都带 BOM，
+    // 而 JSON.parse 见到 \uFEFF 直接抛 —— 不剥掉就会静默退回默认配置，
+    // 表现为"我明明改了 settings.json，界面却当没改"。
+    return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(file, data) {
+  fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * 从旧版（改名之前）的 userData 搬设置。
+ *
+ * Electron 的 userData 目录是按 app 名取的，改名连目录都换了：
+ *   旧：%APPDATA%\qqbridge-desktop
+ *   新：%APPDATA%\dualhabitat-matrix-desktop
+ * 不搬的话，装上新版会像「全新安装」—— 旧版的 NapCat 路径、QQ 号、开机自启这些全看不见。
+ * 只在新的 settings.json 还不存在时搬一次，搬完写 migratedFrom 做标记。
+ */
+const LEGACY_USERDATA = ['qqbridge-desktop', 'DualHabitatMatrix-desktop', 'QQbridge-TEST', 'DualHabitat Matrix'];
+const MIGRATE_FILES = ['settings.json', 'automation.json'];
+
+function migrateLegacyUserData() {
+  if (fs.existsSync(SETTINGS_FILE)) return null;
+
+  const dir = path.dirname(SETTINGS_FILE);
+  const appData = path.dirname(dir);
+
+  for (const name of LEGACY_USERDATA) {
+    const from = path.join(appData, name);
+    if (!fs.existsSync(path.join(from, 'settings.json'))) continue;
+
+    const copied = [];
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      for (const f of MIGRATE_FILES) {
+        const src = path.join(from, f);
+        if (!fs.existsSync(src)) continue;
+        fs.copyFileSync(src, path.join(dir, f));
+        copied.push(f);
+      }
+
+      // 旧 bridgeRoot 指向改名前的目录（qqbridge），早没了。
+      // 留着只会让「桥接根目录」显示成一个不存在的路径，删掉回落到默认根目录。
+      const s = readJson(SETTINGS_FILE);
+      const root = typeof s.bridgeRoot === 'string' ? path.resolve(s.bridgeRoot.replace(/\/+/g, '\\')) : '';
+      if (s.bridgeRoot && !fs.existsSync(root)) delete s.bridgeRoot;
+      s.migratedFrom = name;
+      s.migratedAt = Date.now();
+      writeJson(SETTINGS_FILE, s);
+    } catch (err) {
+      console.log(`[migrate] 从 ${name} 搬设置失败：${err.message}`);
+      continue;
+    }
+
+    console.log(`[migrate] 从 ${name} 搬了 ${copied.join(', ') || '（没有可搬的文件）'}`);
+    return name;
+  }
+  return null;
+}
+
+migrateLegacyUserData();
+
+/**
+ * 首次运行时把默认设置铺出来。
+ *
+ * 打包版的设置落在 userData（AppData\Roaming\DualHabitatMatrix-desktop），和开发时那份
+ * desktop/settings.json 不是同一个文件 —— 不铺的话第一次打开 QQ 号、桥接目录全是空的。
+ * 打包时会把 desktop/settings.json 复制成 default-settings.json 一起带进去。
+ */
+function seedSettings() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) return;
+    const seed = readJson(path.join(here, 'default-settings.json'), null);
+    if (!seed) return;
+    fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
+    writeJson(SETTINGS_FILE, seed);
+  } catch {
+    // 铺不出来也不影响启动，用户手填就是了
+  }
+}
+
+seedSettings();
+
+/* 桥接的 config.json 不随包发布（里面有 QQ 号、白名单、模型选择），首次运行
+ * 必须从模板铺一份。少了这一步，「一键启动」会在 bridge.js 里直接 ENOENT 退出，
+ * 界面上只看到「桥接已退出（code 1）」。
+ *
+ * 如果这台机器上还留着旧版的桥接目录，优先把它的 config.json / secrets.json
+ * 搬过来 —— 升级不该让用户重新配一遍。 */
+function legacyBridgeRoots() {
+  const found = [];
+  const seen = new Set();
+  const add = (raw) => {
+    if (!raw) return;
+    try {
+      const dir = path.resolve(String(raw).replace(/\/+/g, path.sep));
+      if (seen.has(dir)) return;
+      if (!fs.existsSync(path.join(dir, 'config.json'))) return;
+      seen.add(dir);
+      found.push(dir);
+    } catch {
+      /* 路径非法就当没看见 */
+    }
+  };
+
+  // 1. 旧版 settings.json 里记的 bridgeRoot（迁移时只删了失效的那条，文件还在）
+  const appData = path.dirname(path.dirname(SETTINGS_FILE));
+  for (const name of LEGACY_USERDATA) {
+    const legacy = readJson(path.join(appData, name, 'settings.json'), null);
+    if (legacy && typeof legacy.bridgeRoot === 'string') add(legacy.bridgeRoot);
+  }
+
+  // 2. 以前手动放桥接的几个常见位置
+  add(path.join(os.homedir(), 'qqbridge'));
+  add(path.join(os.homedir(), 'DualHabitatMatrix'));
+
+  // 3. Programs 下旧版安装包自带的 resources\bridge
+  const programs = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs') : '';
+  if (programs && fs.existsSync(programs)) {
+    for (const name of fs.readdirSync(programs)) {
+      add(path.join(programs, name, 'resources', 'bridge'));
+    }
+  }
+  return found;
+}
+
+function seedBridgeData() {
+  const root = getRoot();
+  const config = path.join(root, 'config.json');
+  if (fs.existsSync(config)) return null;
+
+  for (const legacy of legacyBridgeRoots()) {
+    if (path.resolve(legacy) === path.resolve(root)) continue;
+    try {
+      fs.copyFileSync(path.join(legacy, 'config.json'), config);
+      const secrets = path.join(legacy, 'secrets.json');
+      if (fs.existsSync(secrets) && !fs.existsSync(path.join(root, 'secrets.json'))) {
+        fs.copyFileSync(secrets, path.join(root, 'secrets.json'));
+      }
+      return { from: legacy };
+    } catch {
+      // 这个目录读不了就试下一个
+    }
+  }
+
+  const example = path.join(root, 'config.example.json');
+  try {
+    if (fs.existsSync(example)) {
+      fs.copyFileSync(example, config);
+      return { from: 'config.example.json' };
+    }
+  } catch {
+    /* 安装目录不可写：交给 startBridge 报错，别在这里把整个服务带崩 */
+  }
+  return null;
+}
+
+const bridgeSeed = seedBridgeData();
+if (bridgeSeed) console.log(`[bridge] 已从 ${bridgeSeed.from} 生成 config.json`);
+
+function loadConfig() {
+  const cfg = fs.existsSync(configFile()) ? readJson(configFile()) : readJson(exampleFile());
+  return normalizeBackendKey(cfg ?? {});
+}
+
+/**
+ * 2026-10 改名：内置实例那段配置以前叫 `opencode`（拿引擎的名字当了键），
+ * 现在叫 `matrix`。老 config.json 里还是旧键 —— 读的时候认一次，
+ * 让老配置不改也能跑；保存时只写新键，旧键顺手删掉（见 PUT /api/matrix）。
+ */
+function normalizeBackendKey(cfg) {
+  if (cfg.matrix == null && cfg.opencode != null) cfg.matrix = cfg.opencode;
+  delete cfg.opencode;
+  return cfg;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 模型配置分档（2026-10-20）
+ *
+ * 以前模型只有全局一份（backend.modelApi），QQ 和微信共用同一套厂商、密钥
+ * 和参数。实际上两边的用法完全不同：群里闲聊要快而便宜的模型，用户发指令
+ * 要能调工具、能读文件的模型。
+ *
+ * 现在按「平台 × 用途」拆成四档：
+ *   qq.chat     QQ 聊天        —— 只说话，不给工具
+ *   qq.work     QQ 聊天+指令   —— 能调工具、读文件
+ *   wechat.chat 微信聊天
+ *   wechat.work 微信聊天+指令
+ *
+ * 旧配置不迁移也能跑：没有 profiles 时，backend.modelApi 自动当成 qq.chat。
+ * 保存时同时回写 modelApi，让只认旧字段的桥接侧不至于读不到配置。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const MODEL_SLOTS = { qq: ['chat', 'work'], wechat: ['chat', 'work'] };
+
+const MODEL_PROFILE_FIELDS = [
+  'provider',
+  'protocol',
+  'baseUrl',
+  'model',
+  'temperature',
+  'maxTokens',
+  'maxHistory',
+  'timeoutMs',
+  'maxContextChars',
+  'anthropicVersion',
+  'allowTools',
+  'maxToolRounds',
+  'workspaceDir'
+];
+
+const MODEL_PROFILE_NUMBERS = new Set([
+  'temperature',
+  'maxTokens',
+  'maxHistory',
+  'timeoutMs',
+  'maxContextChars',
+  'maxToolRounds'
+]);
+
+/**
+ * 单档模型配置的白名单清洗。只留认识的字段，其余一律丢掉 —— 这个对象
+ * 来自 HTTP 请求体，不能原样落盘。
+ * @returns {object|null} 清洗后的配置；没有有效字段时返回 null
+ */
+function sanitizeModelProfile(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out = {};
+  for (const k of MODEL_PROFILE_FIELDS) {
+    const v = raw[k];
+    if (v === undefined || v === null || v === '') continue;
+    if (k === 'allowTools') {
+      out[k] = v === true;
+      continue;
+    }
+    if (MODEL_PROFILE_NUMBERS.has(k)) {
+      const n = Number(v);
+      if (Number.isFinite(n)) out[k] = n;
+      continue;
+    }
+    out[k] = String(v).slice(0, 2000);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * 读出四档配置。缺失的档位不补空对象，交给调用方判断「还没配」。
+ * 旧字段 backend.modelApi 兜底到 qq.chat。
+ */
+function readModelProfiles() {
+  const cfg = loadConfig();
+  const stored = cfg.backend?.profiles ?? {};
+  const out = {};
+  for (const [pf, slots] of Object.entries(MODEL_SLOTS)) {
+    out[pf] = {};
+    for (const slot of slots) {
+      const v = sanitizeModelProfile(stored?.[pf]?.[slot]);
+      if (v) out[pf][slot] = v;
+    }
+  }
+  if (!out.qq.chat) {
+    const v = sanitizeModelProfile(cfg.backend?.modelApi);
+    if (v) out.qq.chat = v;
+  }
+  return out;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 一之二、人格卡文件（roles/<名字>.md）
+ *
+ * 「角色」下拉原来只能挑 roles/ 里**已经存在**的 .md：想添加新人格，得自己开
+ * 文件管理器建文件，还得知道格式（roles/README.md 那套）。这里把「建 / 读 /
+ * 改 / 删」搬进界面。
+ *
+ * 名字来自界面输入，一律按**不可信输入**处理 —— 少校验一个分隔符或 `..`，
+ * `../../../config` 就能写到 roles/ 外面，把 config.json 覆盖掉。
+ * 约束和 roles/README.md 里写的一致（README 与 Windows 保留名不能用）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const ROLE_NAME_MAX = 40;
+const ROLE_CHARS_MAX = 200_000; // 文件体积护栏；注入上限是 config.role.maxInjectChars，另一回事
+
+/**
+ * 人格名 → 磁盘路径。名字非法就抛错（调用方把 message 直接回给前端）。
+ * @returns {{ name: string, dir: string, file: string }}
+ */
+function rolePath(name) {
+  const n = String(name ?? '').trim();
+  if (!n) throw new Error('人格名不能为空');
+  if (n.length > ROLE_NAME_MAX) throw new Error(`人格名太长（最多 ${ROLE_NAME_MAX} 字）`);
+  // 分隔符 / 盘符 / 通配符 / 控制字符一律不许出现
+  if (/[\\/:*?"<>|\u0000-\u001f]/.test(n)) throw new Error('人格名里不能有 \\ / : * ? " < > | 这些符号');
+  if (n.includes('..')) throw new Error('人格名里不能有 ..');
+  if (/[.\s]$/.test(n)) throw new Error('人格名不能以点或空格结尾（Windows 上这类名字建了删不掉）');
+  if (n.toUpperCase() === 'README') throw new Error('README 是说明文件，不能当人格名');
+  if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(n)) throw new Error(`"${n}" 是 Windows 保留名，换一个`);
+
+  const dir = path.join(getRoot(), 'roles');
+  const file = path.join(dir, `${n}.md`);
+  // 双保险：拼出来必须还在 roles/ 里（前面哪条校验漏了，这里兜住）
+  if (path.dirname(path.resolve(file)) !== path.resolve(dir)) throw new Error('非法的人格名');
+  return { name: n, dir, file };
+}
+
+/** 覆盖/删除前把旧内容存一份，改坏了能捞回来（对齐 preset 备份的做法）。 */
+function backupRole(file, name) {
+  try {
+    if (!fs.existsSync(file)) return null;
+    const dir = path.join(getRoot(), 'state', 'role-backups');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dest = path.join(dir, `${name}.${stamp}.md`);
+    fs.copyFileSync(file, dest);
+    return path.relative(getRoot(), dest);
+  } catch {
+    return null; // 备份失败不该拦住保存本身
+  }
+}
+
+/** 注入上限，和桥接读的是同一个数（config.json 的 role.maxInjectChars）。 */
+function roleInjectLimit() {
+  const n = Number(loadConfig().role?.maxInjectChars);
+  return Number.isFinite(n) && n > 0 ? n : 6000;
+}
+
+/** 这张卡现在被哪个平台用着 —— 正在用的不许删。 */
+function roleInUse(name) {
+  const used = [];
+  if (readJson(path.join(getRoot(), 'state', 'current-role.json'), {})?.role === name) used.push('QQ');
+  if (loadConfig().platforms?.wechat?.role === name) used.push('微信');
+  return used;
+}
+
+/**
+ * 角色卡自动整理：把用户随手粘贴的一段人设素材，调一次大模型整理成标准五段式卡。
+ *
+ * 前提是「模型来源」已经配好（backend.type === model-api）—— 整理本身就是一次模型调用。
+ * 只整理不落盘：结果回给前端，用户过目改完再走 /api/role/file 保存，坏结果不会直接进 roles/。
+ * 素材只发给用户自己配置的模型服务商，本服务不留存。
+ */
+const ROLE_ORGANIZE_MAX = 20_000;
+const ROLE_ORGANIZE_PROMPT = [
+  '你是人设卡整理员。把用户给的原始素材整理成一张「角色卡」，输出遵守以下格式（Markdown，五个二级标题，一字不差）：',
+  '',
+  '# 角色卡：<名字>',
+  '## 一、你是谁',
+  '## 二、说话风格',
+  '## 三、性格与反应',
+  '## 四、梗与背景（可选）',
+  '## 五、回复示例',
+  '',
+  '规则：',
+  '1. 只用素材里的信息，不编造设定；措辞可以顺，事实不能加。',
+  '2. 「说话风格」里明确写出「不要什么」（比如：不要总结、不要客服腔），这比写「要什么」更管用。',
+  '3. 「回复示例」给 3~5 条「对方说 → 你回」的示例，只示范语气和长度；素材里没有示例就按风格推断写短的。',
+  '4. 全文用中文，总长控制在 1000~4000 字符，别写提纲式的空话，每一条都要具体可用。',
+  '5. 只输出卡片本身，不要任何前言、解释或代码块围栏。'
+].join('\n');
+
+/**
+ * 把上游返回的一大坨报错翻译成人话 —— 界面上贴原始 JSON 等于没报错。
+ * 认不出来的原样带回，但截短，别把整页挤爆。
+ */
+function humanizeModelError(error) {
+  const raw = String(error?.message ?? error ?? '');
+  const low = raw.toLowerCase();
+  if (low.includes('free quota') || low.includes('free tier') || low.includes('quota exhausted') || low.includes('insufficient')) {
+    return '这个模型的免费额度用完了。换一个模型（或到「API 与模型」页把模型来源换成有额度的），再试一次。';
+  }
+  if (raw.includes('401') || low.includes('unauthorized') || low.includes('invalid api key') || low.includes('incorrect api key')) {
+    return 'key 不对或已失效。去「API 与模型」页重新粘一次这个厂商的 key。';
+  }
+  if (raw.includes('429') || low.includes('rate limit')) {
+    return '被限流了，等一分钟再试。';
+  }
+  if (raw.includes('403')) {
+    return '服务商拒绝了这次请求（403）。常见原因是额度用完、key 没开通这个模型、或地区限制。';
+  }
+  if (low.includes('timeout') || low.includes('aborted') || low.includes('timed out')) {
+    return '模型那边超时了。可能网络不稳，或者这个模型这会儿很慢，再试一次。';
+  }
+  if (raw.includes('404') || low.includes('model not found') || low.includes('no such model')) {
+    return '这个模型名在服务商那边不存在。到「API 与模型」页点「拉取」看看真实列表。';
+  }
+  return raw.length > 300 ? `${raw.slice(0, 300)}…` : raw;
+}
+
+/**
+ * 找一组能用来"整理文字"的模型 —— 按优先级排队，一个不行换下一个：
+ *   1. 「模型来源」配好的直连模型 API（backend.modelApi）
+ *   2. 模型池免费档前几个（`provider/model#tag`），用厂商预设补地址、用 secrets 里的 key
+ * 只挑「配置齐全」的，不猜；一个都挑不出来才报人话错误。
+ */
+function organizeCandidates() {
+  const secrets = readJson(secretsFile());
+  const out = [];
+  // 不看 backend.type：用户可能在用 API 实例当主后端，但「模型来源」照样填过一份。
+  const ma = loadConfig().backend?.modelApi;
+  if (ma?.baseUrl && ma?.model) {
+    try {
+      out.push({ profile: resolveProfile({ ...ma }, secrets), via: '模型来源' });
+    } catch { /* 这个来源配不全，往下走 */ }
+  }
+  // 池子里的厂商名和「模型来源」的内置厂商表不完全一致（池子里写 zhipuai，
+  // 预设表里叫 zhipu），不映射一下这些模型会被静默跳过、永远试不到。
+  const ALIAS = { zhipuai: 'zhipu', moonshotai: 'moonshot' };
+  // 池子里前面常常是同一家的几个型号，一起挂了就是一起挂 —— 所以取满 12 个，
+  // 让后面那几家（不同厂商）也有机会被试到。
+  for (const entry of (loadPool().free ?? []).map(String).slice(0, 12)) {
+    const [rawProvider, ...rest] = entry.split('/');
+    const provider = ALIAS[rawProvider] ?? rawProvider;
+    const model = rest.join('/').replace(/#.*$/, '');
+    if (!provider || !model) continue;
+    try {
+      out.push({ profile: resolveProfile({ provider, model }, secrets), via: '模型池' });
+    } catch { /* key 没配，跳过 */ }
+  }
+  return out;
+}
+
+async function organizeRoleCard({ text } = {}) {
+  const raw = String(text ?? '').trim();
+  if (!raw) return { ok: false, error: '先粘贴要整理的内容' };
+  if (raw.length > ROLE_ORGANIZE_MAX) {
+    return { ok: false, error: `内容太长（${raw.length} 字符，上限 ${ROLE_ORGANIZE_MAX}）。先删减一点再整理。` };
+  }
+  const candidates = organizeCandidates();
+  if (!candidates.length) {
+    return {
+      ok: false,
+      error:
+        '自动整理要调用一次大模型，但本机现在没有能用的模型。去「API 与模型」页选一个厂商、填 key（或把模型加进模型池），再回来整理。'
+    };
+  }
+
+  const prompt = `${ROLE_ORGANIZE_PROMPT}\n\n=== 待整理素材 ===\n${raw}`;
+  let lastError = '';
+
+  // 一个模型额度用完/限流，就换下一个 —— 用户点的是「整理」，不是「用第一个模型整理」。
+  for (const { profile, via } of candidates) {
+    let out = '';
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 120_000);
+    try {
+      for await (const item of streamChat(profile, {
+        messages: [{ role: 'user', text: prompt }],
+        signal: abort.signal
+      })) {
+        if (item.delta) out += item.delta;
+        if (out.length > 200_000) { abort.abort(); break; }
+      }
+      const card = out.trim();
+      if (!card) {
+        lastError = '模型没有返回内容';
+        continue;
+      }
+      pushLog(`角色卡自动整理完成（${card.length} 字符，${via} · ${profile.model ?? ''}）`, 'sys', 'app');
+      return { ok: true, card, model: profile.model ?? '', via };
+    } catch (error) {
+      lastError = humanizeModelError(error);
+      pushLog(`角色卡整理换模型（${profile.model ?? '?'}）：${lastError}`, 'err', 'app');
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  // 全试完还是不行：把「试了几个」和最后一次的原因一起说清楚 ——
+  // 只说最后一个错误会让人以为只试了一次，看不出程序已经尽力换过模型。
+  return {
+    ok: false,
+    error: `试了 ${candidates.length} 个模型都没成功。最后一次：${lastError || '未知原因'}`
+  };
+}
+
+/** 配置里有没有 key 只返回布尔，绝不把 key 本身吐给前端。 */
+function secretPresence() {
+  const secrets = readJson(secretsFile());
+  return Object.keys(secrets).map((k) => ({ env: k, set: Boolean(secrets[k]) }));
+}
+
+/** 点号路径读值：`socialV2.sticker.collect.maxPerMinute` → 数字。 */
+function deepGet(obj, dotted) {
+  return dotted.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+
+/**
+ * 点号路径写值（value === null 表示删掉这个键，回落到桥接自己的默认值）。
+ *
+ * 为什么用「删掉」而不是写空值：这些配置在桥接里都有 `?? 默认值` 的兜底，
+ * 但兜底只认 `undefined`。写个空串进去，`Number('')` 会变成 0，
+ * 于是「留空」就变成了「设成 0」—— 概率 0 和不冒泡是一样的，很难查。
+ */
+function deepSet(obj, dotted, value) {
+  const keys = dotted.split('.');
+  let cur = obj;
+  for (const k of keys.slice(0, -1)) {
+    if (typeof cur[k] !== 'object' || cur[k] === null) cur[k] = {};
+    cur = cur[k];
+  }
+  const last = keys[keys.length - 1];
+  if (value === null) delete cur[last];
+  else cur[last] = value;
+  return obj;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 可调项清单
+ *
+ * 为什么把 schema 放服务端：可调项有几十个，前端一个个手写 HTML 加事件会写到吐，
+ * 而且加一项要改三处（HTML / 事件 / 保存）。这里声明「路径 + 类型 + 含义」，
+ * 前端照着画就行 —— 加设置项只改这一个数组。
+ *
+ * type：bool / number / text / select / list（逗号分隔）
+ * default 只是占位提示和空值时的显示值，真正的兜底在桥接代码里。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* 内置价目表里的模型名（只抄名字，价格不抄 —— 价格在 bridge 的 model-prices.js 里，
+ * 会随官方调价变；这里只用来给「加一条」时提供候选，免得手打错名字）。 */
+const PRICE_BUILTIN_MODELS = [
+  { name: 'deepseek-flash', label: 'DeepSeek-V4.1-Flash' },
+  { name: 'deepseek-v4-flash', label: 'DeepSeek-V4.1-Flash（旧名）' },
+  { name: 'deepseek-v4-flash-vision-exp', label: 'DeepSeek-V4.1-Flash（视觉实验）' },
+  { name: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro-0813' },
+  { name: 'deepseek-pro', label: 'DeepSeek-V4-Pro-0813（旧名）' }
+];
+
+const OPTION_GROUPS = [
+  {
+    id: 'model',
+    title: '模型连接',
+    hint: '桥接拿哪个地址、哪个模型、什么思考强度去出字。改错了整条链路不响 —— 改完用「一键自检」验一遍',
+    items: [
+      { path: 'dsh.baseUrl', label: '模型服务地址', hint: '留空 = 用桥接自己拉起的那份', type: 'text', default: 'http://127.0.0.1:3080' },
+      { path: 'dsh.provider', label: '提供方', hint: '一般不用改', type: 'text', default: 'deepseek-official' },
+      { path: 'dsh.model', label: '模型名', hint: '要和中转那边认的名字逐字一致', type: 'text', default: 'deepseek-flash' },
+      { path: 'dsh.reasoningEffort', label: '思考强度', hint: '越高越慢越贵，但想得更透', type: 'select', default: 'max', options: [
+        { value: 'low', label: 'low（快，想得浅）' },
+        { value: 'high', label: 'high（默认偏上）' },
+        { value: 'max', label: 'max（最慢最深）' }
+      ] },
+      { path: 'dsh.authToken', label: '鉴权口令', hint: '中转要 Bearer 就填在这', type: 'text', secret: true, default: '' },
+      { path: 'dsh.authHeader', label: '鉴权头名字', hint: '一般就是 authorization', type: 'text', default: 'authorization' },
+      { path: 'dsh.authPrefix', label: '鉴权前缀', hint: '和口令之间会拼一个空格', type: 'text', default: 'Bearer' },
+      { path: 'dsh.allowRemote', label: '允许连非本机地址', hint: '关着的时候只让连 127.0.0.1，防止口令发到别人机器上', type: 'bool', default: false }
+    ]
+  },
+  {
+    id: 'rhythm',
+    title: '消息节奏',
+    hint: '发多快、等多久',
+    items: [
+      { path: 'sendDelayMs', label: '发送前的延迟', hint: '毫秒。给人类一点"打字"时间', type: 'number', step: 50, min: 0, default: 300 },
+      { path: 'questionTimeoutMs', label: '提问等回复的超时', hint: '毫秒。超时就当没答上来', type: 'number', step: 1000, min: 1000, default: 300000 },
+      { path: 'ackMessage', label: '先回一句', hint: '收到消息立刻先发这句（留空 = 不回）', type: 'text', default: '' },
+      { path: 'consolePort', label: '本地控制台端口', hint: '桥接自己那个网页控制台', type: 'number', step: 1, min: 1, max: 65535, default: 3100 },
+      { path: 'consoleToken', label: '控制台口令', hint: '留空 = 自动生成一个，存在 state/console-token', type: 'text', default: '' }
+    ]
+  },
+  {
+    id: 'session',
+    title: '会话轮换',
+    hint: '一条会话用得越久，每次请求要带的上下文越大。到线就自动换新会话（人格和近期消息每轮都会重新注入，不会全忘）',
+    items: [
+      { path: 'session.rotateIdleMs', label: '闲置多久换会话', hint: '毫秒。填 0 = 不按闲置换', type: 'number', step: 600000, min: 0, default: 7200000 },
+      { path: 'session.rotateTurns', label: '聊多少轮换会话', hint: '填 0 = 不按轮次换', type: 'number', step: 5, min: 0, default: 40 },
+      { path: 'session.rotateMaxAgeMs', label: '会话最长活多久', hint: '毫秒。填 0 = 不限年龄', type: 'number', step: 3600000, min: 0, default: 28800000 }
+    ]
+  },
+  {
+    id: 'social',
+    title: '社交（一代）',
+    hint: '收到消息后判断要不要插话的那套逻辑',
+    items: [
+      { path: 'social.enabled', label: '启用', type: 'bool', default: true },
+      { path: 'social.maxReplyChars', label: '单条最多多少字', type: 'number', step: 50, min: 20, default: 500 },
+      { path: 'social.contextWindow', label: '带几条上下文', hint: '判断要不要说话时看多少条历史', type: 'number', step: 1, min: 1, default: 20 },
+      { path: 'social.triggerProbability', label: '插话概率', hint: '0~1。普通消息被搭话的几率', type: 'number', step: 0.05, min: 0, max: 1, default: 0.1 },
+      { path: 'social.mustReplyKeywords', label: '必答关键词', hint: '命中一定回，逗号分隔', type: 'list', default: [] },
+      { path: 'social.skipProbability', label: '已读不回概率', hint: '0~1。决定回了又反悔的几率', type: 'number', step: 0.01, min: 0, max: 1, default: 0.05 },
+      { path: 'social.burstEnabled', label: '允许连发', hint: '关掉就永远一条一条发', type: 'bool', default: true },
+      { path: 'social.activeDurationEnabled', label: '有"活跃时段"', hint: '开启后会有一段时间特别爱说话', type: 'bool', default: true },
+      { path: 'social.proactiveEnabled', label: '允许主动找话说', type: 'bool', default: true },
+      { path: 'social.proactiveIdleThresholdMs', label: '多久没人说话才主动', hint: '毫秒', type: 'number', step: 60000, min: 60000, default: 1800000 },
+      { path: 'social.proactiveProbability', label: '主动开口概率', type: 'number', step: 0.05, min: 0, max: 1, default: 0.2 },
+      { path: 'social.activeCheckMinMs', label: '多久看一次（最短）', hint: '毫秒。判断要不要插话的间隔下限', type: 'number', step: 1000, min: 1000, default: 8000 },
+      { path: 'social.activeCheckMaxMs', label: '多久看一次（最长）', hint: '毫秒。实际间隔在这两个数之间随机', type: 'number', step: 1000, min: 1000, default: 30000 },
+      { path: 'social.activeReplyDelayMinMs', label: '回之前等多久（最短）', hint: '毫秒。装作在打字', type: 'number', step: 500, min: 0, default: 1000 },
+      { path: 'social.activeReplyDelayMaxMs', label: '回之前等多久（最长）', hint: '毫秒', type: 'number', step: 500, min: 0, default: 5000 },
+      { path: 'social.idleWindowMs', label: '多久算"没人说话"', hint: '毫秒。超过这个时长进入闲置逻辑', type: 'number', step: 60000, min: 60000, default: 360000 },
+      { path: 'social.idleRetryProbability', label: '闲置时再试的概率', hint: '0~1', type: 'number', step: 0.05, min: 0, max: 1, default: 0.4 },
+      { path: 'social.idleRetryWaitMs', label: '再试之前等多久', hint: '毫秒', type: 'number', step: 10000, min: 1000, default: 120000 },
+      { path: 'social.proactiveCheckMinMs', label: '主动找话的检查间隔（最短）', hint: '毫秒', type: 'number', step: 60000, min: 60000, default: 2700000 },
+      { path: 'social.proactiveCheckMaxMs', label: '主动找话的检查间隔（最长）', hint: '毫秒', type: 'number', step: 60000, min: 60000, default: 5400000 },
+      { path: 'social.activeDurationMinMs', label: '活跃时段多长（最短）', hint: '毫秒', type: 'number', step: 60000, min: 60000, default: 1200000 },
+      { path: 'social.activeDurationMaxMs', label: '活跃时段多长（最长）', hint: '毫秒', type: 'number', step: 60000, min: 60000, default: 3000000 },
+      { path: 'social.surrenderProbability', label: '直接放弃的概率', hint: '0~1。抽中就当这条没看见', type: 'number', step: 0.01, min: 0, max: 1, default: 0 },
+      { path: 'social.burstIntervalMinMs', label: '连发间隔（最短）', hint: '毫秒', type: 'number', step: 100, min: 100, default: 1000 },
+      { path: 'social.burstIntervalMaxMs', label: '连发间隔（最长）', hint: '毫秒', type: 'number', step: 100, min: 100, default: 3000 },
+      { path: 'social.longGapProbability', label: '出现长停顿的概率', hint: '0~1。连发中间突然停一下', type: 'number', step: 0.05, min: 0, max: 1, default: 0.2 },
+      { path: 'social.longGapMinMs', label: '长停顿多久（最短）', hint: '毫秒', type: 'number', step: 500, min: 0, default: 5000 },
+      { path: 'social.longGapMaxMs', label: '长停顿多久（最长）', hint: '毫秒', type: 'number', step: 500, min: 0, default: 10000 }
+    ]
+  },
+  {
+    id: 'socialV2',
+    title: '二代会话',
+    hint: '模型自己管收发、能潜水的那套（reserved2 模式）',
+    items: [
+      { path: 'socialV2.enabled', label: '启用', type: 'bool', default: true },
+      { path: 'socialV2.chatOnly', label: '纯聊天（不给工具）', hint: '打开后模型没有任何工具，只回话：一条消息只花一次调用，省 token；代价是引用回复、看图、联网搜索、表情语音全没了。改完会自动重新生成配置并重启桥接', type: 'bool', default: false },
+      { path: 'socialV2.autoReplyCheckMs', label: '自动回复检查间隔', hint: '毫秒', type: 'number', step: 1000, min: 1000, default: 30000 },
+      { path: 'socialV2.agentPreset', label: '用哪个 agent', type: 'select', default: 'qq-chat-v2', options: [
+        { value: 'qq-chat-v2', label: 'qq-chat-v2（推荐）' },
+        { value: 'qq-chat', label: 'qq-chat' }
+      ] },
+      { path: 'socialV2.provideRecommendations', label: '给模型行动建议', hint: '关掉更"野生"，但更容易不说话', type: 'bool', default: true },
+      { path: 'socialV2.send.maxMessageChars', label: '单条最多多少字', type: 'number', step: 50, min: 20, default: 500 },
+      { path: 'socialV2.send.maxSendPerMinute', label: '每分钟最多发几条', type: 'number', step: 1, min: 1, default: 8 },
+      { path: 'socialV2.send.maxSendPerHour', label: '每小时最多发几条', type: 'number', step: 1, min: 1, default: 60 },
+      { path: 'socialV2.send.burstEnabled', label: '允许连发', type: 'bool', default: true },
+      { path: 'socialV2.send.burstMaxMessages', label: '一次最多连发几条', type: 'number', step: 1, min: 2, default: 8 },
+      { path: 'socialV2.wait.defaultMs', label: '默认等待时长', hint: '毫秒。等新消息的默认值', type: 'number', step: 1000, min: 1000, default: 30000 },
+      { path: 'socialV2.wait.maxMs', label: '最长等待', hint: '毫秒', type: 'number', step: 1000, min: 1000, default: 600000 },
+      { path: 'socialV2.wake.defaultMode', label: '默认唤醒模式', type: 'select', default: 'diving', options: [
+        { value: 'diving', label: 'diving（潜水，偶尔上来）' },
+        { value: 'active', label: 'active（全程参与）' }
+      ] },
+      { path: 'socialV2.wake.preSleepWaitEnabled', label: '睡前先观察一轮', hint: '关掉会睡得很急', type: 'bool', default: true },
+      { path: 'socialV2.wake.preSleepWaitMs', label: '睡前观察时长', hint: '毫秒', type: 'number', step: 30000, min: 30000, default: 300000 },
+      { path: 'socialV2.wake.sleepMinMs', label: '最短睡多久', hint: '毫秒', type: 'number', step: 60000, min: 0, default: 60000 },
+      { path: 'socialV2.wake.maxWakePerHour', label: '每小时最多醒几次', type: 'number', step: 1, min: 1, default: 12 },
+      { path: 'socialV2.wake.recommendedProbability', label: '主动醒来的概率', type: 'number', step: 0.01, min: 0, max: 1, default: 0.05 },
+      { path: 'socialV2.wake.batchWindowMs', label: '消息合并窗口', hint: '毫秒。这段时间内的消息攒一起看', type: 'number', step: 1000, min: 0, default: 8000 },
+      { path: 'socialV2.context.recentLimit', label: '近期消息取多少条', type: 'number', step: 10, min: 1, default: 100 },
+      { path: 'socialV2.context.unreadLimit', label: '未读取多少条', type: 'number', step: 5, min: 1, default: 30 },
+      { path: 'socialV2.proactive.enabled', label: '允许主动找话说', type: 'bool', default: true },
+      { path: 'socialV2.proactive.idleThresholdMs', label: '多久没人说话才主动', hint: '毫秒', type: 'number', step: 60000, min: 60000, default: 900000 },
+      { path: 'socialV2.proactive.probability', label: '主动开口概率', type: 'number', step: 0.05, min: 0, max: 1, default: 0.3 },
+      { path: 'socialV2.feedback.maxLength', label: '反馈最多多少字', type: 'number', step: 50, min: 10, default: 500 },
+      { path: 'socialV2.feedback.notifyOwnerOnError', label: '出错时通知管理员', type: 'bool', default: false },
+      { path: 'socialV2.send.gapBaseMs', label: '打字基础间隔', hint: '毫秒。两条之间的固定底数', type: 'number', step: 100, min: 0, default: 800 },
+      { path: 'socialV2.send.gapPerCharMs', label: '每多一个字多等多久', hint: '毫秒。越长越像真在打字', type: 'number', step: 5, min: 0, default: 20 },
+      { path: 'socialV2.send.maxGapMs', label: '间隔上限', hint: '毫秒。算出来超过这个就按这个', type: 'number', step: 500, min: 0, default: 10000 },
+      { path: 'socialV2.send.burstIntervalMinMs', label: '连发间隔（最短）', hint: '毫秒', type: 'number', step: 100, min: 100, default: 1000 },
+      { path: 'socialV2.send.burstIntervalMaxMs', label: '连发间隔（最长）', hint: '毫秒', type: 'number', step: 100, min: 100, default: 3000 },
+      { path: 'socialV2.send.longGapProbability', label: '出现长停顿的概率', hint: '0~1', type: 'number', step: 0.05, min: 0, max: 1, default: 0.2 },
+      { path: 'socialV2.send.longGapMinMs', label: '长停顿多久（最短）', hint: '毫秒', type: 'number', step: 500, min: 0, default: 5000 },
+      { path: 'socialV2.send.longGapMaxMs', label: '长停顿多久（最长）', hint: '毫秒', type: 'number', step: 500, min: 0, default: 10000 },
+      { path: 'socialV2.wait.minMs', label: '等待下限', hint: '毫秒。模型要等也至少等这么久', type: 'number', step: 1000, min: 1000, default: 5000 },
+      { path: 'socialV2.wait.defaultQuietMs', label: '默认安静多久算说完', hint: '毫秒。等新消息时判断"这轮说完了"', type: 'number', step: 500, min: 0, default: 8000 },
+      { path: 'socialV2.wait.minQuietAfterNewMs', label: '来新消息后至少再等', hint: '毫秒。防止刚来人就走', type: 'number', step: 1000, min: 0, default: 10000 },
+      { path: 'socialV2.proactive.checkIntervalMinMs', label: '主动找话检查间隔（最短）', hint: '毫秒', type: 'number', step: 60000, min: 60000, default: 1800000 },
+      { path: 'socialV2.proactive.checkIntervalMaxMs', label: '主动找话检查间隔（最长）', hint: '毫秒', type: 'number', step: 60000, min: 60000, default: 5400000 },
+      { path: 'socialV2.context.contextWindow', label: '判断时带几条上下文', hint: '给模型看多少条历史来决定说不说', type: 'number', step: 1, min: 1, default: 20 },
+      { path: 'socialV2.context.inlineWakeMessages', label: '唤醒时直接附上新消息', hint: '关掉模型得自己再调一次工具去取', type: 'bool', default: true },
+      { path: 'socialV2.context.wakeMessageLimit', label: '唤醒最多附几条', type: 'number', step: 1, min: 1, default: 12 },
+      { path: 'socialV2.context.wakeRecentLimit', label: '唤醒时带几条前情', type: 'number', step: 1, min: 0, default: 4 },
+      { path: 'socialV2.context.wakeMaxChars', label: '唤醒附文最多多少字', hint: '超了截断。太大每次请求都贵', type: 'number', step: 500, min: 500, default: 6000 },
+      { path: 'socialV2.wake.sleepMaxMs', label: '最长睡多久', hint: '毫秒。填 0 = 不封顶', type: 'number', step: 60000, min: 0, default: 0 },
+      { path: 'socialV2.wake.maxWakePerMinute', label: '每分钟最多醒几次', type: 'number', step: 1, min: 1, default: 1 },
+      { path: 'socialV2.wake.noActionLimit', label: '连着几次没动作就提醒', hint: '醒了却什么都不干，提醒它一下', type: 'number', step: 1, min: 1, default: 3 },
+      { path: 'socialV2.wake.maxWakeConfigReminders', label: '唤醒设置最多提醒几次', hint: '提醒完就不念叨了', type: 'number', step: 1, min: 0, default: 2 }
+    ]
+  },
+  {
+    id: 'sticker',
+    title: '表情包',
+    hint: '同步、收藏、发图',
+    items: [
+      { path: 'socialV2.sticker.enabled', label: '启用', type: 'bool', default: true },
+      { path: 'socialV2.sticker.syncTtlMs', label: '同步缓存多久', hint: '毫秒。过了就重新拉一遍收藏夹', type: 'number', step: 10000, min: 0, default: 60000 },
+      { path: 'socialV2.sticker.maxListCount', label: '最多同步几个', type: 'number', step: 10, min: 1, default: 100 },
+      { path: 'socialV2.sticker.includeInPrompt', label: '把表情清单塞进提示词', hint: '关掉模型就不知道自己有哪些图', type: 'bool', default: true },
+      { path: 'socialV2.sticker.promptMaxStickers', label: '提示词里列几个', type: 'number', step: 1, min: 1, default: 8 },
+      { path: 'socialV2.sticker.collect.enabled', label: '允许自己收藏表情', type: 'bool', default: true },
+      { path: 'socialV2.sticker.collect.maxPerMinute', label: '每分钟最多收几个', type: 'number', step: 1, min: 1, default: 2 },
+      { path: 'socialV2.sticker.collect.maxPerHour', label: '每小时最多收几个', type: 'number', step: 1, min: 1, default: 10 },
+      { path: 'socialV2.sticker.collect.maxRemarkChars', label: '备注最多几个字', type: 'number', step: 1, min: 1, default: 20 }
+    ]
+  },
+  {
+    id: 'voice',
+    title: '语音',
+    hint: '发语音需要本机有 ffmpeg',
+    items: [
+      { path: 'socialV2.voice.enabled', label: '启用', type: 'bool', default: false },
+      { path: 'socialV2.voice.dir', label: '音频目录', hint: '相对项目根，或填绝对路径（要开下面那个开关）', type: 'text', default: 'audio' },
+      { path: 'socialV2.voice.allowAbsolutePath', label: '允许绝对路径', hint: '开了就等于允许模型读本机任意音频文件', type: 'bool', default: false },
+      { path: 'socialV2.voice.maxSeconds', label: '最长多少秒', type: 'number', step: 10, min: 1, default: 300 },
+      { path: 'socialV2.voice.maxBytes', label: '最大多少字节', type: 'number', step: 1048576, min: 1024, default: 20971520 },
+      { path: 'socialV2.voice.maxPerMinute', label: '每分钟最多发几条', type: 'number', step: 1, min: 1, default: 2 },
+      { path: 'socialV2.voice.maxPerHour', label: '每小时最多发几条', type: 'number', step: 1, min: 1, default: 10 },
+      { path: 'socialV2.voice.defaultVolume', label: '默认音量', hint: '1 = 原声', type: 'number', step: 0.1, min: 0, default: 1 },
+      { path: 'socialV2.voice.loudness', label: '响度处理', hint: '透传给 NapCat 的参数，一般不用改', type: 'text', default: 'normal' },
+      { path: 'socialV2.voice.autoReadback', label: '发完自动读回一遍', type: 'bool', default: true },
+      { path: 'socialV2.voice.ffmpegPath', label: 'ffmpeg 路径', hint: '留空 = 用 PATH 里的那个', type: 'text', default: '' }
+    ]
+  },
+  {
+    id: 'slang',
+    title: '黑话学习',
+    hint: '从群聊里学梗，然后自己用',
+    items: [
+      { path: 'slang.enabled', label: '启用', type: 'bool', default: true },
+      { path: 'slang.extractMinMessages', label: '攒够多少条才提炼', type: 'number', step: 1, min: 1, default: 10 },
+      { path: 'slang.extractCooldownMs', label: '提炼冷却', hint: '毫秒', type: 'number', step: 60000, min: 0, default: 300000 },
+      { path: 'slang.inferenceThresholds', label: '几次能猜出来', hint: '逗号分隔的数字，例：2, 4, 8', type: 'list', itemType: 'number', default: [2, 4, 8] },
+      { path: 'slang.injectMax', label: '最多注入几条', type: 'number', step: 1, min: 0, default: 8 },
+      { path: 'slang.autoResearch', label: '自己去网上查', hint: '拿不准的梗走只读联网搜索', type: 'bool', default: true },
+      { path: 'slang.learnerPreset', label: '用哪个 agent 学', hint: '学习任务单独跑一个会话，不占聊天的上下文', type: 'text', default: 'qq-chat' },
+      { path: 'slang.workspaceTitle', label: '学习会话的标题', type: 'text', default: 'QQ 黑话学习' }
+    ]
+  },
+  {
+    id: 'gateway',
+    title: '网关（OneBot）',
+    hint: '桥接连的是哪个 OneBot 实现',
+    items: [
+      { path: 'snowluma.wsUrl', label: 'WebSocket 地址', hint: '事件推送上来的那条', type: 'text', default: 'ws://127.0.0.1:3001' },
+      { path: 'snowluma.httpUrl', label: 'HTTP 地址', hint: '主动调接口用', type: 'text', default: 'http://127.0.0.1:3000' },
+      { path: 'snowluma.accessToken', label: 'OneBot 口令', hint: '必须和 NapCat 里配的一致，否则连不上', type: 'text', default: '' },
+      { path: 'snowluma.silenceWarnMs', label: '多久没消息就告警', hint: '毫秒', type: 'number', step: 60000, min: 0, default: 600000 },
+      { path: 'snowluma.followDiscoveredEndpoint', label: '跟着发现的地址走', hint: 'NapCat 换了端口时自动跟过去。填了固定地址建议关掉', type: 'bool', default: true },
+      { path: 'snowluma.homeDir', label: 'NapCat 的 app 目录', hint: '留空 = 自动探测。探测不到时才需要手填', type: 'text', default: '' },
+      { path: 'snowluma.launcherPath', label: 'NapCat 启动器路径', hint: '留空 = 在目录里自己找', type: 'text', default: '' }
+    ]
+  },
+  {
+    id: 'security',
+    title: '安全',
+    hint: '改动前想清楚',
+    items: [
+      { path: 'security.interceptNotify', label: '管理员命令被拦时通知', hint: '关掉就静默忽略', type: 'bool', default: true }
+    ]
+  },
+  {
+    id: 'commands',
+    title: '聊天指令',
+    hint: '在 QQ / 微信里发 / 开头的指令（仅管理员）：截屏、锁屏、定时关机、搜文件、插件。发 /help 看全部',
+    items: [
+      { path: 'commands.enabled', label: '启用本地指令', hint: '关掉后 / 开头的消息全部照旧交给模型，什么都不执行', type: 'bool', default: true },
+      { path: 'commands.shutdownDelaySec', label: '关机默认倒计时', hint: '/shutdown 不带参数时用这个值，单位秒，5~3600', type: 'number', default: 60 },
+      { path: 'commands.roots', label: '/find 搜索目录', hint: '逗号分隔的绝对路径；留空用 桌面/文档/下载/视频/图片', type: 'list' }
+    ]
+  }
+];
+
+/** schema 里出现过的全部路径 —— POST 时只允许改这些，避免前端写坏整个配置。 */
+const OPTION_PATHS = new Map(
+  OPTION_GROUPS.flatMap((g) => g.items.map((i) => [i.path, i]))
+);
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 模型能用哪些工具（config.json → socialV2.tools）
+ *
+ * 这些开关以前只在配置文件里躺着，界面上看不见 —— 想关掉「拍一拍」得自己去
+ * 翻 JSON。这里把 bridge 里那张 toolMap 原样搬过来，分组 + 中文名，
+ * 界面照着画开关就行。
+ *
+ * `flag` 必须和 bridge.js 里 `socialV2.tools` 的键名逐字一致；
+ * `default` 跟 config.example.json 的出厂值一致（没有 default 字段 = 出厂开）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const TOOL_GROUPS = [
+  {
+    id: 'read',
+    title: '读消息',
+    hint: '关掉这些，模型就看不见上下文，只会瞎回',
+    items: [
+      { flag: 'getPrompt', tool: 'qq_get_prompt', label: '取当前提示词', hint: '人设、群规、未读摘要一次拿全' },
+      { flag: 'getUnread', tool: 'qq_get_unread_messages', label: '取未读消息' },
+      { flag: 'getRecent', tool: 'qq_get_recent_messages', label: '取最近消息' },
+      { flag: 'getMyRecent', tool: 'qq_get_my_recent_messages', label: '取自己发过的' },
+      { flag: 'getMessageDetail', tool: 'qq_get_message_detail', label: '查单条详情' },
+      { flag: 'getActiveMembers', tool: 'qq_get_active_members', label: '看谁在活跃' },
+      { flag: 'socialState', tool: 'qq_social_state', label: '看社交状态', hint: '潜水/活跃、上次说话是什么时候' },
+      { flag: 'getImages', tool: 'qq_get_message_images', label: '看图', hint: '关掉就只能看到「[图片]」两个字' },
+      { flag: 'getForwardMsg', tool: 'qq_get_forward_msg', label: '读合并转发', default: false },
+      { flag: 'getSelfImage', tool: 'qq_get_self_image', label: '看自己的头像', default: false }
+    ]
+  },
+  {
+    id: 'send',
+    title: '发消息',
+    hint: '全关就是纯观察模式：只看不说',
+    items: [
+      { flag: 'sendMessage', tool: 'qq_send_message', label: '发消息（通用）' },
+      { flag: 'reply', tool: 'qq_reply', label: '引用回复' },
+      { flag: 'sendGroup', tool: 'qq_send_group_message', label: '发到群里' },
+      { flag: 'sendPrivate', tool: 'qq_send_private_message', label: '发私聊' },
+      { flag: 'sendBurst', tool: 'qq_send_burst', label: '连发多条', hint: '像人一样一句一句往外蹦' },
+      { flag: 'waitMessages', tool: 'qq_wait_for_messages', label: '等新消息', hint: '会占住一次调用，等到了再回' },
+      { flag: 'markRead', tool: 'qq_mark_read', label: '标记已读' },
+      { flag: 'sendPoke', tool: 'qq_send_poke', label: '拍一拍', default: false },
+      { flag: 'feedback', tool: 'qq_report_feedback', label: '写反馈报告', default: false }
+    ]
+  },
+  {
+    id: 'memory',
+    title: '记忆',
+    hint: '长期记住群里的人和事',
+    items: [
+      { flag: 'memory', tool: 'qq_memory_append / query / remove / clear', label: '长期记忆（增删查清）', default: false }
+    ]
+  },
+  {
+    id: 'slang',
+    title: '黑话',
+    hint: '学群里的梗，然后在对话里用',
+    items: [
+      { flag: 'slangQuery', tool: 'qq_slang_query', label: '查黑话', default: false },
+      { flag: 'slangSubmit', tool: 'qq_slang_submit', label: '提交新黑话', default: false }
+    ]
+  },
+  {
+    id: 'sticker',
+    title: '表情包',
+    hint: '收藏夹那套。主开关在「高级 → 表情包」',
+    items: [
+      { flag: 'listStickers', tool: 'qq_list_stickers', label: '看自己有哪些表情', default: false },
+      { flag: 'getStickerImage', tool: 'qq_get_sticker_image', label: '取表情图', default: false },
+      { flag: 'sendSticker', tool: 'qq_send_sticker', label: '发表情', default: false },
+      { flag: 'setStickerRemark', tool: 'qq_set_sticker_remark', label: '给表情起名', default: false },
+      { flag: 'stickerNote', tool: 'qq_sticker_note', label: '记表情备注', default: false },
+      { flag: 'collectSticker', tool: 'qq_collect_sticker', label: '自己收藏表情', default: false }
+    ]
+  },
+  {
+    id: 'voice',
+    title: '语音',
+    hint: '要本机装了 ffmpeg 才能用',
+    items: [
+      { flag: 'sendVoice', tool: 'qq_send_voice / qq_list_voices', label: '发语音', default: false }
+    ]
+  },
+  {
+    id: 'wake',
+    title: '自己的状态',
+    hint: '让模型自己决定什么时候睡、什么时候醒',
+    items: [
+      { flag: 'setWakeConfig', tool: 'qq_set_wake_config', label: '调醒睡节奏' }
+    ]
+  }
+];
+
+/** 只读：看得见，但一个字也发不出去。 */
+const TOOL_PRESET_READONLY = new Set([
+  'sendMessage', 'reply', 'sendGroup', 'sendPrivate', 'sendBurst',
+  'markRead', 'sendPoke', 'feedback', 'collectSticker', 'sendVoice', 'setWakeConfig'
+]);
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 模型 API 隔离实例 / 模型池
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const modelsFile = () => path.join(getRoot(), 'models.json');
+
+/**
+ * 实例的注册文件：桥接把它起在哪、pid 多少，都写在这儿。只读，不碰它的生死。
+ *
+ * 字段是 { id, version, url, pid, password } —— 注意存的是 **url** 不是 port，
+ * 一开始按 port 读，界面上端口永远是「—」。
+ */
+function ocInstance() {
+  const cfg = loadConfig();
+  const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(getRoot(), '.oc', 'state');
+  const file = path.join(stateDir, 'opencode', 'service.json');
+  const info = readJson(file, null);
+  if (!info) return { alive: false, pid: null, url: null, port: null, version: null, file };
+
+  let alive = false;
+  try {
+    // pid 活着不代表端口还是它的，但对"大概在不在"够用了；
+    // 真要确定就 probePort，那是 /api/state 里 napcat 那套的活。
+    process.kill(info.pid, 0);
+    alive = true;
+  } catch {
+    alive = false;
+  }
+
+  let port = null;
+  try {
+    port = info.url ? Number(new URL(info.url).port) || null : null;
+  } catch {
+    port = null;
+  }
+
+  return { alive, pid: info.pid ?? null, url: info.url ?? null, port, version: info.version ?? null, file };
+}
+
+function loadPool() {
+  return readJson(modelsFile(), {
+    enabled: true,
+    allowPaid: false,
+    // 全链熔断时直接发给对方的一句话，必须是**人话**（旧默认值 429ERROR 会原样发进聊天）。
+    exhaustedNotice: '我这会儿 API 连不上了，等会儿再聊吧。',
+    free: [],
+    paid: []
+  });
+}
+
+/**
+ * 桥接的熔断状态文件（运行时写在 .oc/state/model-chain.json）。
+ * health: [{ key, kind, until, detail, count, firstAt, lastAt }]
+ * key 形如 bailian/qwen3.8-max#low（也可能不带 #档位）。
+ */
+function chainStateFile() {
+  const cfg = loadConfig();
+  const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(getRoot(), '.oc', 'state');
+  return path.join(stateDir, 'model-chain.json');
+}
+
+/** 还在熔断期内（until 未到）的候选列表。 */
+function loadFused() {
+  const d = readJson(chainStateFile(), null);
+  const now = Date.now();
+  return (Array.isArray(d?.health) ? d.health : [])
+    .filter((e) => Number(e?.until) > now)
+    .map((e) => ({ key: String(e.key), until: Number(e.until), kind: e.kind ?? '', detail: e.detail ?? '' }));
+}
+
+/** 去掉 #档位后缀再比，兼容池子里带/不带档位两种写法。 */
+const baseModelId = (s) => String(s).replace(/#.*$/, '');
+
+/**
+ * 按模型累计本机用量（token）。
+ *
+ * 为什么读 模型 API 的会话库而不是问厂商：百炼/智谱/NVIDIA/Cloudflare 都没有公开的
+ * 余额或额度接口（实测过，见 2026-10-18 的调研），能查余额的只有 OpenRouter 一家。
+ * 所以"这个模型还剩多少"只能给个本机口径：这台机器上用它花过多少 token。
+ * 数据源是 模型 API 自己的 session_v2 表（每会话的 tokens_input/output + 模型名），
+ * 按 provider/id 聚合，档位（#low 之类）合并成同一个模型。
+ *
+ * 拿不到就返回 {}：界面就不显示这一栏，绝不因为统计挂了影响模型池本身。
+ */
+let _sqliteCtor = null;
+async function readModelUsage() {
+  try {
+    if (_sqliteCtor === null) {
+      _sqliteCtor = await import('node:sqlite').then((m) => m.DatabaseSync).catch(() => false);
+    }
+    if (!_sqliteCtor) return {};
+    const cfg = loadConfig();
+    const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(getRoot(), '.oc', 'state');
+    const candidates = [
+      path.join(path.dirname(stateDir), 'data', 'opencode', 'opencode.db'),
+      path.join(getRoot(), '.oc', 'data', 'opencode', 'opencode.db')
+    ];
+    const file = candidates.find((f) => fs.existsSync(f));
+    if (!file) return {};
+    const db = new _sqliteCtor(file, { readOnly: true });
+    const rows = db
+      .prepare('SELECT model, SUM(tokens_input + tokens_output) AS t, COUNT(*) AS n FROM session_v2 GROUP BY model')
+      .all();
+    db.close();
+    const out = {};
+    for (const r of rows) {
+      let id = String(r.model ?? '');
+      let provider = '';
+      try {
+        const j = JSON.parse(id);
+        id = j.id || id;
+        provider = j.providerID || '';
+      } catch {
+        /* 不是 JSON（老数据）就按原样用 */
+      }
+      const key = provider ? `${provider}/${id}` : id;
+      const prev = out[key] ?? { tokens: 0, calls: 0 };
+      prev.tokens += Number(r.t) || 0;
+      prev.calls += Number(r.n) || 0;
+      out[key] = prev;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** 池子里有哪些模型正在坐废池：熔断记录 ∩ 池内 id。 */
+function spentInPool(pool) {
+  const ids = [...(pool.free ?? []), ...(pool.paid ?? [])].map(String);
+  const spent = [];
+  for (const f of loadFused()) {
+    const id = ids.find((x) => x === f.key || baseModelId(x) === baseModelId(f.key));
+    if (id && !spent.some((s) => s.id === id)) {
+      spent.push({ id, until: f.until, kind: f.kind, detail: f.detail });
+    }
+  }
+  return spent;
+}
+
+/**
+ * 重新生成 opencode.json。
+ *
+ * 模型链是写在 opencode.json 里的，改了 models.json 不重跑一次生成器，
+ * 模型 API 那边看到的还是旧的模型表。
+ */
+function regenerateConfig() {
+  return new Promise((resolve) => {
+    const { command, env } = nodeRunner();
+    const child = spawn(command, [path.join(getRoot(), 'src', 'oc-config.js')], {
+      cwd: getRoot(),
+      env: { ...process.env, ...env },
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const lines = [];
+    relayText(child.stdout, lines);
+    relayText(child.stderr, lines);
+    child.on('close', (code) => {
+      pushLog(`重新生成配置文件结束（code ${code}）`, code === 0 ? 'sys' : 'err', 'bridge');
+      resolve({ ok: code === 0, lines });
+    });
+    child.on('error', (error) => resolve({ ok: false, lines: [String(error?.message ?? error)] }));
+  });
+}
+
+function relayText(stream, into) {
+  let buffer = '';
+  stream.on('data', (chunk) => {
+    buffer += chunk.toString();
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, idx).replace(/\r$/, '');
+      into.push(line);
+      if (line.trim()) pushLog(line, 'out', 'bridge');
+      buffer = buffer.slice(idx + 1);
+    }
+  });
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 二、NapCat
+ *
+ * 判断"NapCat 起没起来"看 3001 端口，不看子进程 ——
+ * NapCatWinBootMain.exe 是个启动器，拉起真正的 NapCat 后自己就退了，
+ * 拿子进程存活当判据会一直显示"没起来"。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+let napcatLaunch = { startedAt: null, pid: null, child: null };
+
+function probePort(port, host = '127.0.0.1', timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ port, host });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve(ok);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false));
+    sock.once('error', () => finish(false));
+  });
+}
+
+/** 轮询等端口就绪，比 bat 里硬等 30 秒靠谱 —— 快了立刻走，慢了自己等够。 */
+async function waitForPort(port, maxMs) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (await probePort(port)) return true;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  return false;
+}
+
+/**
+ * 本机已经装好的 NapCat 在哪。
+ *
+ * 精简安装包不带 NapCat，但用户机器上常常已经有一份（自己下的、或者旧版软件装的）。
+ * 只在设置里没写、又没有自带时才找；找到就记进 settings.json，下次不用再扫。
+ */
+function detectNapcatDir(exe) {
+  const bases = [
+    path.join(os.homedir(), 'napcat-shell'), // 打包脚本的默认源目录
+    path.join(os.homedir(), 'Documents', '默认项目', 'napcat'), // 以前手动装的
+    path.join(path.dirname(SETTINGS_FILE), 'napcat') // 软件自己下到 userData 里的
+  ];
+  for (const base of bases) {
+    if (!fs.existsSync(base)) continue;
+    if (fs.existsSync(path.join(base, exe))) return base;
+    let subs = [];
+    try {
+      subs = fs.readdirSync(base, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    // 先挑 NapCat* 这种完整目录，别选中 bootmain 之类只有启动器的半套
+    const dirs = subs.filter((d) => d.isDirectory());
+    dirs.sort((a, b) => Number(/^napcat/i.test(b.name)) - Number(/^napcat/i.test(a.name)));
+    for (const d of dirs) {
+      const p = path.join(base, d.name);
+      if (fs.existsSync(path.join(p, exe))) return p;
+    }
+  }
+  return '';
+}
+
+let napcatScanAt = 0;
+let napcatScanHit = '';
+
+function napcatSettings() {
+  const s = readJson(SETTINGS_FILE);
+  const n = s.napcat ?? {};
+  const exe = n.exe ?? 'NapCatWinBootMain.exe';
+
+  // 打包版自带 NapCat 时优先用它 —— 用户不用再去配路径。
+  // 判断标准是启动器真的在，不看目录存在与否（空目录不算数）。
+  const bundled = path.join(here, 'napcat');
+  const hasBundled = fs.existsSync(path.join(bundled, exe));
+
+  // 设置里没有、也没有自带 —— 先在本机常见位置找一遍，别一上来就让人重下
+  let dir = hasBundled ? bundled : n.dir ? path.resolve(n.dir) : '';
+  if (!dir) {
+    const now = Date.now();
+    if (now - napcatScanAt > 30_000) {
+      napcatScanAt = now;
+      napcatScanHit = detectNapcatDir(exe);
+    }
+    if (napcatScanHit && fs.existsSync(path.join(napcatScanHit, exe))) {
+      dir = napcatScanHit;
+      try {
+        const next = readJson(SETTINGS_FILE);
+        next.napcat = { ...(next.napcat ?? {}), dir };
+        writeJson(SETTINGS_FILE, next);
+        console.log(`[napcat] 找到本机已装的：${dir}`);
+      } catch {
+        /* 写不进去也不影响这次使用 */
+      }
+    }
+  }
+
+  return {
+    dir,
+    bundled: hasBundled,
+    exe,
+    qq: n.qq ?? '',
+    wsPort: Number(n.wsPort) || 3001,
+    httpPort: Number(n.httpPort) || 3000,
+    waitMs: Number(n.waitMs) || 90_000,
+    updateMode: n.updateMode === 'notify' ? 'notify' : 'off',
+    updateRepo: String(n.updateRepo ?? 'NapNeko/NapCatQQ'),
+    updateAsset: String(n.updateAsset ?? 'Shell.*\\.zip$'),
+    updateMirror: String(n.updateMirror ?? ''),
+    lastUpdateCheck: Number(n.lastUpdateCheck) || 0
+  };
+}
+
+/**
+ * 起 NapCat。
+ *
+ * 以前是 `windowsHide:false` + `stdio:'ignore'` —— **故意**留一个黑窗口，因为要扫码登录。
+ * 代价是那个窗口收不进软件：用户得同时盯两个地方，窗口一关日志就没了，
+ * 「集成」也就无从谈起。
+ *
+ * 现在改成窗口藏起来、把启动器的 stdout/stderr 接进「日志」页：
+ *   - NapCat 的日志本来就是重定向出来的（启动时会自报
+ *     `[StdOut] 已重定向到命名管道：\\.\pipe\NapCat_<pid>`），管道里有；
+ *   - 扫码/登录走 WebUI 面板（`/api/napcat/panel` 会给出带 token 的地址，
+ *     「运行」页有按钮直接打开）。
+ *
+ * ⚠️ 停它**不要**用同目录的 `napcat.kill.qq.bat`：那脚本里"输入 0"那条是
+ * `taskkill /f /im QQ.exe`，会把用户自己日常在用的 QQ 一起杀掉。
+ */
+function startNapcat() {
+  const n = napcatSettings();
+  if (!n.dir) return { ok: false, error: '还没配 NapCat 目录（去「运行」页填）' };
+  if (!fs.existsSync(n.dir)) return { ok: false, error: `NapCat 目录不存在：${n.dir}` };
+
+  const exe = path.join(n.dir, n.exe);
+  if (!fs.existsSync(exe)) return { ok: false, error: `找不到启动器：${exe}` };
+
+  // 没开文件日志的话，NapCat 的输出只会进命名管道，日志页永远是空的
+  ensureNapcatFileLog();
+
+  const child = spawn(exe, n.qq ? [String(n.qq)] : [], {
+    cwd: n.dir,
+    windowsHide: true,
+    detached: false,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  napcatLaunch = { startedAt: Date.now(), pid: child.pid, child };
+  pushLog(`NapCat 启动中（QQ ${n.qq || '未填'}）`, 'sys', 'napcat');
+  startNapcatTail();
+  pushLog('NapCat 在后台跑，输出直接进这里；要扫码登录就用上面的「打开 NapCat 面板」', 'sys', 'napcat');
+
+  relay(child.stdout, 'out', 'napcat');
+  relay(child.stderr, 'err', 'napcat');
+  child.on('close', (code) => {
+    if (napcatLaunch.child === child) napcatLaunch = { startedAt: null, pid: null, child: null };
+    pushLog(`NapCat 启动器已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'napcat');
+  });
+
+  return { ok: true, pid: child.pid };
+}
+
+/**
+ * 停 NapCat。
+ *
+ * **只杀它自己的进程树**（`/pid <pid> /T`）：启动器下面挂着它自己那个 QQ.exe，
+ * 一起收掉才算真停。按镜像名全杀是危险的 —— 同目录的 `napcat.kill.qq.bat`
+ * 就是那么干的，会连用户日常在用的 QQ 一起杀。
+ * 只有在没有 pid（比如 NapCat 是用户自己起的，我们没托管）时，才退回按启动器镜像名杀，
+ * 那时不碰 QQ.exe（QQ.exe 留在那儿用户自己关）。
+ */
+function stopNapcat() {
+  markManualStop('napcat');
+  const pid = napcatLaunch.pid;
+  try {
+    if (pid) {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+    } else {
+      spawn('taskkill', ['/IM', 'NapCatWinBootMain.exe', '/F'], { windowsHide: true });
+    }
+    napcatLaunch = { startedAt: null, pid: null, child: null };
+    pushLog('已请求停止 NapCat', 'sys', 'napcat');
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+/**
+ * 找 NapCat 真正的运行时配置目录。
+ *
+ * Shell 版把 config 藏在 `versions/<版本>/resources/app/napcat/config/` 里，
+ * 根目录那个 `config/` 是空的 —— 而版本号会变（`9.9.33-52230` → …），
+ * 所以只能搜，不能写死。
+ */
+function findNapcatConfigDir() {
+  const n = napcatSettings();
+  if (!n.dir) return '';
+  const direct = path.join(n.dir, 'config');
+  if (fs.existsSync(path.join(direct, 'webui.json'))) return direct;
+
+  const versions = path.join(n.dir, 'versions');
+  if (!fs.existsSync(versions)) return '';
+  for (const v of fs.readdirSync(versions)) {
+    const dir = path.join(versions, v, 'resources', 'app', 'napcat', 'config');
+    if (fs.existsSync(path.join(dir, 'webui.json'))) return dir;
+  }
+  return '';
+}
+
+/**
+ * NapCat 自己的日志目录。
+ *
+ * 为什么不再指望启动器的 stdout：NapCat Shell 版是把 NapCat 注入进 QQ 进程的，
+ * 真正干活的日志不走启动器那根管道 —— 它重定向到命名管道 `\\.\pipe\NapCat_<pid>`，
+ * 我们这边读不到。结果是「日志 → NapCat」那一栏只有两行系统提示，看着像没跑。
+ * 所以改成读 NapCat 自己写的文件日志（napcat.json 里 fileLog: true）。
+ */
+function findNapcatLogDir() {
+  const n = napcatSettings();
+  if (!n.dir) return '';
+  const versions = path.join(n.dir, 'versions');
+  if (fs.existsSync(versions)) {
+    for (const v of fs.readdirSync(versions)) {
+      const dir = path.join(versions, v, 'resources', 'app', 'napcat', 'logs');
+      if (fs.existsSync(dir)) return dir;
+    }
+  }
+  const direct = path.join(n.dir, 'logs');
+  return fs.existsSync(direct) ? direct : '';
+}
+
+/**
+ * 把 NapCat 的 fileLog 打开，否则 logs 目录永远是空的。
+ *
+ * 只改这一个字段，改之前留一份 .bak —— 那是他自己装的 NapCat，配置不该被无声改掉。
+ */
+function ensureNapcatFileLog() {
+  const dir = findNapcatConfigDir();
+  if (!dir) return { ok: false, error: '找不到 NapCat 配置目录' };
+  const file = path.join(dir, 'napcat.json');
+  if (!fs.existsSync(file)) return { ok: false, error: '没有 napcat.json' };
+
+  const cfg = readJson(file);
+  if (cfg.fileLog === true) return { ok: true, changed: false };
+
+  try {
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    fs.copyFileSync(file, `${file}.bak-${stamp}`);
+    cfg.fileLog = true;
+    writeJson(file, cfg);
+    pushLog('已打开 NapCat 的文件日志（原配置备份成 napcat.json.bak-…），NapCat 下次启动生效', 'sys', 'napcat');
+    return { ok: true, changed: true };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+/**
+ * 追 NapCat 的日志文件。
+ *
+ * 按字节增量读，只认到最后一个换行符为止 —— 一次写入可能停在半行，
+ * 直接按字符串切会把一条日志切成两截。轮转（maxFiles 5）时文件变小，offset 归零重读。
+ */
+let napcatTail = { dir: '', file: '', offset: 0, timer: null, hinted: false };
+
+function startNapcatTail() {
+  if (napcatTail.timer) return;
+  const dir = findNapcatLogDir();
+  if (!dir) return;
+  napcatTail.dir = dir;
+  napcatTail.timer = setInterval(pumpNapcatLog, 1000);
+  pumpNapcatLog();
+}
+
+function stopNapcatTail() {
+  if (napcatTail.timer) clearInterval(napcatTail.timer);
+  napcatTail = { dir: '', file: '', offset: 0, timer: null, hinted: false };
+}
+
+function pumpNapcatLog() {
+  const dir = napcatTail.dir;
+  if (!dir) return;
+
+  let files = [];
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith('.log'));
+  } catch {
+    return;
+  }
+
+  if (!files.length) {
+    // 只提示一次，别每秒刷屏
+    if (!napcatTail.hinted) {
+      napcatTail.hinted = true;
+      pushLog('NapCat 还没写出日志文件。开一次 NapCat（或点「一键启动」），文件日志就会开始记。', 'sys', 'napcat');
+    }
+    return;
+  }
+
+  let newest = '';
+  let newestAt = -1;
+  for (const f of files) {
+    try {
+      const st = fs.statSync(path.join(dir, f));
+      if (st.mtimeMs > newestAt) {
+        newestAt = st.mtimeMs;
+        newest = f;
+      }
+    } catch {
+      /* 正在被轮转，跳过这一轮 */
+    }
+  }
+  if (!newest) return;
+
+  if (newest !== napcatTail.file) {
+    napcatTail.file = newest;
+    napcatTail.offset = 0;
+  }
+
+  const full = path.join(dir, newest);
+  let size = 0;
+  try {
+    size = fs.statSync(full).size;
+  } catch {
+    return;
+  }
+  if (size < napcatTail.offset) napcatTail.offset = 0;
+  if (size === napcatTail.offset) return;
+
+  let buf;
+  try {
+    const fd = fs.openSync(full, 'r');
+    const len = size - napcatTail.offset;
+    buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, napcatTail.offset);
+    fs.closeSync(fd);
+  } catch {
+    return;
+  }
+
+  // 只吃到最后一个换行：剩下的半行等下次写完再读
+  const lastNl = buf.lastIndexOf(0x0a);
+  if (lastNl < 0) return;
+
+  napcatTail.offset += lastNl + 1;
+  const text = buf.subarray(0, lastNl + 1).toString('utf8');
+  for (const line of text.split('\n')) {
+    const clean = line.replace(/\r$/, '').replace(ANSI, '').trimEnd();
+    if (clean) pushLog(clean, 'out', 'napcat');
+  }
+}
+
+/**
+ * 返回 NapCat WebUI 面板地址（带 token，点了直接进，不用手抄）。
+ *
+ * 为什么把 token 也给前端：它本来就明文躺在 `webui.json` 里，而服务只监听
+ * 127.0.0.1、页面同源 —— 本地自用，抄 token 只是折磨人。
+ */
+function napcatPanel() {
+  const dir = findNapcatConfigDir();
+  if (!dir) return { ok: false, error: '找不到 NapCat 的 webui.json（NapCat 目录配了吗？）' };
+  const cfg = readJson(path.join(dir, 'webui.json'));
+  const port = Number(cfg.port) || 6099;
+  const token = typeof cfg.token === 'string' ? cfg.token : '';
+  return {
+    ok: true,
+    port,
+    token,
+    configDir: dir,
+    url: `http://127.0.0.1:${port}/webui${token ? `?token=${encodeURIComponent(token)}` : ''}`
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * NapCat 自动更新（GitHub Releases）
+ *
+ * 两档：off / notify（检查 + 记日志 + 界面提醒，装不装由人点）。
+ * 不做「自动安装」：换掉正在跑的 NapCat 会断开登录态，必须人点头。
+ * 流程：查 latest release → 按匹配规则挑 Shell 压缩包 → 下载 → tar 解压 →
+ * 校验启动器在 → 装成旁边的 NapCat-<tag> 目录 → 把 settings 的 dir 指过去。
+ * 原目录永远保留（更新不是覆盖，是换指针），跑不了一眼就能退回。
+ * 国内直连 GitHub 不稳：updateMirror 可以填镜像前缀（如 https://ghproxy.cn/），
+ * 下载 URL 会拼成 镜像/原始URL；API 查询不走镜像，连不上就提示手动检查。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+async function napcatUpdateInfo() {
+  const n = napcatSettings();
+  const repo = String(n.updateRepo || 'NapNeko/NapCatQQ').replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '');
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+    headers: { 'user-agent': 'DualHabitat-Matrix', accept: 'application/vnd.github+json' },
+    signal: AbortSignal.timeout(15_000)
+  });
+  if (!res.ok) throw new Error(`GitHub API HTTP ${res.status}`);
+  const rel = await res.json();
+  const assets = (rel.assets ?? []).map((a) => ({ name: String(a.name), size: Number(a.size) || 0, url: String(a.browser_download_url) }));
+  let picked = null;
+  try {
+    const re = new RegExp(n.updateAsset || 'Shell.*\\.zip$', 'i');
+    picked = assets.find((a) => re.test(a.name)) ?? null;
+  } catch {
+    /* 匹配规则写坏了就当作没挑上，让用户自己从列表里选 */
+  }
+  const current = n.dir ? path.basename(n.dir) : '';
+  return { repo, tag: String(rel.tag_name ?? ''), name: String(rel.name ?? ''), publishedAt: String(rel.published_at ?? ''), assets, picked, current, dir: n.dir };
+}
+
+async function applyNapcatUpdate(assetUrl) {
+  const n = napcatSettings();
+  const info = await napcatUpdateInfo();
+  const asset = assetUrl ? (info.assets.find((a) => a.url === assetUrl) ?? null) : info.picked;
+  if (!asset) return { ok: false, error: '发行版里没有匹配的 Shell 压缩包 —— 去「参数与日志」页调一下匹配规则，或从资产列表里手动指定' };
+  const mirror = String(n.updateMirror || '').replace(/\/$/, '');
+  const url = mirror ? `${mirror}/${asset.url}` : asset.url;
+  const tmp = path.join(os.tmpdir(), `napcat-update-${Date.now()}`);
+  fs.mkdirSync(tmp, { recursive: true });
+  pushLog(`下载 NapCat 更新：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB）`, 'sys', 'napcat');
+  const zipPath = path.join(tmp, asset.name);
+  const dl = await downloadToFile(url, zipPath);
+  if (!dl.ok) {
+    return { ok: false, error: `下载失败：${dl.error}${mirror ? '' : '（GitHub 直连不行就在「高级 → 更新」填镜像前缀，比如 https://ghfast.top/）'}` };
+  }
+  const dest = path.join(tmp, 'unpacked');
+  fs.mkdirSync(dest, { recursive: true });
+  await new Promise((resolve) => {
+    const child = spawn(tarExe(), ['-xf', zipPath, '-C', dest], { windowsHide: true });
+    child.on('close', (code) => resolve(code));
+    child.on('error', () => resolve(-1));
+  });
+  let root = dest;
+  try {
+    const entries = fs.readdirSync(dest);
+    if (entries.length === 1 && fs.statSync(path.join(dest, entries[0])).isDirectory()) root = path.join(dest, entries[0]);
+  } catch { /* 读不了就按根目录用 */ }
+  if (!fs.existsSync(path.join(root, n.exe))) {
+    return { ok: false, error: `解压出来没找到 ${n.exe} —— 挑的可能不是 Shell 包，换个资产再试` };
+  }
+  const safeTag = String(info.tag || 'update').replace(/[\\\/:*?"<>|]/g, '');
+  const newDir = path.join(path.dirname(n.dir), `NapCat-${safeTag}`);
+  try {
+    if (fs.existsSync(newDir)) fs.rmSync(newDir, { recursive: true, force: true });
+    fs.renameSync(root, newDir);
+  } catch (error) {
+    return { ok: false, error: `安装失败：${error?.message ?? error}` };
+  }
+  const s = readJson(SETTINGS_FILE);
+  s.napcat = { ...(s.napcat ?? {}), dir: newDir, lastUpdateCheck: Date.now() };
+  writeJson(SETTINGS_FILE, s);
+  pushLog(`NapCat 已更新到 ${info.tag}：${newDir}（原目录保留：${n.dir}）`, 'sys', 'napcat');
+  let restarted = false;
+  if (napcatLaunch.startedAt || (await probePort(n.wsPort))) {
+    stopNapcat();
+    await new Promise((r) => setTimeout(r, 2500));
+    startNapcat();
+    restarted = true;
+  }
+  return { ok: true, tag: info.tag, newDir, restarted };
+}
+
+/**
+ * 找 tar。
+ *
+ * 不能直接 spawn('tar')：打包后的 Electron 进程继承的是系统 PATH，
+ * Git Bash 的 /usr/bin 不在里面，会直接 ENOENT。Windows 10 1803 起
+ * System32 下自带 bsdtar，用绝对路径最稳。
+ */
+function tarExe() {
+  const sys = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+  return fs.existsSync(sys) ? sys : 'tar';
+}
+
+/**
+ * 带看门狗的下载：90 秒没有任何新数据就断开。
+ *
+ * 为什么不能只靠总超时：GitHub 的 release 会 302 到 objects.githubusercontent.com，
+ * 国内常见「连上了但不给数据」。一个 900 秒的总超时会把界面挂十几分钟，
+ * 看起来像卡死；看门狗能在 90 秒内给出「网络卡死」这种能看懂的错误。
+ *
+ * @returns {{ok:true,got:number,total:number}|{ok:false,error:string}}
+ */
+async function downloadToFile(url, dest, onProgress) {
+  const ctrl = new AbortController();
+  let abortReason = '';
+  let lastByteAt = Date.now();
+  let total = 0;
+  let got = 0;
+
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastByteAt > 90_000) {
+      abortReason = '90 秒没有收到任何数据 —— 网络卡住了。去「高级 → 更新」填个下载镜像前缀再试';
+      ctrl.abort();
+    }
+  }, 5000);
+
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    total = Number(res.headers.get('content-length')) || 0;
+    lastByteAt = Date.now();
+
+    const file = fs.createWriteStream(dest);
+    try {
+      for await (const chunk of Readable.fromWeb(res.body)) {
+        got += chunk.length;
+        lastByteAt = Date.now();
+        if (!file.write(chunk)) await new Promise((r) => file.once('drain', r));
+        if (total) onProgress?.(Math.min(1, got / total), got, total);
+      }
+      await new Promise((r) => file.end(r));
+    } catch (error) {
+      file.destroy();
+      throw error;
+    }
+    return { ok: true, got, total };
+  } catch (error) {
+    fs.rmSync(dest, { force: true });
+    return { ok: false, error: abortReason || String(error?.message ?? error) };
+  } finally {
+    clearInterval(watchdog);
+  }
+}
+
+/**
+ * 下载并装一份 NapCat（给「精简安装包」用）。
+ *
+ * 为什么不把这一步塞进安装器：NSIS 里没有可靠的下载插件（要额外带 inetc），
+ * 而且安装过程断网就整个装不上。放在软件里做，能重试、能换镜像、能显示进度，
+ * 装完直接把路径写进设置 —— 对用户来说还是「点一下，等它自己下完」。
+ *
+ * 装到 userData/napcat/NapCat-<tag>，不动安装目录（Program Files 下写不进去）。
+ */
+async function installNapcat() {
+  const info = await napcatUpdateInfo();
+  const asset = info.picked;
+  if (!asset) {
+    return { ok: false, error: '发行版里没有匹配的 Shell 压缩包 —— 去「高级」页调一下资产匹配规则' };
+  }
+  const n = napcatSettings();
+  const mirror = String(n.updateMirror || '').replace(/\/$/, '');
+  const url = mirror ? `${mirror}/${asset.url}` : asset.url;
+  const tmp = path.join(os.tmpdir(), `napcat-install-${Date.now()}`);
+  fs.mkdirSync(tmp, { recursive: true });
+  pushLog(`开始下载 NapCat ${info.tag}：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB）`, 'sys', 'napcat');
+
+  const zipPath = path.join(tmp, asset.name);
+  const dl = await downloadToFile(url, zipPath, (ratio) => {
+    componentJob = { ...(componentJob ?? {}), id: 'napcat', pct: Math.round(ratio * 70), note: '下载中' };
+  });
+  if (!dl.ok) {
+    return { ok: false, error: `下载失败：${dl.error}${mirror ? '' : '（GitHub 直连不行就在「高级 → 更新」填镜像前缀，比如 https://ghfast.top/）'}` };
+  }
+  return installNapcatFromZip(zipPath, info.tag, asset.size);
+}
+
+/**
+ * 从一个已经下好的 zip 装 NapCat。
+ *
+ * 拆出来是为了让「从本地文件装」和「从网上下载装」走同一条路 ——
+ * 国内 GitHub 基本下不动，用户自己下好的包得能直接用。
+ */
+async function installNapcatFromZip(zipPath, tag, size = 0) {
+  const n = napcatSettings();
+  const tmp = path.dirname(zipPath);
+  const dest = path.join(tmp, 'unpacked');
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(dest, { recursive: true });
+  const tarCode = await new Promise((resolve) => {
+    const child = spawn(tarExe(), ['-xf', zipPath, '-C', dest], { windowsHide: true });
+    child.on('close', (code) => resolve(code));
+    child.on('error', () => resolve(-1));
+  });
+  if (tarCode !== 0) return { ok: false, error: '解压失败（本机 tar 不可用？）' };
+
+  let root = dest;
+  try {
+    const entries = fs.readdirSync(dest);
+    if (entries.length === 1 && fs.statSync(path.join(dest, entries[0])).isDirectory()) root = path.join(dest, entries[0]);
+  } catch { /* 读不了就按根目录用 */ }
+  if (!fs.existsSync(path.join(root, n.exe))) {
+    return { ok: false, error: `解压出来没找到 ${n.exe} —— 这个可能不是 Shell 包` };
+  }
+
+  const safeTag = String(tag || 'latest').replace(/[\\/:*?"<>|]/g, '');
+  const base = path.join(path.dirname(SETTINGS_FILE), 'napcat');
+  const target = path.join(base, `NapCat-${safeTag}`);
+  try {
+    fs.mkdirSync(base, { recursive: true });
+    if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+    fs.renameSync(root, target);
+  } catch (error) {
+    return { ok: false, error: `安装失败：${error?.message ?? error}` };
+  }
+
+  const s = readJson(SETTINGS_FILE);
+  s.napcat = { ...(s.napcat ?? {}), dir: target, lastUpdateCheck: Date.now(), lastUpdateFound: '' };
+  writeJson(SETTINGS_FILE, s);
+  pushLog(`NapCat ${safeTag} 装好了：${target}`, 'sys', 'napcat');
+  return { ok: true, tag: safeTag, dir: target, size };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 组件：得下载才有、但不必塞进安装包的东西
+ *
+ * 为什么不做进安装包：NapCat 约 200 MB、ffmpeg 约 200 MB，全塞进去安装包直接
+ * 1.6 GB，而大多数人只用得上其中一个。改成「点一下装进来」：
+ *   - 装到 userData/components 下（Program Files 写不进去）
+ *   - 装完把路径写进配置，桥接下次启动就用上
+ *   - 进度挂在内存里，前端轮询显示 —— 一次请求挂十分钟容易被当成卡死
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** 正在装的组件。null = 没在装。装完保留 done/error 供前端收尾。 */
+let componentJob = null;
+
+/* 官方静态包地址。DHM_FFMPEG_URL 可以覆盖 —— 内网自建镜像、或者离线测试用。 */
+const FFMPEG_ZIP_URL =
+  process.env.DHM_FFMPEG_URL ||
+  'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip';
+
+function componentsDir() {
+  return path.join(path.dirname(SETTINGS_FILE), 'components');
+}
+
+/** 本机 ffmpeg 在哪：配置里指的 → 软件自己装的 → 系统 PATH 里的，按顺序认。 */
+function findFfmpeg() {
+  const cfg = loadConfig();
+  const custom = String(cfg.socialV2?.voice?.ffmpegPath ?? '').trim();
+  if (custom && fs.existsSync(custom)) return { path: custom, via: '配置里指的' };
+
+  const local = path.join(componentsDir(), 'ffmpeg', 'ffmpeg.exe');
+  if (fs.existsSync(local)) return { path: local, via: '软件装的' };
+
+  try {
+    const out = spawnSync('where.exe', ['ffmpeg'], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    if (out.status === 0) {
+      const first = String(out.stdout ?? '')
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean)[0];
+      if (first) return { path: first, via: '系统 PATH 里的' };
+    }
+  } catch {
+    /* 没有 where.exe 就往下试 */
+  }
+
+  // where 查不到不代表没有：WinGet 装的是无扩展名符号链接，where 只按 PATHEXT 找。
+  // 直接试跑一次最实在 —— 能吐出 `ffmpeg version` 就是能用。
+  try {
+    const out = spawnSync('ffmpeg', ['-version'], { encoding: 'utf8', windowsHide: true, timeout: 8000 });
+    if (out.status === 0) return { path: 'ffmpeg（走 PATH）', via: '系统 PATH 里的' };
+  } catch {
+    /* 没装就是没装 */
+  }
+
+  return { path: '', via: '' };
+}
+
+function componentList() {
+  const n = napcatSettings();
+  const exePath = n.dir ? path.join(n.dir, n.exe) : '';
+  const napcatOk = Boolean(exePath && fs.existsSync(exePath));
+  const ff = findFfmpeg();
+
+  return [
+    {
+      id: 'napcat',
+      name: 'NapCat',
+      need: 'QQ 那条链路',
+      detail: 'QQ 的 OneBot 网关。走 QQ 就必须有它，走微信用不上。',
+      installed: napcatOk,
+      where: napcatOk ? n.dir : '',
+      note: napcatOk ? (n.bundled ? '安装包自带' : '已装在这台机器上') : '还没装',
+      size: '约 200 MB'
+    },
+    {
+      id: 'ffmpeg',
+      name: 'ffmpeg',
+      need: '语音',
+      detail: '模型发语音时用它调音量、转码。不发语音可以不装。',
+      installed: Boolean(ff.path),
+      where: ff.path,
+      note: ff.path ? `已找到 · ${ff.via}` : '还没装',
+      size: '约 200 MB'
+    }
+  ];
+}
+
+/** 下载 ffmpeg 的 Windows 静态包，只留 bin 下那三个 exe。 */
+async function installFfmpeg() {
+  const zipPath = path.join(os.tmpdir(), `ffmpeg-dl-${Date.now()}.zip`);
+  // 镜像前缀和 NapCat 共用一个设置项：国内 GitHub 直连基本下不动
+  const mirror = String(napcatSettings().updateMirror || '').replace(/\/$/, '');
+  const url = mirror ? `${mirror}/${FFMPEG_ZIP_URL}` : FFMPEG_ZIP_URL;
+  componentJob = { ...componentJob, pct: 1, note: '连接下载源' };
+
+  const dl = await downloadToFile(url, zipPath, (ratio) => {
+    // 下载占 0-70%，解压 70-95%
+    componentJob = { ...componentJob, pct: Math.round(ratio * 70), note: '下载中' };
+  });
+  if (!dl.ok) {
+    return { ok: false, error: `下载失败：${dl.error}${mirror ? '' : '（GitHub 直连不行就在「高级 → 更新」填镜像前缀，比如 https://ghfast.top/）'}` };
+  }
+  return installFfmpegFromZip(zipPath);
+}
+
+/** 从一个已经下好的 zip 装 ffmpeg（和 NapCat 一样，下载和安装分开，好支持本地文件装）。 */
+async function installFfmpegFromZip(zipPath) {
+  componentJob = { ...componentJob, pct: 72, note: '解压中' };
+  const unpack = path.join(os.tmpdir(), `ffmpeg-unpack-${Date.now()}`);
+  fs.mkdirSync(unpack, { recursive: true });
+  const code = await new Promise((resolve) => {
+    const child = spawn(tarExe(), ['-xf', zipPath, '-C', unpack], { windowsHide: true });
+    child.on('close', resolve);
+    child.on('error', () => resolve(-1));
+  });
+  if (code !== 0) {
+    fs.rmSync(zipPath, { force: true });
+    return { ok: false, error: '解压失败（本机 tar 不可用？）' };
+  }
+
+  // 包结构是 ffmpeg-master-*/bin/ffmpeg.exe，层数不固定，直接往下找
+  const found = (() => {
+    const stack = [unpack];
+    while (stack.length) {
+      const dir = stack.pop();
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) stack.push(full);
+        else if (e.name.toLowerCase() === 'ffmpeg.exe') return full;
+      }
+    }
+    return '';
+  })();
+  if (!found) {
+    fs.rmSync(unpack, { recursive: true, force: true });
+    fs.rmSync(zipPath, { force: true });
+    return { ok: false, error: '解压出来没找到 ffmpeg.exe' };
+  }
+
+  componentJob = { ...componentJob, pct: 92, note: '安装中' };
+  const target = path.join(componentsDir(), 'ffmpeg');
+  fs.mkdirSync(target, { recursive: true });
+  for (const name of fs.readdirSync(path.dirname(found))) {
+    // ffprobe / ffplay 一起搬：以后要探时长、试听都不用再下一遍
+    if (/^ff(mpeg|probe|play)\.exe$/i.test(name)) {
+      fs.copyFileSync(path.join(path.dirname(found), name), path.join(target, name));
+    }
+  }
+  fs.rmSync(unpack, { recursive: true, force: true });
+  fs.rmSync(zipPath, { force: true });
+
+  const exe = path.join(target, 'ffmpeg.exe');
+  const cfg = loadConfig();
+  cfg.socialV2 = {
+    ...(cfg.socialV2 ?? {}),
+    voice: { ...(cfg.socialV2?.voice ?? {}), ffmpegPath: exe }
+  };
+  writeJson(configFile(), cfg);
+  pushLog(`ffmpeg 装好了：${exe}`, 'sys', 'voice');
+  return { ok: true, path: exe };
+}
+
+/** 起一个安装任务，立刻返回；进度靠 /api/components 轮询。 */
+function startComponentInstall(id) {
+  componentJob = { id, pct: 0, note: '准备中', done: false, error: null, startedAt: Date.now() };
+  const run = id === 'napcat' ? installNapcat() : installFfmpeg();
+  run
+    .then((r) => {
+      componentJob = {
+        ...componentJob,
+        pct: 100,
+        note: r.ok ? '装好了' : '失败',
+        done: true,
+        error: r.ok ? null : (r.error ?? '失败')
+      };
+      if (!r.ok) pushLog(`装 ${id} 失败：${r.error ?? ''}`, 'err', 'sys');
+    })
+    .catch((error) => {
+      componentJob = { ...componentJob, note: '失败', done: true, error: String(error?.message ?? error) };
+    });
+  return { ok: true, started: true, id };
+}
+
+async function checkNapcatUpdateOnce() {
+  try {
+    const info = await napcatUpdateInfo();
+    const upToDate = Boolean(info.tag && info.current && info.current.includes(info.tag));
+    const s = readJson(SETTINGS_FILE);
+    s.napcat = {
+      ...(s.napcat ?? {}),
+      lastUpdateCheck: Date.now(),
+      // 只在真有新版时记 tag；已是最新就清空，免得下次启动还拿着旧 tag 弹提醒
+      lastUpdateFound: upToDate ? '' : info.tag
+    };
+    writeJson(SETTINGS_FILE, s);
+    if (upToDate) {
+      pushLog(`NapCat 已是最新（${info.tag}）`, 'sys', 'napcat');
+      return { ok: true, ...info, updateAvailable: false };
+    }
+    pushLog(`NapCat 有新版本：${info.tag}（当前 ${info.current || '未知'}）。去「总览」页更新`, 'sys', 'napcat');
+    return { ok: true, ...info, updateAvailable: true };
+  } catch (error) {
+    pushLog(`NapCat 更新检查失败：${error?.message ?? error}`, 'err', 'napcat');
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+/** 启动时按档位查一次；24 小时内不重复查（省得每次开软件都打 GitHub）。 */
+function scheduleNapcatUpdateCheck() {
+  const n = napcatSettings();
+  if (n.updateMode === 'off') return;
+  if (Date.now() - n.lastUpdateCheck < 20 * 3600_000) return;
+  setTimeout(async () => {
+    const r = await checkNapcatUpdateOnce().catch(() => null);
+    if (!r?.updateAvailable) return;
+    const s = readJson(SETTINGS_FILE);
+    if (s.napcat?.lastReminded === r.tag) return;
+    s.napcat = { ...(s.napcat ?? {}), lastReminded: r.tag };
+    writeJson(SETTINGS_FILE, s);
+    pushLog(`NapCat 有新版本 ${r.tag}（当前 ${r.current || '未知'}）—— 这个版本只提醒这一次，去「总览」页更新`, 'sys', 'napcat');
+  }, 15_000);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 软件本体自更新
+ *
+ * 只提醒不自动装 —— 换掉正在跑的程序必须经过人点头。
+ * 流程：查 releases/latest → 比较 tag 与当前版本 → 下载 Setup.exe →
+ * 静默安装（/S，沿用原安装目录）→ 软件退出，安装完自动拉起新版。
+ * 开发模式没有安装器，明确报告不支持。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+function appSettings() {
+  const s = readJson(SETTINGS_FILE);
+  const a = s.app ?? {};
+  return {
+    updateMode: a.updateMode === 'off' ? 'off' : 'notify',
+    updateRepo: String(a.updateRepo ?? 'Delance-cn/DualHabitat-Matrix'),
+    lastUpdateCheck: Number(a.lastUpdateCheck) || 0
+  };
+}
+
+function cmpVersion(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map(Number);
+  const pb = String(b).replace(/^v/, '').split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    const x = pa[i] ?? 0;
+    const y = pb[i] ?? 0;
+    if (x !== y) return x - y;
+  }
+  return 0;
+}
+
+async function appUpdateInfo() {
+  const s = appSettings();
+  const res = await fetch(`https://api.github.com/repos/${s.updateRepo}/releases/latest`, {
+    headers: { 'user-agent': 'DualHabitat-Matrix', accept: 'application/vnd.github+json' },
+    signal: AbortSignal.timeout(15_000)
+  });
+  if (!res.ok) throw new Error(`GitHub API HTTP ${res.status}`);
+  const rel = await res.json();
+  const assets = (rel.assets ?? []).map((a) => ({ name: String(a.name), size: Number(a.size) || 0, url: String(a.browser_download_url) }));
+  let picked = null;
+  try {
+    const re = new RegExp('Setup.*\\.exe$', 'i');
+    picked = assets.find((a) => re.test(a.name)) ?? null;
+  } catch { /* 同上，匹配规则坏了就当没挑上 */ }
+  return {
+    repo: s.updateRepo,
+    tag: String(rel.tag_name ?? ''),
+    publishedAt: String(rel.published_at ?? ''),
+    notes: String(rel.body ?? '').slice(0, 2000),
+    current: APP_VERSION,
+    assets,
+    picked,
+    updateAvailable: rel.tag_name ? cmpVersion(rel.tag_name, APP_VERSION) > 0 : false
+  };
+}
+
+async function applyAppUpdate(assetUrl) {
+  if (!electronApp) return { ok: false, error: '开发模式不支持自更新（没有安装器），请手动下载新安装包' };
+  const info = await appUpdateInfo();
+  const asset = assetUrl ? (info.assets.find((a) => a.url === assetUrl) ?? null) : info.picked;
+  if (!asset) return { ok: false, error: '发行版里没有找到 Setup 安装包（资产名要含 Setup 并以 .exe 结尾）' };
+  const tmp = path.join(os.tmpdir(), `dhm-update-${Date.now()}`);
+  fs.mkdirSync(tmp, { recursive: true });
+  const exePath = path.join(tmp, asset.name);
+  pushLog(`下载新版本安装包：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB）`, 'sys', 'app');
+  try {
+    const res = await fetch(asset.url, { signal: AbortSignal.timeout(600_000) });
+    if (!res.ok) return { ok: false, error: `下载失败 HTTP ${res.status}` };
+    await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(exePath));
+  } catch (error) {
+    return { ok: false, error: `下载失败：${error?.message ?? error}` };
+  }
+  const child = spawn(exePath, ['/S'], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.unref();
+  pushLog('安装程序已启动，本软件即将退出并在安装完成后自动重开', 'sys', 'app');
+  setTimeout(() => {
+    try { electronApp.quit(); } catch { /* 退出失败也无能为力了 */ }
+  }, 1500);
+  return { ok: true, tag: info.tag, note: '安装程序已在后台运行' };
+}
+
+async function checkAppUpdateOnce() {
+  try {
+    const info = await appUpdateInfo();
+    const s = readJson(SETTINGS_FILE);
+    s.app = { ...(s.app ?? {}), lastUpdateCheck: Date.now(), lastUpdateFound: info.updateAvailable ? info.tag : '' };
+    writeJson(SETTINGS_FILE, s);
+    return { ok: true, ...info };
+  } catch (error) {
+    pushLog(`软件更新检查失败：${error?.message ?? error}`, 'err', 'app');
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+function scheduleAppUpdateCheck() {
+  const s = appSettings();
+  if (s.updateMode === 'off') return;
+  if (Date.now() - s.lastUpdateCheck < 20 * 3600_000) return;
+  setTimeout(async () => {
+    try {
+      const info = await appUpdateInfo();
+      const st = readJson(SETTINGS_FILE);
+      const app = { ...(st.app ?? {}) };
+      // 同一个版本只提醒一次：提醒过 X 版，X 就不再弹，直到出现更高的版本。
+      // 记的是"提醒过哪个 tag"而不是"有没有提醒过"，所以跳过 0.2.0 之后
+      // 0.3.0 出现时照样会提醒。
+      if (info.updateAvailable && app.lastReminded !== info.tag) {
+        app.lastReminded = info.tag;
+        pushLog(`有新版本 ${info.tag}（当前 ${APP_VERSION}），去「总览」页升级 —— 这个版本只提醒这一次`, 'sys', 'app');
+      }
+      app.lastUpdateCheck = Date.now();
+      app.lastUpdateFound = info.updateAvailable ? info.tag : '';
+      st.app = app;
+      writeJson(SETTINGS_FILE, st);
+    } catch { /* 检查失败静默，不打扰 */ }
+  }, 20_000);
+}
+
+
+/**
+ * Webhook 测试体的渲染 —— 与 wechat-bot.js 的 renderHookBody 保持同一套映射
+ * （两个进程各自持有一份，改一边要改另一边；文件头注释里互相点名）。
+ */
+function renderHookSample(format, template) {
+  const base = { event: 'message.received', at: new Date().toISOString(), bot: 'test@im.bot', from: 'wxid_demo', text: '测试消息： hook 通了', kinds: '文字' };
+  if (format === 'onebot') {
+    const unix = Math.floor(Date.now() / 1000);
+    return JSON.stringify({ time: unix, self_id: base.bot, post_type: 'message', message_type: 'private', sub_type: 'friend', user_id: base.from, message: [{ type: 'text', data: { text: base.text } }], raw_message: base.text, font: 0, sender: { user_id: base.from, nickname: base.from, sex: 'unknown' } });
+  }
+  if (format === 'template') {
+    const vals = {
+      event: base.event, at: base.at, bot: base.bot, from: base.from, to: base.to ?? '',
+      text: JSON.stringify(base.text), kinds: JSON.stringify(base.kinds), message: JSON.stringify(base.text), json: JSON.stringify(base)
+    };
+    return String(template || '').replace(/\{\{\s*(\w+)\s*\}\}/g, (m, k) => (k in vals ? String(vals[k]) : m));
+  }
+  return JSON.stringify(base);
+}
+
+
+/**
+ * 一键启动：NapCat（没在跑才起）→ 等 WS 就绪 → 起桥接。
+ * 这就是桌面那个 bat 干的事，区别是不硬等 30 秒、失败能说清楚卡在哪一步。
+ */
+async function bringUp(scope = 'all') {
+  // scope: qq = 只开 QQ 这条线；wechat = 只开微信；all = 都开
+  const wantQq = scope !== 'wechat';
+  const wantWx = scope !== 'qq';
+  const n = napcatSettings();
+  const panel = napcatPanel();
+
+  /* 三条线各自起，谁也不等谁 —— 这是「QQ 和微信同时跑」的前提。
+   *
+   * 以前的写法是 NapCat 起不来就直接 return，桥接根本不启动。那对纯 QQ 是合理的
+   * （没有 NapCat 的桥接什么都干不了），但微信那条线要靠桥接里的模型 API，
+   * 于是 QQ 这边扫码过期一次，微信也跟着哑掉 —— 两个平台互相拖累。
+   * 现在改成尽力而为：NapCat 失败只记一笔，桥接和微信照常拉起。 */
+  let napcatError = null;
+
+  if (wantQq) {
+    if (await probePort(n.wsPort)) {
+      pushLog(`NapCat 已在运行（${n.wsPort} 端口通），跳过启动`, 'sys', 'napcat');
+      ensureNapcatFileLog();
+      startNapcatTail();
+    } else {
+      const started = startNapcat();
+      if (!started.ok) {
+        napcatError = started.error ?? 'NapCat 启动失败';
+      } else {
+        pushLog(`等待 NapCat WebSocket（${n.wsPort}）…`, 'sys', 'napcat');
+        const ready = await waitForPort(n.wsPort, n.waitMs);
+        if (!ready) {
+          // 窗口藏起来了，所以"去它的窗口看看"已经不成立 —— 指到面板上，
+          // 扫码和登录状态都在那儿。
+          napcatError =
+            `NapCat 在 ${Math.round(n.waitMs / 1000)} 秒内没有打开 ${n.wsPort} 端口。` +
+            (panel.ok
+              ? `多数是要扫码登录：打开 ${panel.url} 看一眼。`
+              : '去「运行」页确认 NapCat 目录，或看日志页的 NapCat 输出。');
+        } else {
+          pushLog('NapCat 就绪', 'sys', 'napcat');
+        }
+      }
+    }
+  }
+
+  // 微信也要模型 API（在桥接里），所以只开微信时也得确保桥接在
+  const bridgeResult = wantQq || !bridge.child ? startBridge() : { ok: true, skipped: true };
+  // 微信那条不依赖 NapCat，但依赖桥接拉起来的模型 API，所以放在桥接之后。
+  // 已经在跑就跳过，不会起第二份。
+  const wechatResult = wantWx
+    ? wechat.child
+      ? { ok: true, skipped: true }
+      : startWechat()
+    : { ok: true, skipped: true };
+
+  return {
+    ok: Boolean(bridgeResult.ok) || bridgeResult.error === '桥接已在运行',
+    napcatError,
+    bridge: bridgeResult,
+    wechat: wechatResult,
+    error: napcatError ?? bridgeResult.error
+  };
+}
+
+function bringDown(scope = 'all') {
+  const wantQq = scope !== 'wechat';
+  const wantWx = scope !== 'qq';
+  // 停 QQ 就只停 QQ 这条线；微信留着，别让它当孤儿，也别互相牵连
+  const bridgeResult = wantQq ? stopBridge() : { ok: true, skipped: true };
+  const napcatResult = wantQq ? stopNapcat() : { ok: true, skipped: true };
+  const wechatResult = wantWx
+    ? wechat.child
+      ? stopWechat()
+      : { ok: true, skipped: true }
+    : { ok: true, skipped: true };
+  return { ok: true, bridge: bridgeResult, napcat: napcatResult, wechat: wechatResult };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 三、桥接进程管理
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+let bridge = { child: null, startedAt: null, exitCode: null };
+
+/**
+ * 日志环形缓冲，新连上的前端能立刻看到最近内容。
+ *
+ * `source` 标记这条是**哪个进程**吐的。桌面上其实有三条流（桌面服务自己、桥接、
+ * NapCat），全都汇进同一个「日志」页，前端靠它分色 + 过滤：
+ *   app    桌面服务自己的话（启动/停止/报错）
+ *   bridge 桥接进程的 stdout / stderr
+ *   napcat NapCat 启动器的 stdout / stderr（以前是个黑窗口，现在收进来了）
+ */
+const LOG_MAX = 500;
+const logs = [];
+const logClients = new Set();
+
+function pushLog(line, level = 'out', source = 'app') {
+  const entry = { t: Date.now(), level, source, line: String(line) };
+  logs.push(entry);
+  if (logs.length > LOG_MAX) logs.shift();
+  for (const res of logClients) {
+    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+  }
+}
+
+/**
+ * 把子进程的输出一行行灌进日志页。
+ *
+ * 必须自己攒缓冲：`data` 事件的 chunk 边界**不等于**行边界，一条日志很可能被切成
+ * 两半，也可能一次来好几行。不攒缓冲的话日志会断成一截一截的。
+ *
+ * NapCat 的日志带 ANSI 颜色码（`\x1b[32minfo\x1b[39m`），在网页里会变成
+ * 一坨乱码，所以在入队前剥掉。
+ */
+const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+function relay(stream, level, source) {
+  const emit = (text) => pushLog(text.replace(ANSI, ''), level, source);
+  let buffer = '';
+  stream.on('data', (chunk) => {
+    buffer += chunk.toString();
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      emit(buffer.slice(0, idx).replace(/\r$/, ''));
+      buffer = buffer.slice(idx + 1);
+    }
+  });
+  // 进程退出时最后一行常常不带换行，别把它一起吞了
+  stream.on('end', () => {
+    if (buffer.trim()) emit(buffer.trim());
+  });
+}
+
+/**
+ * 找到能跑 Node 脚本的解释器。
+ * Electron 里 `process.execPath` 是 electron.exe，直接跑脚本会开个新窗口 ——
+ * 必须带 ELECTRON_RUN_AS_NODE=1，或者退回系统 node。
+ */
+function nodeRunner() {
+  const isElectron = Boolean(process.versions.electron);
+  if (!isElectron) return { command: process.execPath, env: {} };
+  return { command: process.execPath, env: { ELECTRON_RUN_AS_NODE: '1' } };
+}
+
+/**
+ * 读桥接的单实例锁，判断「是不是已经有一个不是本窗口启动的桥接在跑」。
+ *
+ * 为什么需要：桥接自己用 `state/bridge.lock` 做单实例保护。如果它是手动
+ * `node src/bridge.js` 起的（或上一份桌面进程留下的），本窗口再 spawn 一个，
+ * 新进程会被锁挡回去、以 code 2 退出 —— 界面上只会显示「桥接已退出（code 2）」，
+ * 看起来像启动失败，其实服务是好的。这里提前识别并复用。
+ *
+ * 拿不准时一律返回 null（按「没有」处理）：宁可多 spawn 一次被锁挡回，
+ * 也不要因为锁文件残留就误判成「已在运行」而不启动。
+ */
+function externalBridgePid() {
+  return pidFromLockFile(path.join('state', 'bridge.lock'));
+}
+
+/**
+ * 同理，读微信接入的单实例锁（`state/wechat.lock`，由 wechat-bot.js 写）。
+ * 文件名是和 wechat-bot.js 约定死的，改一边就要改另一边。
+ */
+function externalWechatPid() {
+  return pidFromLockFile(path.join('state', 'wechat.lock'));
+}
+
+/**
+ * 读一个「存着 PID 的锁文件」，只认「PID 解析得出来、而且那个进程还活着」。
+ * 拿不准（文件不在 / 内容坏 / 权限不足）一律返回 null —— 宁可多 spawn 一次被锁挡回，
+ * 也不要因为残留文件就误判成「已在运行」而不启动。
+ */
+function pidFromLockFile(relativePath) {
+  try {
+    const lock = path.join(getRoot(), relativePath);
+    if (!fs.existsSync(lock)) return null;
+    const pid = Number(fs.readFileSync(lock, 'utf8').trim());
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return null;
+    process.kill(pid, 0); // PID 不存在会抛 ESRCH
+    return pid;
+  } catch {
+    return null;
+  }
+}
+
+function startBridge() {
+  if (bridge.child) return { ok: false, error: '桥接已在运行' };
+  const externalPid = externalBridgePid();
+  if (externalPid) {
+    pushLog(`桥接已在运行（pid ${externalPid}，不是本窗口启动的），直接复用`, 'sys', 'bridge');
+    return { ok: true, pid: externalPid, external: true };
+  }
+
+  const seeded = seedBridgeData();
+  if (seeded) pushLog(`桥接配置不存在，已从 ${seeded.from} 生成 config.json`, 'sys', 'bridge');
+  if (!fs.existsSync(path.join(getRoot(), 'config.json'))) {
+    return { ok: false, error: `桥接目录里没有 config.json，也没有可用的模板：${getRoot()}` };
+  }
+
+  const { command, env } = nodeRunner();
+  const child = spawn(command, [path.join(getRoot(), 'src', 'bridge.js')], {
+    cwd: getRoot(),
+    env: { ...process.env, ...env },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  bridge = { child, startedAt: Date.now(), exitCode: null };
+  pushLog(`桥接已启动（pid ${child.pid}）`, 'sys', 'bridge');
+
+  relay(child.stdout, 'out', 'bridge');
+  relay(child.stderr, 'err', 'bridge');
+
+  child.on('close', (code) => {
+    bridge = { child: null, startedAt: null, exitCode: code };
+    onServiceExit('bridge');
+    pushLog(`桥接已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'bridge');
+  });
+
+  return { ok: true, pid: child.pid };
+}
+
+function stopBridge() {
+  markManualStop('bridge');
+  const child = bridge.child;
+  if (!child) {
+    // 外部启动的桥接：界面上是「运行中」，停止按钮就得真的能停，否则用户会以为按钮坏了。
+    const externalPid = externalBridgePid();
+    if (!externalPid) return { ok: false, error: '桥接没在运行' };
+    try {
+      if (process.platform === 'win32') {
+        spawn('taskkill', ['/pid', String(externalPid), '/T', '/F'], { windowsHide: true });
+      } else {
+        process.kill(externalPid, 'SIGTERM');
+      }
+      pushLog(`正在停止外部启动的桥接（pid ${externalPid}）…`, 'sys', 'bridge');
+      return { ok: true, pid: externalPid };
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) };
+    }
+  }
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+    } else {
+      child.kill('SIGTERM');
+    }
+    pushLog('正在停止桥接…', 'sys', 'bridge');
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+function bridgeState() {
+  return {
+    running: Boolean(bridge.child),
+    pid: bridge.child?.pid ?? null,
+    startedAt: bridge.startedAt,
+    exitCode: bridge.exitCode,
+    // 桥接由本窗口之外启动（手动运行 / 上一份桌面进程留下的）时为它的 PID。
+    // 界面据此显示「运行中」，但「停止」按钮不会去杀一个不属于本窗口的进程。
+    externalPid: bridge.child ? null : externalBridgePid()
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 微信接入（官方 iLink / ClawBot 协议）
+ *
+ * 单独一个进程（src/wechat-bot.js），不走 NapCat、也不进 bridge.js：
+ * 那边会话 key 必须是 `private:<数字>`、发消息全靠 NapCat 的 bot 对象，
+ * 硬塞会动到已经跑通的 QQ 链路。这里只负责把它拉起来、收日志、报状态。
+ *
+ * 二维码不由这里生成：bot 扫码时会把图写进 state/wechat-qr.json，这里读出来给前端。
+ * 好处是软件重启后二维码还在，不用重新点一次。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+let wechat = { child: null, startedAt: null, exitCode: null };
+
+function wechatFiles() {
+  const base = path.join(getRoot(), 'state');
+  return {
+    qr: path.join(base, 'wechat-qr.json'),
+    token: path.join(base, 'wechat-token.json')
+  };
+}
+
+function wechatState() {
+  const f = wechatFiles();
+  const qr = readJson(f.qr) ?? {};
+  const token = readJson(f.token) ?? {};
+  // 「运行中」不能只看自己的 child：桥接/微信可能是从别的终端起的（比如调试时手起一份），
+  // 这时锁文件里有活着的 pid，界面也得如实显示，否则会诱着用户再点一次启动。
+  const externalPid = wechat.child ? null : externalWechatPid();
+  const runningPid = wechat.child?.pid ?? externalPid ?? null;
+  // 只在「进程在跑 + 码还新鲜」时把图给前端：进程没了那张图就是上次留下的尸体，
+  // 扫了只会得到一个过期提示；超过 4 分钟的码微信那边也已经不认了。
+  const fresh = qr.dataUrl && Date.now() - Number(qr.at ?? 0) < 4 * 60 * 1000;
+  const live = Boolean(runningPid) && fresh && (qr.status === 'waiting' || qr.status === 'scanned');
+  return {
+    running: Boolean(runningPid),
+    pid: runningPid,
+    externalPid,
+    startedAt: wechat.startedAt,
+    loggedIn: Boolean(token.bot_token),
+    botId: token.bot_id ?? null,
+    loginTime: token.login_time ?? null,
+    qrStatus: qr.status ?? null,
+    qr: live ? qr.dataUrl : null,
+    qrUrl: live ? qr.qrUrl ?? null : null
+  };
+}
+
+function startWechat() {
+  if (wechat.child) return { ok: false, error: '微信接入已在运行' };
+  // 微信这条线自己也有单实例锁（state/wechat.lock）。同一账号只允许一个进程长轮询，
+  // 再 spawn 一个只会立刻 exit(2) —— 界面上看着像"启动失败"，其实服务是好的。
+  const externalPid = externalWechatPid();
+  if (externalPid) {
+    pushLog(`微信接入已在运行（pid ${externalPid}，不是本窗口启动的），直接复用`, 'sys', 'wechat');
+    return { ok: true, pid: externalPid, external: true };
+  }
+  const { command, env } = nodeRunner();
+  const script = path.join(getRoot(), 'src', 'wechat-bot.js');
+  if (!fs.existsSync(script)) return { ok: false, error: '找不到 src/wechat-bot.js（桥接目录对吗）' };
+
+  const child = spawn(command, [script], {
+    cwd: getRoot(),
+    env: { ...process.env, ...env },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  wechat = { child, startedAt: Date.now(), exitCode: null };
+  pushLog(`微信接入已启动（pid ${child.pid}）`, 'sys', 'wechat');
+  relay(child.stdout, 'out', 'wechat');
+  relay(child.stderr, 'err', 'wechat');
+
+  child.on('close', (code) => {
+    if (wechat.child === child) wechat = { child: null, startedAt: null, exitCode: code };
+    onServiceExit('wechat');
+    pushLog(`微信接入已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'wechat');
+  });
+
+  return { ok: true, pid: child.pid };
+}
+
+function stopWechat() {
+  markManualStop('wechat');
+  // 先看自己拉起来的；没有就试着停「外部启动的」那个（锁文件里记着 pid）。
+  // 不这么写的话，界面显示「运行中」但点停止永远提示"没在运行"，只能去任务管理器杀。
+  const child = wechat.child;
+  const pid = child?.pid ?? externalWechatPid();
+  if (!pid) return { ok: false, error: '微信接入没在运行' };
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+    } else if (child) {
+      child.kill('SIGTERM');
+    } else {
+      process.kill(pid, 'SIGTERM');
+    }
+    pushLog('正在停止微信接入…', 'sys', 'wechat');
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 主动发送（不等来消息，直接把一条话发给指定的人）
+ *
+ * 微信：走 wechat-bot.js 的 push 子命令（2026-10-19 实测 sendmessage 不带
+ * context_token 也能发，所以能主动推）。这里把它一次性拉起来、喂 stdin、收输出。
+ * 白名单检查在 pushText 内部做，这里不做第二遍 —— 两处不一致时以那边为准。
+ *
+ * QQ：走 NapCat 的 OneBot v11 HTTP（/send_private_msg）。口令从桥接配置的
+ * snowluma.accessToken 读（必须和 NapCat 配的一致）；NapCat 没起就说人话报错。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+function wechatPush({ to, text, dryRun = false } = {}) {
+  const target = String(to ?? '').trim();
+  const body = String(text ?? '');
+  if (!target) return Promise.resolve({ ok: false, error: '缺少目标微信用户 id' });
+  if (!dryRun && !body.trim()) return Promise.resolve({ ok: false, error: '没有要发的内容' });
+
+  const script = path.join(getRoot(), 'src', 'wechat-bot.js');
+  if (!fs.existsSync(script)) return Promise.resolve({ ok: false, error: '找不到 src/wechat-bot.js（桥接目录对吗）' });
+
+  const args = [script, 'push'];
+  if (dryRun) args.push('--dry-run');
+  args.push(target); // 文字不放进命令行（长文本/多行不用和转义搏斗），走 stdin
+
+  return new Promise((resolve) => {
+    const { command, env } = nodeRunner();
+    const child = spawn(command, args, {
+      cwd: getRoot(),
+      env: { ...process.env, ...env },
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    const out = [];
+    child.stdout.on('data', (chunk) => out.push(chunk.toString()));
+    child.stderr.on('data', (chunk) => out.push(chunk.toString()));
+    child.on('error', (error) => resolve({ ok: false, error: String(error?.message ?? error) }));
+    child.on('close', (code) => {
+      const output = out.join('').trim();
+      for (const line of output.split('\n').slice(-8)) if (line.trim()) pushLog(line, code === 0 ? 'out' : 'err', 'wechat');
+      pushLog(dryRun ? `微信 dry-run（${target}）完成` : `微信主动发送（${target}）${code === 0 ? '完成' : `失败 code ${code}`}`, code === 0 ? 'sys' : 'err', 'wechat');
+      resolve({ ok: code === 0, code, output: output.slice(-2000) });
+    });
+    child.stdin.write(body.endsWith('\n') ? body : body + '\n');
+    child.stdin.end();
+  });
+}
+
+async function qqSend({ qq, text } = {}) {
+  const target = String(qq ?? '').trim();
+  const body = String(text ?? '');
+  if (!/^\d{5,12}$/.test(target)) return { ok: false, error: 'QQ 号不对（5~12 位数字）' };
+  if (!body.trim()) return { ok: false, error: '没有要发的内容' };
+
+  const n = napcatSettings();
+  if (!(await probePort(n.httpPort))) {
+    return { ok: false, error: `NapCat 的 HTTP 接口（${n.httpPort} 端口）不通。先一键启动，等 NapCat 就绪再发。` };
+  }
+  const token = String(loadConfig().snowluma?.accessToken ?? '').trim();
+  try {
+    const res = await fetch(`http://127.0.0.1:${n.httpPort}/send_private_msg`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      },
+      body: JSON.stringify({ user_id: Number(target), message: body }),
+      signal: AbortSignal.timeout(10_000)
+    });
+    const data = await res.json().catch(() => ({}));
+    const bad = !res.ok || (data.status != null && data.status !== 'ok' && data.retcode !== 0);
+    if (bad) {
+      return { ok: false, error: `NapCat 返回异常：HTTP ${res.status} ${JSON.stringify(data).slice(0, 200)}` };
+    }
+    pushLog(`QQ 主动发送 → ${target}：${body.slice(0, 40)}`, 'sys', 'napcat');
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+/** 微信推送可选目标：state/wechat-sessions.json 里聊过天的用户 id。 */
+function wechatTargets() {
+  const saved = readJson(path.join(getRoot(), 'state', 'wechat-sessions.json'), {});
+  return Object.keys(saved ?? {}).map((id) => ({ id }));
+}
+
+/** QQ 好友 / 群列表（发送选择器用）。NapCat 没在跑就给空列表，不报错。 */
+async function qqContacts() {
+  const n = napcatSettings();
+  if (!(await probePort(n.httpPort))) return { friends: [], groups: [] };
+  const token = String(loadConfig().snowluma?.accessToken ?? '').trim();
+  const headers = { 'content-type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) };
+  const get = async (endpoint) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${n.httpPort}${endpoint}`, { headers, signal: AbortSignal.timeout(5000) });
+      const data = await res.json();
+      return Array.isArray(data?.data) ? data.data : [];
+    } catch {
+      return [];
+    }
+  };
+  const [friends, groups] = await Promise.all([get('/get_friend_list'), get('/get_group_list')]);
+  return {
+    friends: friends.map((f) => ({ id: String(f.user_id ?? ''), remark: f.remark ?? f.nickname ?? '' })).filter((x) => x.id),
+    groups: groups.map((g) => ({ id: String(g.group_id ?? ''), name: g.group_name ?? '' })).filter((x) => x.id)
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 消息历史（「消息」页：按联系人看最近聊过什么）
+ *
+ * 数据源就是桥接和微信各自写的活动日志，不另建数据库：
+ *   QQ   → state/qq-activity.log     `[HH:MM:SS] private:123 管理员 某某：正文`
+ *  微信 → state/wechat-activity.log  `[HH:MM:SS] wxid_xxx 对方：正文`
+ * 两边同一套形状（会话键 + 角色 + 正文），所以一个解析器够用。
+ * 日志本身有行数上限（桥接侧 createCappedLogger 500 行），所以这里是「最近」
+ * 而不是「全部」—— 界面上要写清楚，别让人以为聊天记录丢了。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const ACTIVITY_RE = /^\[(\d{2}:\d{2}:\d{2})\]\s+(\S+)\s+([^：:]{1,24})[：:]\s*([\s\S]*)$/;
+
+function activityFile(platform) {
+  const name =
+    platform === 'wechat' ? 'wechat-activity.log' : platform === 'phone' ? 'phone-activity.log' : 'qq-activity.log';
+  return path.join(getRoot(), 'state', name);
+}
+
+function readMessages(platform, limit = 300) {
+  const file = activityFile(platform);
+  let raw = '';
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return { entries: [], contacts: [], file, missing: true };
+  }
+  const lines = raw.split('\n').filter((l) => l.trim());
+  const entries = [];
+  for (const line of lines.slice(-Math.max(1, limit))) {
+    const m = ACTIVITY_RE.exec(line.trim());
+    if (!m) continue;
+    const [, clock, conv, who, text] = m;
+    // 活动日志里混着一堆系统记录（`[reserved2] 消息已入未读：…`、`[voice] 发送语音…`），
+    // 那些不是聊天内容，混进消息流只会把真正的对话淹掉。只留真人说话和 agent 回复。
+    if (!/^(管理员|群友|对方|agent 回复|主动发送)/.test(who)) continue;
+    const self = /^(agent 回复|主动发送)/.test(who);
+    entries.push({
+      clock,
+      conv,
+      // private:123 / group:456 是桥接的会话键；微信那边就是一个 id
+      kind: conv.startsWith('group:') ? 'group' : 'private',
+      target: conv.includes(':') ? conv.split(':')[1] : conv,
+      who: who.trim(),
+      self,
+      text
+    });
+  }
+  const contacts = [];
+  const seen = new Map();
+  for (const e of entries) {
+    let c = seen.get(e.conv);
+    if (!c) {
+      c = { conv: e.conv, kind: e.kind, target: e.target, label: e.target, count: 0, last: '' };
+      seen.set(e.conv, c);
+      contacts.push(c);
+    }
+    c.count += 1;
+    c.last = e.clock;
+    // 拿对方最近一次的名字当显示名（agent 回复那行的 who 是固定串，跳过）
+    if (!e.self) c.label = e.who.replace(/^管理员\s*/, '') || e.target;
+  }
+  // 微信那边可能还没聊过天但有会话记录，一并列出来，好让人挑目标发消息
+  if (platform === 'wechat') {
+    for (const t of wechatTargets()) {
+      if (!seen.has(t.id)) {
+        contacts.push({ conv: t.id, kind: 'private', target: t.id, label: t.id, count: 0, last: '' });
+      }
+    }
+  }
+  return { entries, contacts, file, missing: false };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 省流总结 + Webhook 通知枢纽
+ *
+ * 省流总结：把活动日志里某联系人的最近消息拼成一段话，喂给已配置的模型，
+ * 出一份「我离开的这段时间群里发生了什么」。模型走「API 与模型」页配的那份
+ * （qq/微信各认各的，work 档没有就用 chat 档）。
+ *
+ * 通知枢纽：本机其他软件 POST /hook/notify/<口令> 就能把一条文字推到
+ * QQ（好友或群）或微信。配置存在 settings.json 旁边的 notify-hub.json。
+ * 主服务只绑 127.0.0.1 —— 本机软件直接调；局域网设备要用得自己穿透。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const NOTIFY_FILE = path.join(path.dirname(SETTINGS_FILE), 'notify-hub.json');
+
+function loadNotify() {
+  const d = {
+    enabled: true,
+    token: randomBytes(9).toString('base64url'),
+    default: { platform: 'qq', to: '' },
+    mirror: { enabled: false, from: '', keyword: '', platform: 'qq', to: '' }
+  };
+  const c = readJson(NOTIFY_FILE, null);
+  if (!c) {
+    // 第一次用：把生成的口令落盘，否则界面展示的和接收端比对的永远对不上
+    writeJson(NOTIFY_FILE, d);
+    return d;
+  }
+  return {
+    enabled: c.enabled !== false,
+    token: String(c.token ?? '') || d.token,
+    default: {
+      platform: c.default?.platform === 'wechat' ? 'wechat' : 'qq',
+      to: String(c.default?.to ?? '')
+    },
+    mirror: {
+      enabled: c.mirror?.enabled === true,
+      from: String(c.mirror?.from ?? ''),
+      keyword: String(c.mirror?.keyword ?? ''),
+      platform: c.mirror?.platform === 'wechat' ? 'wechat' : 'qq',
+      to: String(c.mirror?.to ?? '')
+    }
+  };
+}
+
+function saveNotify(hub) {
+  writeJson(NOTIFY_FILE, hub);
+}
+
+/** QQ 发送：目标支持「QQ号」（私聊）和「group:群号」（群聊） */
+async function qqSendAny(target, text) {
+  const spec = String(target ?? '').trim();
+  if (spec.startsWith('group:')) {
+    const group = spec.slice(6).trim();
+    if (!/^\d{3,15}$/.test(group)) return { ok: false, error: '群号不对：group: 后面要是数字' };
+    const n = napcatSettings();
+    if (!(await probePort(n.httpPort))) {
+      return { ok: false, error: `NapCat 的 HTTP 接口（${n.httpPort} 端口）不通，先一键启动` };
+    }
+    const token = String(loadConfig().snowluma?.accessToken ?? '').trim();
+    try {
+      const res = await fetch(`http://127.0.0.1:${n.httpPort}/send_group_msg`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(token ? { authorization: `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({ group_id: Number(group), message: String(text ?? '') }),
+        signal: AbortSignal.timeout(10_000)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || (data.status != null && data.status !== 'ok' && data.retcode !== 0)) {
+        return { ok: false, error: `NapCat 返回异常：HTTP ${res.status} ${JSON.stringify(data).slice(0, 200)}` };
+      }
+      pushLog(`QQ 群通知 → ${group}：${String(text ?? '').slice(0, 40)}`, 'sys', 'napcat');
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) };
+    }
+  }
+  return qqSend({ qq: spec, text });
+}
+
+/** 统一出口：platform + to + text → QQ 或微信 */
+async function notifyDispatch({ platform, to, text }) {
+  const body = String(text ?? '').trim();
+  if (!body) return { ok: false, error: '没有要发的内容' };
+  const target = String(to ?? '').trim();
+  if (!target) return { ok: false, error: '没有目标' };
+  if (platform === 'wechat') return wechatPush({ to: target, text: body });
+  return qqSendAny(target, body);
+}
+
+const SUMMARIZE_SYSTEM =
+  '你是聊天记录总结助手。用户离开了一段时间，现在要看「省流版」。请用中文总结给出的聊天记录，格式：\n' +
+  '1. 【聊了什么】每条话题一行，最多 5 行，每行一句话\n' +
+  '2. 【等我处理】列出需要用户本人回应或行动的事；没有就写「没有」\n' +
+  '3. 【一句话】整体结论或氛围，一句话\n' +
+  '只输出这三段，不要开场白、不要复述原文、不要客套。直接输出总结文本，不要调用任何工具。';
+
+/** 走内置模型 API 实例（matrix 后端）出一轮回答。
+ *  secrets 里的厂商 key 全失效时，实例自己的模型链路往往还活着
+ *  （self-test 走的就是它），所以它是省流总结的最后一档候选。
+ *  流程照抄 src/self-test.js：建一次性会话 → 订阅事件流 → prompt → 等回合结束 → 归档。 */
+async function summarizeViaMatrix(prompt) {
+  const { NodeApiClient, unwrap, createTurnCollector } = await import(
+    pathToFileURL(path.join(getRoot(), 'src', 'oc-client.js')).href
+  );
+  const { ensureServer } = await import(pathToFileURL(path.join(getRoot(), 'src', 'oc-server.js')).href);
+  const { PATHS } = await import(pathToFileURL(path.join(getRoot(), 'src', 'oc-env.js')).href);
+
+  await ensureServer({ log: () => {} });
+
+  const api = new NodeApiClient(undefined, undefined, {
+    stateDir: PATHS.state,
+    sessionDir: PATHS.state,
+    log: () => {}
+  });
+  const ws = unwrap(await api.workspace.create({ path: getRoot() }), 'workspace.create');
+  const workspaceId = ws.workspace.workspaceId;
+  const created = unwrap(
+    await api.sessions.create({ workspaceId, agentPreset: 'qq-chat', title: '省流总结（一次性，用完即归档）' }),
+    'sessions.create'
+  );
+  const sessionId = created.sessionId;
+  try {
+    const collector = createTurnCollector();
+    const stream = api.events.mux({});
+    const done = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('等待模型回复超时（240s）')), 240_000);
+      (async () => {
+        for await (const envelope of stream) {
+          const frame = envelope.payload;
+          if (frame.type === 'session/event' && frame.sessionId === sessionId) {
+            const ended = collector.push(frame.event);
+            if (ended) {
+              clearTimeout(timer);
+              resolve(ended);
+              return;
+            }
+          }
+          if (frame.type === 'stream/error') {
+            clearTimeout(timer);
+            reject(new Error('事件流错误: ' + JSON.stringify(frame.error).slice(0, 300)));
+            return;
+          }
+        }
+      })().catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+    api.events.follow(sessionId);
+    await unwrap(
+      await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] }),
+      'sessions.prompt'
+    );
+    const ended = await done;
+    return String(ended.text ?? '').trim();
+  } finally {
+    try {
+      await api.workspace.archiveSession({ sessionId });
+    } catch {
+      /* 归档失败不影响结果 */
+    }
+  }
+}
+
+async function summarizeChat({ platform, conv, count } = {}) {
+  const pf = platform === 'wechat' ? 'wechat' : 'qq';
+  const key = String(conv ?? '').trim();
+  if (!key) return { ok: false, error: '没有指定联系人' };
+  const data = readMessages(pf, 2000);
+  const entries = (data.entries ?? []).filter((e) => e.conv === key);
+  if (!entries.length) return { ok: false, error: '这个联系人还没有消息记录' };
+
+  const n = Math.min(Math.max(Number(count) || 100, 20), 400);
+  const lines = entries
+    .slice(-n)
+    .map((e) => `[${e.clock}] ${e.self ? '机器人' : e.who}：${e.text}`);
+
+  // 模型来源：当前平台的四档配置优先（总结是「干活」，chat 档就够），
+  // 没配就走 organizeCandidates() 的降级链（模型来源 → 模型池免费档）。
+  const secrets = readJson(secretsFile()) ?? {};
+  const profiles = readModelProfiles();
+  const preferred = [];
+  for (const raw of [profiles[pf]?.chat, profiles[pf]?.work, profiles.qq?.chat, profiles.qq?.work]) {
+    if (!raw) continue;
+    try {
+      preferred.push({ profile: resolveProfile(raw, secrets), via: '四档配置' });
+    } catch {
+      /* 配不全，跳过 */
+    }
+  }
+  const candidates = [...preferred, ...organizeCandidates()];
+  if (!candidates.length) {
+    return { ok: false, error: '还没配置模型 —— 先到「API 与模型」页配好，或把模型加进模型池' };
+  }
+
+  const prompt = `以下是「${key}」的最近聊天记录（${lines.length} 条，按时间排序）：\n\n${lines.join('\n')}\n\n请给一份省流版总结。`;
+  let lastError = '';
+  // 一个模型额度用完/限流，就换下一个 —— 和角色卡整理是同一套降级逻辑。
+  for (const { profile, via } of candidates) {
+    let out = '';
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90_000);
+    try {
+      for await (const item of streamChat(profile, {
+        messages: [
+          { role: 'system', text: SUMMARIZE_SYSTEM },
+          { role: 'user', text: prompt }
+        ],
+        signal: controller.signal
+      })) {
+        if (item.delta) out += item.delta;
+        if (out.length > 4000) break;
+      }
+      out = out.trim();
+      if (!out) {
+        lastError = '模型没有返回内容';
+        continue;
+      }
+      return { ok: true, summary: out, count: lines.length, via, model: profile.model ?? '' };
+    } catch (error) {
+      lastError = humanizeModelError(error);
+      pushLog(`省流总结换模型（${profile.model ?? '?'}）：${lastError}`, 'err', 'app');
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  // 直连厂商全挂（本机常见：secrets 里的 key 被轮换过）还有一条路：
+  // 内置模型 API 实例 —— self-test 走的就是它，key 由实例自己管。
+  try {
+    const out = await summarizeViaMatrix(prompt);
+    if (out) return { ok: true, summary: out, count: lines.length, via: '模型 API 实例', model: 'matrix' };
+    lastError = '实例没有返回内容';
+  } catch (error) {
+    lastError = String(error?.message ?? error).slice(0, 300);
+    pushLog(`省流总结走模型 API 实例失败：${lastError}`, 'err', 'app');
+  }
+  return { ok: false, error: `试了 ${candidates.length} 个直连模型和实例都没成功。最后一次：${lastError || '未知原因'}` };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 手机推送（Android 通知转发）
+ *
+ * 手机端跑 SmsForwarder / message-mirror 这类工具，把通知 POST 过来。
+ * 收进来的东西落到 state/phone-activity.log，和 QQ / 微信同一套格式，
+ * 「消息」页的解析器直接能读。
+ *
+ * 为什么要单开一个端口：主服务只绑 127.0.0.1 —— 那上面有密钥、有控制台口令，
+ * 绝不能给局域网开。这里另起一个监听，只认 /hook/<token> 和根路径的状态页，
+ * 其它路径一律 404。万一 token 漏了，最坏结果也只是别人能往消息流里塞一行字。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const PHONE_DEFAULT_PORT = 3210;
+const PHONE_LOG_MAX = 400;
+const PHONE_INBOX_MAX = 60;
+
+function phoneSettings() {
+  const st = readJson(SETTINGS_FILE);
+  const ph = st.phone && typeof st.phone === 'object' ? st.phone : {};
+  const token = typeof ph.token === 'string' ? ph.token.trim() : '';
+  const port = Number(ph.port);
+  return {
+    enabled: ph.enabled === true,
+    port: Number.isFinite(port) && port >= 1024 && port <= 65535 ? port : PHONE_DEFAULT_PORT,
+    token: /^[a-z0-9]{6,64}$/i.test(token) ? token : '',
+    count: Number(ph.count) || 0,
+    lastAt: Number(ph.lastAt) || 0,
+    // 让模型也看到：推给管理员私聊那一路会话
+    notifyAi: ph.notifyAi === true,
+    notifyKey: typeof ph.notifyKey === 'string' ? ph.notifyKey.trim() : ''
+  };
+}
+
+function writePhoneSettings(patch) {
+  const st = readJson(SETTINGS_FILE);
+  st.phone = { ...(st.phone ?? {}), ...patch };
+  writeJson(SETTINGS_FILE, st);
+  return phoneSettings();
+}
+
+/** 18 位十六进制。够长到猜不出来，又短到能手输。 */
+const newPhoneToken = () => randomBytes(9).toString('hex');
+
+/**
+ * 局域网地址列表，**按「手机能不能连上」排序**。
+ *
+ * 机器上往往挂着一堆虚拟网卡（Radmin VPN、VMware、Hyper-V…），它们的 IP 手机根本
+ * 连不到。以前直接按网卡顺序返回，第一个经常是 26.x 的 VPN 地址 —— 用户照抄过去
+ * 怎么试都不通，还以为是防火墙的事。
+ */
+const VIRTUAL_IF = /(radmin|vmware|virtualbox|hyper-?v|tailscale|zerotier|wsl|docker|loopback|tap|tun|npcap|vpn)/i;
+
+function lanAddresses() {
+  const out = [];
+  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+    for (const ni of list ?? []) {
+      if (ni.family !== 'IPv4' || ni.internal) continue;
+      if (/^(127\.|169\.254\.)/.test(ni.address)) continue;
+      out.push({ name, address: ni.address });
+    }
+  }
+  const score = (item) => {
+    if (VIRTUAL_IF.test(item.name)) return 9;
+    if (/^192\.168\./.test(item.address)) return 0;
+    if (/^10\./.test(item.address)) return 1;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(item.address)) return 1;
+    if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(item.address)) return 2;
+    return 3;
+  };
+  return out.sort((a, b) => score(a) - score(b));
+}
+
+const phoneLogFile = () => path.join(getRoot(), 'state', 'phone-activity.log');
+const phoneInboxFile = () => path.join(getRoot(), 'state', 'phone-inbox.json');
+
+function readPhoneInbox() {
+  const list = readJson(phoneInboxFile(), []);
+  return Array.isArray(list) ? list : [];
+}
+
+/** 只留最后 max 行 —— 不重写的话这个文件会一直涨。 */
+function trimLines(file, max) {
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    if (lines.length <= max + 40) return;
+    fs.writeFileSync(file, lines.slice(-max).join('\n'), 'utf8');
+  } catch {
+    /* 截断失败不影响收消息 */
+  }
+}
+
+/**
+ * 包名 → 人话。
+ * SmsForwarder 的 {{app_pkg}} 给的是 `com.tencent.mm`，直接显示在消息流里没法看；
+ * 认不出来的包名就取最后一段（`com.xxx.something` → `something`）。
+ */
+const PHONE_APP_ALIAS = [
+  [/com\.tencent\.mm/i, '微信'],
+  [/com\.tencent\.mobileqq/i, 'QQ'],
+  [/com\.tencent\.tim/i, 'TIM'],
+  [/com\.tencent\.android\.qqmail/i, 'QQ邮箱'],
+  [/com\.android\.mms|^mms$/i, '短信'],
+  [/com\.alibaba\.android\.rimet/i, '钉钉'],
+  [/com\.ss\.android\.ugc\.aweme/i, '抖音'],
+  [/com\.xingin/i, '小红书'],
+  [/com\.taobao|com\.tmall/i, '淘宝'],
+  [/com\.jd\.jingdong/i, '京东'],
+  [/com\.eg\.android\.AlipayGphone/i, '支付宝'],
+  [/com\.netease\.mail/i, '网易邮箱'],
+  [/android\.dialer|incallui|com\.android\.phone/i, '电话']
+];
+
+function normalizePhoneApp(raw) {
+  const text = String(raw ?? '').trim();
+  if (!text) return '手机';
+  const pkg = text.split('/')[0].trim();
+  for (const [re, name] of PHONE_APP_ALIAS) if (re.test(pkg)) return name;
+  if (/^[a-z][a-z0-9_]*(\.[a-z0-9_]+){2,}$/i.test(pkg)) {
+    const parts = pkg.split('.');
+    return (parts[parts.length - 1] || '手机').slice(0, 20);
+  }
+  return text.slice(0, 24);
+}
+
+/**
+ * 三种来源的字段名都不一样，统一成 {app, from, text, kind}。
+ *   SmsForwarder  → 自己拼的 JSON / 表单，常见 from + content
+ *   message-mirror→ {app, message_body, type}
+ *   随手 curl     → 纯文本、?text=xxx、{"text": "..."}
+ */
+function parsePhonePayload(raw, contentType, query) {
+  const body = String(raw ?? '').trim();
+  let data = {};
+  if (body) {
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed;
+    } catch {
+      if (/x-www-form-urlencoded/i.test(contentType ?? '') || /^[^\s=&]+=[^\s&]*(&|$)/.test(body)) {
+        data = Object.fromEntries(new URLSearchParams(body).entries());
+      } else {
+        data = { text: body };
+      }
+    }
+  }
+  // 有的工具把真正的内容包了一层
+  for (const key of ['extra', 'data', 'payload', 'notification']) {
+    const inner = data?.[key];
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+      data = { ...inner, ...data };
+      break;
+    }
+  }
+
+  const q = query ?? new URLSearchParams();
+  const pick = (keys) => {
+    for (const k of keys) {
+      for (const src of [data, Object.fromEntries(q.entries())]) {
+        const v = src?.[k];
+        if (typeof v === 'string' && v.trim()) return v.trim();
+        if (typeof v === 'number') return String(v);
+      }
+    }
+    return '';
+  };
+
+  return {
+    app: pick(['app', 'appName', 'app_name', 'packageName', 'package_name', 'package', 'pkg', 'source']),
+    from: pick(['from', 'sender', 'title', 'contact', 'fromName', 'from_name', 'number']),
+    text: pick(['text', 'content', 'message_body', 'body', 'msg', 'message', 'description', 'notify', 'summary']),
+    kind: pick(['type', 'kind', 'event', 'category'])
+  };
+}
+
+function recordPhonePush({ app, from, text, kind }) {
+  const appName = normalizePhoneApp(app);
+  const clean = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!clean) return { ok: false, error: '内容为空，检查一下手机端的字段映射' };
+  const sender = String(from ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  const clock = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+
+  const file = phoneLogFile();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `[${clock}] phone:${appName} 对方：${sender ? `【${sender}】` : ''}${clean.slice(0, 4000)}\n`, 'utf8');
+    trimLines(file, PHONE_LOG_MAX);
+  } catch (error) {
+    return { ok: false, error: `写日志失败：${error?.message ?? error}` };
+  }
+
+  const inbox = readPhoneInbox();
+  inbox.unshift({
+    at: Date.now(),
+    app: appName,
+    from: sender,
+    text: clean.slice(0, 600),
+    kind: String(kind ?? '').slice(0, 30)
+  });
+  try {
+    writeJson(phoneInboxFile(), inbox.slice(0, PHONE_INBOX_MAX));
+  } catch { /* 收件箱写不进去不影响日志 */ }
+
+  writePhoneSettings({ count: phoneSettings().count + 1, lastAt: Date.now() });
+  pushLog(`手机推送 · ${appName}${sender ? `（${sender}）` : ''}：${clean.slice(0, 60)}`, 'out', 'phone');
+
+  // 让模型也看到：走桥接控制台的「后台提醒」通道，投进管理员私聊那一路会话。
+  // 为什么走这条而不是自己拼 prompt：桥接已经处理好了会话令牌、静默投递、角色注入，
+  // 从外面另起一套只会跟它打架。
+  if (phoneSettings().notifyAi) {
+    notifyAiAboutPhone({ app: appName, from: sender, text: clean }).catch((error) => {
+      pushLog(`手机推送没送进模型：${error?.message ?? error}`, 'err', 'phone');
+    });
+  }
+
+  return { ok: true, app: appName, from: sender, text: clean.slice(0, 200) };
+}
+
+/** 桥接控制台的端口和口令（口令没配就去读桥接自动生成的那个文件）。 */
+function bridgeConsole() {
+  const cfg = loadConfig();
+  const port = Number(cfg.consolePort) || 3100;
+  let token = String(cfg.consoleToken ?? '').trim();
+  if (!token) {
+    try {
+      token = fs.readFileSync(path.join(getRoot(), 'state', 'console-token'), 'utf8').trim();
+    } catch {
+      token = '';
+    }
+  }
+  return { port, token };
+}
+
+/**
+ * 把一条手机通知作为「后台提醒」投给模型。
+ *
+ * 目标会话默认是管理员私聊（private:ownerQQ）—— 手机通知本来就该让管理员知道，
+ * 而且这条会话一定存在、权限最宽，不用额外给模型开新会话。
+ */
+async function notifyAiAboutPhone({ app, from, text }) {
+  const cfg = loadConfig();
+  const s = phoneSettings();
+  const key = s.notifyKey || (cfg.ownerQQ ? `private:${cfg.ownerQQ}` : '');
+  if (!key) throw new Error('没配管理员 QQ，不知道该投给哪一路会话');
+  const { port, token } = bridgeConsole();
+  if (!token) throw new Error('拿不到桥接控制台口令，先启动一次桥接');
+  if (!(await probePort(port))) throw new Error(`桥接控制台 ${port} 没在跑`);
+
+  const message =
+    `【手机通知】${app}${from ? ` · ${from}` : ''}：${String(text).slice(0, 800)}\n` +
+    '（这条是从手机通知转发过来的，不是 QQ 消息。需要的话可以用 qq_send_private_message 转告管理员，不需要就忽略。）';
+
+  const res = await fetch(`http://127.0.0.1:${port}/api/console/notify-ai`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-console-token': token },
+    body: JSON.stringify({ key, message }),
+    signal: AbortSignal.timeout(30_000)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) throw new Error(data.error ?? `HTTP ${res.status}`);
+  pushLog(`手机推送已投给模型（${key}）`, 'sys', 'phone');
+  return data;
+}
+
+/* ── 手机那个专用端口 ───────────────────────────────────────────────────── */
+
+let phoneServer = null;
+let phoneListening = 0;
+let phoneHits = { at: 0, count: 0 };
+
+function phoneStatusPage() {
+  const { enabled, port } = phoneSettings();
+  return `<!doctype html><meta charset="utf-8"><title>DualHabitat Matrix · 手机推送</title>
+<style>body{font:14px/1.7 "Segoe UI",system-ui,sans-serif;background:#0e1114;color:#dbe3ec;padding:40px;max-width:640px;margin:auto}
+h1{font-size:18px}code{background:#1b2128;padding:2px 6px;border-radius:4px;color:#58a6ff}
+.ok{color:#4ec27f}</style>
+<h1>手机推送端点<span class="${enabled ? 'ok' : ''}">${enabled ? ' · 已启用' : ' · 未启用'}</span></h1>
+<p>这个端口只收通知转发，别的什么都干不了。</p>
+<p>端口 <code>${port}</code>；推送地址形如 <code>http://本机局域网 IP:${port}/hook/&lt;口令&gt;</code>。</p>
+<p>要改设置，回桌面端「手机」页。</p>`;
+}
+
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      // 通知内容再长也到不了这个量级，超了直接掐，别让一个坏请求把内存吃满
+      if (size > 256 * 1024) {
+        reject(new Error('请求体太大'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+/**
+ * 手机上打开的那一页：扫二维码进来，看到的就是要填的东西。
+ *
+ * 为什么地址用 req.headers.host 现拼：手机是用哪个 IP 找到我们的，
+ * 它就该用哪个 IP 往回调 —— 电脑上有几块网卡时，写死某一个必然有一半是错的。
+ */
+function phoneSetupPage(host, token) {
+  const safeHost = String(host ?? '').replace(/[^0-9a-zA-Z.:\-[\]]/g, '');
+  const endpoint = `http://${safeHost}/hook/${token}`;
+  const body = '{"app":"{{app名称}}","from":"{{通知标题}}","text":"{{通知内容}}"}';
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>手机推送配置</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;padding:18px 16px 40px;background:#0e1114;color:#dbe3ec;
+       font:15px/1.65 -apple-system,"Segoe UI",system-ui,"PingFang SC","Microsoft YaHei",sans-serif}
+  h1{font-size:19px;margin:6px 0 4px}
+  p.sub{margin:0 0 18px;color:#9aa7b6;font-size:13px}
+  .card{background:#161b20;border:1px solid #262e37;border-radius:10px;padding:14px;margin-bottom:14px}
+  .k{font-size:12px;color:#6c7a89;margin-bottom:6px}
+  .v{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;word-break:break-all;
+     background:#0e1114;border:1px solid #262e37;border-radius:7px;padding:9px 10px;user-select:all}
+  button{margin-top:10px;width:100%;padding:11px;font-size:14px;border-radius:9px;
+         border:1px solid #2f7fd6;background:#2f7fd6;color:#fff;font-weight:600}
+  button.ghost{background:transparent;color:#58a6ff;border-color:#262e37}
+  ol{padding-left:20px;margin:6px 0 0;color:#9aa7b6;font-size:13.5px}
+  ol li{margin-bottom:8px}
+  b{color:#dbe3ec}
+  code{background:#1b2128;border-radius:4px;padding:1px 5px;font-size:12.5px}
+</style>
+<h1>手机推送 · 配置</h1>
+<p class="sub">这一页就是给手机填的。填完回电脑上看「手机」页的「最近收到」。</p>
+
+<div class="card">
+  <div class="k">推送地址（POST）</div>
+  <div class="v" id="ep">${esc(endpoint)}</div>
+  <button onclick="cp('ep',this)">复制地址</button>
+</div>
+
+<div class="card">
+  <div class="k">请求体（JSON）</div>
+  <div class="v" id="bd">${esc(body)}</div>
+  <button onclick="cp('bd',this)">复制请求体</button>
+  <button class="ghost" onclick="tryPost()">从这台手机发一条试试</button>
+  <div class="k" id="out" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
+  <div class="k">怎么填</div>
+  <ol>
+    <li>装 <b>SmsForwarder</b>（GitHub 上开源那个），允许<strong>通知使用权</strong>。</li>
+    <li>「发送通道」→ 新增 → <b>Webhook</b>：地址粘上面的，方法 POST，内容类型
+        <code>application/json</code>，请求体粘上面的。</li>
+    <li>「通知转发」→ 新增 → 勾上要转的 App → 通道选刚建的那个。</li>
+    <li>电脑那边「手机」页会立刻多一行。收不到先看两台设备是不是同一个 WiFi。</li>
+  </ol>
+</div>
+
+<script>
+function cp(id, btn){
+  var text = document.getElementById(id).textContent;
+  var done = function(){ btn.textContent = '已复制'; setTimeout(function(){ btn.textContent = btn.textContent.indexOf('请求体')>=0?'复制请求体':'复制地址'; }, 1500); };
+  var fallback = function(){
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) { alert('长按上面的文字手动复制'); }
+    document.body.removeChild(ta);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done).catch(fallback);
+  } else { fallback(); }
+}
+function tryPost(){
+  var out = document.getElementById('out');
+  out.textContent = '发…';
+  fetch(${JSON.stringify(endpoint).replace(/</g, '\\u003c')}, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ app: '手机浏览器', from: '自测', text: '从手机浏览器发的一条测试' })
+  }).then(function(r){ return r.text(); })
+    .then(function(t){ out.textContent = '结果：' + t; })
+    .catch(function(e){ out.textContent = '失败：' + e.message; });
+}
+</script>
+</html>`;
+}
+
+async function handlePhoneRequest(req, res) {
+  const url = new URL(req.url ?? '/', 'http://0.0.0.0');
+  const { token } = phoneSettings();
+
+  if (url.pathname === '/' || url.pathname === '/health') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(phoneStatusPage());
+    return;
+  }
+
+  // 手机扫二维码落到这里：一页纸，把该复制的东西都摆出来
+  const setup = /^\/setup\/([A-Za-z0-9_-]{4,64})\/?$/.exec(url.pathname);
+  if (setup) {
+    if (!token || setup[1] !== token) {
+      res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('口令不对');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(phoneSetupPage(req.headers.host, token));
+    return;
+  }
+
+  const hit = /^\/hook\/([A-Za-z0-9_-]{4,64})\/?$/.exec(url.pathname);
+  const deny = (status, message) => {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: false, error: message }));
+  };
+  if (!hit) return deny(404, '没有这个地址');
+  if (!token || hit[1] !== token) return deny(403, '口令不对');
+
+  // 一分钟 120 条封顶：正常通知量远低于这个数，超了基本是有人在刷
+  const now = Date.now();
+  if (now - phoneHits.at > 60_000) phoneHits = { at: now, count: 0 };
+  phoneHits.count += 1;
+  if (phoneHits.count > 120) return deny(429, '太频繁了');
+
+  let raw = '';
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    try {
+      raw = await readRawBody(req);
+    } catch (error) {
+      return deny(413, String(error?.message ?? error));
+    }
+  }
+
+  const parsed = parsePhonePayload(raw, req.headers['content-type'], url.searchParams);
+  const result = recordPhonePush(parsed);
+  res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(result));
+}
+
+/** 起手机端口。已经在监听同一个端口就不动它。 */
+function startPhoneListener() {
+  const { enabled, port } = phoneSettings();
+  if (!enabled) {
+    stopPhoneListener();
+    return { ok: false, running: false, reason: '没启用' };
+  }
+  if (phoneServer && phoneListening === port) return { ok: true, running: true, port };
+
+  stopPhoneListener();
+  return new Promise((resolve) => {
+    const s = http.createServer((req, res) => {
+      handlePhoneRequest(req, res).catch(() => {
+        try {
+          res.writeHead(500);
+          res.end('error');
+        } catch { /* 连接已经断了 */ }
+      });
+    });
+    s.once('error', (error) => {
+      phoneServer = null;
+      phoneListening = 0;
+      pushLog(`手机推送端口 ${port} 起不来：${error?.code ?? error}`, 'err', 'phone');
+      resolve({ ok: false, running: false, error: String(error?.code ?? error) });
+    });
+    s.listen(port, '0.0.0.0', () => {
+      phoneServer = s;
+      phoneListening = port;
+      pushLog(`手机推送已就绪：局域网端口 ${port}`, 'sys', 'phone');
+      resolve({ ok: true, running: true, port });
+    });
+  });
+}
+
+function stopPhoneListener() {
+  if (!phoneServer) return;
+  try {
+    phoneServer.close();
+  } catch { /* 关不掉就算了 */ }
+  phoneServer = null;
+  phoneListening = 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 三、测连通
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * 真发一条请求，测首字延迟。
+ * 不测"能不能连上"，测"能不能出字" —— 端点通但 key 错、模型名错，都是常见坑。
+ */
+async function testBackend(input) {
+  const started = Date.now();
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 20_000);
+  try {
+    const secrets = readJson(secretsFile());
+    const profile = resolveProfile(input, secrets);
+    let firstCharAt = null;
+    let text = '';
+    let usage = null;
+
+    for await (const item of streamChat(profile, {
+      messages: [{ role: 'user', text: '用一句话打个招呼' }],
+      signal: abort.signal
+    })) {
+      if (item.delta) {
+        if (firstCharAt === null) firstCharAt = Date.now();
+        text += item.delta;
+        if (text.length > 200) abort.abort();
+      }
+      if (item.usage) usage = item.usage;
+    }
+
+    return {
+      ok: true,
+      model: profile.model,
+      firstCharMs: firstCharAt ? firstCharAt - started : null,
+      totalMs: Date.now() - started,
+      reply: text.slice(0, 200),
+      usage
+    };
+  } catch (error) {
+    return { ok: false, error: humanizeModelError(error) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 自动化：崩溃看护 / 开机自启 / 定时任务
+ *
+ * 配置存 automation.json（和 settings.json 同目录 —— 打包后在 userData）。
+ * 看护挂在各进程的 close 事件上：用户主动停（stopBridge / stopWechat / stopNapcat /
+ * bringDown）会先立 suppress 旗子，只有「没人让它停、它自己死了」才算意外，
+ * 才按配置自动拉回来。连挂太多次就放弃（默认 5 次），免得变成死循环重启。
+ * NapCat 特殊：启动器本来就会自己退出，看它要看端口，不能看子进程。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const AUTOMATION_FILE = path.join(path.dirname(SETTINGS_FILE), 'automation.json');
+const APP_VERSION = readJson(path.join(here, 'package.json'), {}).version ?? '0.0.0';
+
+// 本进程启动时刻。前端拿它算「已经跑了多久」，比轮询计数器准。
+const BOOT_AT = Date.now();
+
+function automationDefaults() {
+  return { watch: { napcat: false, bridge: false, wechat: false }, launchAtLogin: false, schedules: [] };
+}
+
+function loadAutomation() {
+  const cfg = readJson(AUTOMATION_FILE, null);
+  const base = automationDefaults();
+  if (!cfg) return base;
+  return {
+    watch: { ...base.watch, ...(cfg.watch ?? {}) },
+    launchAtLogin: cfg.launchAtLogin === true,
+    schedules: Array.isArray(cfg.schedules) ? cfg.schedules : []
+  };
+}
+
+function saveAutomation(cfg) {
+  writeJson(AUTOMATION_FILE, cfg);
+}
+
+/** 用户主动停了某个服务 → 15 秒内压住 close 回调里的看护，别停完又被拉起来。 */
+const suppressRestart = { napcat: 0, bridge: 0, wechat: 0 };
+const restartAttempts = { napcat: 0, bridge: 0, wechat: 0 };
+const RESTART_MAX = 5;
+const RESTART_DELAY_MS = 5000;
+
+function markManualStop(kind) {
+  if (kind in suppressRestart) suppressRestart[kind] = Date.now();
+}
+
+function recentlyStopped(kind) {
+  return Date.now() - suppressRestart[kind] < 15_000;
+}
+
+function onServiceExit(kind) {
+  if (recentlyStopped(kind)) {
+    suppressRestart[kind] = 0;
+    return;
+  }
+  const cfg = loadAutomation();
+  if (!cfg.watch[kind]) return;
+  if (restartAttempts[kind] >= RESTART_MAX) {
+    pushLog(`「${kind}」连续 ${RESTART_MAX} 次自动重启失败，看护放弃，等手动处理`, 'err', 'app');
+    return;
+  }
+  restartAttempts[kind] += 1;
+  pushLog(`看护：「${kind}」意外退出，${RESTART_DELAY_MS / 1000} 秒后自动重启（第 ${restartAttempts[kind]}/${RESTART_MAX} 次）`, 'sys', 'app');
+  setTimeout(() => {
+    try {
+      if (kind === 'bridge') startBridge();
+      else if (kind === 'wechat') startWechat();
+      pushLog(`看护：「${kind}」已重新拉起`, 'sys', 'app');
+    } catch (error) {
+      pushLog(`看护重启「${kind}」失败：${error?.message ?? error}`, 'err', 'app');
+    }
+  }, RESTART_DELAY_MS);
+}
+
+/** 服务稳定跑过 5 分钟就清零计数 —— 偶尔崩一次和连环崩要区别对待。 */
+setInterval(() => {
+  for (const k of Object.keys(restartAttempts)) {
+    const startedAt = k === 'bridge' ? bridge.startedAt : k === 'wechat' ? wechat.startedAt : napcatLaunch.startedAt;
+    if (startedAt && Date.now() - startedAt > 5 * 60_000) restartAttempts[k] = 0;
+  }
+}, 60_000);
+
+/** NapCat 看护：看端口不看子进程（启动器本来就会退）。只接管我们自己启动过的。 */
+setInterval(async () => {
+  try {
+    const cfg = loadAutomation();
+    if (!cfg.watch.napcat || !napcatLaunch.startedAt || recentlyStopped('napcat')) return;
+    const n = napcatSettings();
+    if (await probePort(n.wsPort)) return;
+    if (restartAttempts.napcat >= RESTART_MAX) {
+      pushLog(`NapCat 连续 ${RESTART_MAX} 次自动重启失败，看护放弃`, 'err', 'app');
+      return;
+    }
+    restartAttempts.napcat += 1;
+    pushLog(`看护：NapCat 端口（${n.wsPort}）掉了，自动重启（第 ${restartAttempts.napcat}/${RESTART_MAX} 次）`, 'sys', 'app');
+    startNapcat();
+  } catch {
+    /* 看护自身不能带崩服务 */
+  }
+}, 30_000);
+
+/* ── 开机自启（Electron 打包版才有；开发态和纯 node 调试都报告不支持） ── */
+
+let electronApp = null;
+try {
+  if (process.versions.electron) electronApp = (await import('electron')).app;
+} catch {
+  electronApp = null;
+}
+
+function autostartState() {
+  if (!electronApp || !electronApp.isPackaged) return { supported: false, enabled: false };
+  try {
+    return { supported: true, enabled: electronApp.getLoginItemSettings().openAtLogin };
+  } catch {
+    return { supported: false, enabled: false };
+  }
+}
+
+function applyAutostart(on) {
+  if (!electronApp || !electronApp.isPackaged) return autostartState();
+  try {
+    electronApp.setLoginItemSettings({ openAtLogin: Boolean(on), openAsHidden: true });
+    return autostartState();
+  } catch (error) {
+    pushLog(`设置开机自启失败：${error?.message ?? error}`, 'err', 'app');
+    return autostartState();
+  }
+}
+
+/* ── 定时任务 ──
+ * kind: wechat-push（target=微信用户id）/ qq-send（target=QQ号）/ restart-all（整条链路重启）
+ * every: { type: "daily", time: "HH:MM" } | { type: "interval", minutes: N }
+ * lastRun 先落盘再执行 —— 防止「触发了还没跑完就退出」导致重复触发。 */
+
+function scheduleDue(task, now) {
+  if (!task?.enabled) return false;
+  const every = task.every ?? {};
+  if (every.type === 'interval') {
+    const minutes = Number(every.minutes);
+    if (!(Number.isFinite(minutes) && minutes >= 1)) return false;
+    if (!task.lastRun) return true;
+    return now - Number(task.lastRun) >= minutes * 60_000;
+  }
+  if (every.type === 'daily') {
+    const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(every.time ?? ''));
+    if (!m) return false;
+    const d = new Date(now);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const want = m[1].padStart(2, '0') + ':' + m[2];
+    if (want !== hh + ':' + mm) return false;
+    const minuteStart = new Date(now);
+    minuteStart.setSeconds(0, 0, 0);
+    return !task.lastRun || Number(task.lastRun) < minuteStart.getTime();
+  }
+  return false;
+}
+
+function runScheduleTask(task) {
+  const kind = String(task.kind ?? '');
+  if (kind === 'wechat-push') return wechatPush({ to: task.target, text: task.text });
+  if (kind === 'qq-send') return qqSend({ qq: task.target, text: task.text });
+  if (kind === 'restart-all') {
+    bringDown();
+    return new Promise((resolve) => setTimeout(async () => resolve(await bringUp()), 2000));
+  }
+  return Promise.resolve({ ok: false, error: `不认识的任务类型「${kind}」` });
+}
+
+function tickSchedules() {
+  const now = Date.now();
+  const cfg = loadAutomation();
+  let dirty = false;
+  for (const task of cfg.schedules) {
+    if (!scheduleDue(task, now)) continue;
+    task.lastRun = now;
+    dirty = true;
+    pushLog(`定时任务「${task.name || task.id}」触发`, 'sys', 'app');
+    runScheduleTask(task)
+      .then((result) => {
+        task.lastResult = { at: now, ok: result?.ok === true, detail: result?.ok === true ? '' : String(result?.error ?? result?.output ?? '失败').slice(0, 200) };
+        saveAutomation(cfg);
+        pushLog(`定时任务「${task.name || task.id}」${task.lastResult.ok ? '完成' : `失败：${task.lastResult.detail}`}`, task.lastResult.ok ? 'sys' : 'err', 'app');
+      })
+      .catch((error) => {
+        task.lastResult = { at: now, ok: false, detail: String(error?.message ?? error).slice(0, 200) };
+        saveAutomation(cfg);
+      });
+  }
+  if (dirty) saveAutomation(cfg);
+}
+
+function startScheduler() {
+  if (startScheduler.timer) return;
+  startScheduler.timer = setInterval(tickSchedules, 20_000);
+}
+
+function initAutomation() {
+  startScheduler();
+  const cfg = loadAutomation();
+  if (cfg.launchAtLogin) applyAutostart(true);
+  const watching = Object.entries(cfg.watch).filter(([, v]) => v).map(([k]) => k).join('、');
+  pushLog(`自动化已加载：看护 ${watching || '关'} · 定时任务 ${cfg.schedules.filter((t) => t.enabled).length} 条`, 'sys');
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 批量导入 API key：粘贴一堆行 → 自动认出是哪家 → 分类入库
+ *
+ * 立场：自动识别是**建议**不是结论 —— 每一行的判定带着依据（前缀 / URL / 形状），
+ * 前端把报告列出来让用户过目改判（provider/env 都能改），apply=true 才真写。
+ * 拿不准的行标 low 置信度，绝不硬猜；完全相同的 key 标 dup 不重复入库。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const maskKey = (k) => (k.length <= 10 ? `${k.slice(0, 2)}…${k.slice(-2)}` : `${k.slice(0, 6)}…${k.slice(-4)}`);
+
+function classifyImportLine(raw, providers, knownEnvs) {
+  const line = String(raw ?? '').trim();
+  if (!line || line.startsWith('#') || line.startsWith('//')) return null;
+  const item = { line: line.slice(0, 160), key: '', provider: '', env: '', baseUrl: '', confidence: 'low', reason: '', dup: false };
+
+  // 行内 JSON：{"baseUrl": "...", "key": "..."} 之类，容忍一下
+  if (line.startsWith('{')) {
+    try {
+      const j = JSON.parse(line);
+      item.key = String(j.key ?? j.apiKey ?? j.token ?? '');
+      item.baseUrl = String(j.baseUrl ?? j.base_url ?? j.url ?? '');
+    } catch { /* 不是 JSON 就按普通行处理 */ }
+  }
+
+  // 显式分隔：provider|key / provider=key / provider: key（provider 也可以是 URL）
+  const split = /^(.*?)\s*[|=:>]\s*(\S+)\s*$/.exec(line);
+  let hint = '';
+  if (split && !item.key) {
+    const left = split[1].trim();
+    const right = split[2].trim();
+    if (/^sk-|^nvapi-|^hf_|^[0-9a-f]{32}\./i.test(right) || left.length <= 24) {
+      hint = left;
+      item.key = right;
+    }
+  }
+
+  if (!item.key) {
+    // URL + key 混排（顺序不管）：挑出 https 开头的当 URL，剩下长得最像 key 的那段
+    const tokens = line.split(/\s+/).filter(Boolean);
+    const urlTok = tokens.find((t) => /^https?:\/\//i.test(t));
+    const keyTok = tokens.filter((t) => t !== urlTok).sort((a, b) => b.length - a.length)[0];
+    if (urlTok) item.baseUrl = urlTok;
+    if (keyTok) item.key = keyTok;
+  }
+
+  if (!item.key) {
+    item.reason = '这行里没认出 key（也可能是注释或说明文字），先跳过';
+    return item;
+  }
+
+  // provider 判定，从强到弱：URL host 匹配 → 显式 hint → key 形状
+  const catalog = providers ?? [];
+  if (item.baseUrl) {
+    try {
+      const host = new URL(item.baseUrl).host;
+      const hit = catalog.find((p) => {
+        try { return new URL(p.baseUrl).host === host; } catch { return false; }
+      });
+      if (hit) {
+        item.provider = hit.id;
+        item.env = hit.keyEnv ?? '';
+        item.confidence = 'high';
+        item.reason = `接口地址 ${host} 对上目录里的 ${hit.label}`;
+      }
+    } catch { /* URL 不合法就当没有 */ }
+  }
+  if (!item.provider && hint) {
+    const h = hint.toLowerCase().replace(/^https?:\/\//, '');
+    const hit = catalog.find((p) => p.id.toLowerCase() === h || p.label.toLowerCase() === h || h.includes(p.id.toLowerCase()));
+    if (hit) {
+      item.provider = hit.id;
+      item.env = hit.keyEnv ?? '';
+      item.confidence = item.baseUrl ? 'medium' : 'high';
+      item.reason = `行首写明了 ${hit.label}`;
+    } else if (knownEnvs.some((e) => e.env.toLowerCase() === h)) {
+      item.env = knownEnvs.find((e) => e.env.toLowerCase() === h).env;
+      item.confidence = 'high';
+      item.reason = `行首写明了环境变量 ${item.env}`;
+    }
+  }
+  if (!item.provider && !item.env) {
+    const shape = [
+      [/^sk-or-v1-/, 'openrouter', 'OPENROUTER_API_KEY', 'sk-or-v1- 是 OpenRouter 的前缀'],
+      [/^sk-ant-/, 'anthropic', 'ANTHROPIC_API_KEY', 'sk-ant- 是 Anthropic 的前缀'],
+      [/^nvapi-/, 'nvidia', 'NVIDIA_API_KEY', 'nvapi- 是 NVIDIA NIM 的前缀'],
+      [/^hf_/, '', 'HF_TOKEN', 'hf_ 是 HuggingFace token（进 HF_TOKEN）'],
+      [/^[0-9a-f]{32}\.[A-Za-z0-9]{16}$/, 'zhipu', 'ZHIPU_API_KEY', 'id.secret 两段式是智谱的 key 形状'],
+      [/^sk-/, 'openai', 'OPENAI_API_KEY', 'sk- 开头是 OpenAI 兼容格式（DeepSeek / 月之暗面等也用这个形状，建议核对）']
+    ];
+    for (const [re, provider, envName, why] of shape) {
+      if (re.test(item.key)) {
+        item.reason = why;
+        const hit = provider ? catalog.find((p) => p.id === provider) : null;
+        if (hit) { item.provider = hit.id; item.env = hit.keyEnv || envName; }
+        else { item.env = envName; if (provider) item.provider = provider; }
+        item.confidence = provider === 'openai' && !item.baseUrl ? 'low' : 'high';
+        break;
+      }
+    }
+  }
+  if (!item.provider && !item.env && !item.reason) item.reason = '认不出是哪家 —— 在下面手动指定服务商或环境变量再入库';
+  return item;
+}
+
+function importProviders({ text, apply = false, items = [] } = {}) {
+  const providers = listProviders();
+  const secrets = readJson(secretsFile(), {});
+  const existing = new Set(Object.entries(secrets ?? {}).filter(([, v]) => v).map(([, v]) => String(v)));
+  const knownEnvs = [
+    ...new Map(providers.filter((p) => p.keyEnv).map((p) => [p.keyEnv, { env: p.keyEnv, provider: p.id, label: p.label }])).values(),
+    { env: 'HF_TOKEN', provider: '', label: 'HuggingFace' }
+  ];
+
+  const overrides = new Map(items.map((it) => [Number(it.index), it]));
+  const report = [];
+  const lines = String(text ?? '').split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const item = classifyImportLine(lines[i], providers, knownEnvs);
+    if (!item) continue;
+    const over = overrides.get(i);
+    if (over) {
+      if (over.provider) item.provider = String(over.provider);
+      if (over.env) item.env = String(over.env);
+      const hit = providers.find((p) => p.id === item.provider);
+      if (hit && !over.env) item.env = hit.keyEnv ?? '';
+      item.confidence = 'manual';
+      item.reason = '手动指定';
+    }
+    if (item.key && existing.has(item.key)) {
+      item.dup = true;
+      item.reason = item.reason ? `${item.reason}；key 已存在，不重复入库` : 'key 已存在，不重复入库';
+    }
+    report.push({ index: i, ...item, key: undefined, keyMasked: item.key ? maskKey(item.key) : '', _raw: apply ? item.key : undefined });
+  }
+
+  let written = 0;
+  if (apply) {
+    for (const item of report) {
+      if (!item._raw || item.dup || !item.env) continue;
+      secrets[item.env] = item._raw;
+      existing.add(item._raw);
+      written += 1;
+      pushLog(`批量导入：${item.env} ← ${item.keyMasked}${item.provider ? `（${item.provider}）` : ''}`, 'sys', 'app');
+    }
+    if (written) writeJson(secretsFile(), secrets);
+  }
+  return {
+    ok: true,
+    applied: written,
+    knownEnvs,
+    report: report.map(({ _raw, ...rest }) => rest)
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 四、HTTP
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon'
+};
+
+function sendJson(res, data, status = 200) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store'
+  });
+  res.end(JSON.stringify(data));
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString('utf8');
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error('请求体不是合法 JSON');
+  }
+}
+
+/**
+ * 把请求体原样落盘（收 zip 用）。
+ *
+ * 不用 readBody：那个是按 JSON 解析的，而且把整个 body 拼进内存 ——
+ * 200 MB 的包会撑到 400 MB 峰值。这里边收边写。
+ */
+async function saveRawBody(req, dest, maxBytes = 512 * 1024 * 1024) {
+  const out = fs.createWriteStream(dest);
+  let size = 0;
+  try {
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > maxBytes) throw new Error('文件太大（上限 512 MB）');
+      if (!out.write(chunk)) await new Promise((r) => out.once('drain', r));
+    }
+    await new Promise((r) => out.end(r));
+  } catch (error) {
+    out.destroy();
+    fs.rmSync(dest, { force: true });
+    throw error;
+  }
+  if (!size) {
+    fs.rmSync(dest, { force: true });
+    throw new Error('没收到文件内容');
+  }
+  return size;
+}
+
+function serveStatic(req, res, urlPath) {
+  const rel = urlPath === '/' ? '/index.html' : urlPath;
+  const file = path.join(PUBLIC, path.normalize(rel).replace(/^([/\\])+/, ''));
+  if (!file.startsWith(PUBLIC)) {
+    res.writeHead(403);
+    res.end('forbidden');
+    return;
+  }
+  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    res.writeHead(404);
+    res.end('not found');
+    return;
+  }
+  // 必须显式 no-store：这些文件就在本机、改完就该立刻看到。
+  // 不带缓存头时 Chromium 会自己猜一份缓存，结果改完界面一点没变（踩过）。
+  res.writeHead(200, {
+    'content-type': MIME[path.extname(file)] ?? 'application/octet-stream',
+    'cache-control': 'no-store, must-revalidate',
+    pragma: 'no-cache',
+    expires: '0'
+  });
+  fs.createReadStream(file).pipe(res);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * "本机能用什么" —— 两条非 模型 API 后端的本地探测
+ *
+ * 为什么要在服务端做：浏览器探测不了端口，也读不了 PATH。
+ * 探测结果给前端渲染成"本机示例"，点一下就把地址/驱动填好。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** 常见本地推理服务的默认端口。顺序就是展示顺序。 */
+const LOCAL_MODEL_SERVERS = [
+  { id: 'ollama', label: 'Ollama', port: 11434 },
+  { id: 'lmstudio', label: 'LM Studio', port: 1234 },
+  { id: 'vllm', label: 'vLLM / llama.cpp', port: 8000 },
+  { id: 'jan', label: 'Jan', port: 1337 }
+];
+
+/** 本机装没装（不要求正在跑）。只查常见目录，不扫全盘。 */
+function localServerInstalled(id) {
+  const local = process.env.LOCALAPPDATA ?? '';
+  const candidates = {
+    ollama: [path.join(local, 'Programs', 'Ollama', 'ollama.exe'), path.join(local, 'Programs', 'Ollama', 'ollama app.exe')],
+    lmstudio: [path.join(local, 'Programs', 'LM Studio', 'LM Studio.exe')],
+    vllm: [],
+    jan: [path.join(local, 'Programs', 'Jan', 'Jan.exe')]
+  }[id] ?? [];
+  return candidates.some((p) => fs.existsSync(p));
+}
+
+/** 200ms 内连上就算在跑 —— 本地端口，慢了就是没开。 */
+function probeLocalPort(port, timeoutMs = 350) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    const done = (ok) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs, () => done(false));
+    socket.once('connect', () => done(true));
+    socket.once('error', () => done(false));
+  });
+}
+
+let localCache = { at: 0, value: null };
+
+async function detectLocalModelServers() {
+  // 2 秒内复用上次结果：/api/state 会被前端反复拉
+  if (localCache.value && Date.now() - localCache.at < 2000) return localCache.value;
+
+  const value = [];
+  for (const s of LOCAL_MODEL_SERVERS) {
+    const installed = localServerInstalled(s.id);
+    const running = await probeLocalPort(s.port);
+    let models = [];
+    if (running) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${s.port}/v1/models`, { signal: AbortSignal.timeout(1500) });
+        if (res.ok) {
+          const json = await res.json();
+          models = (json.data ?? json.models ?? [])
+            .map((m) => String(m.id ?? m.name ?? m.model ?? ''))
+            .filter(Boolean)
+            .slice(0, 60);
+        }
+      } catch {
+        /* 有些服务不实现 /v1/models，能连上就算可用 */
+      }
+    }
+    value.push({
+      id: s.id,
+      label: s.label,
+      baseUrl: `http://127.0.0.1:${s.port}/v1`,
+      port: s.port,
+      installed,
+      running,
+      models
+    });
+  }
+  localCache = { at: Date.now(), value };
+  return value;
+}
+
+/** 这个 driver 现在能不能直接 spawn（PATH 或 driver 自带的常见路径）。 */
+function cliAvailability(driver) {
+  const found = resolveBin(driver.bin);
+  if (found) return { installed: true, path: found.command };
+  for (const candidate of driver.binFallbacks ?? []) {
+    const hit = resolveBin(candidate);
+    if (hit) return { installed: true, path: hit.command };
+  }
+  return { installed: false, path: null };
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`);
+  const p = url.pathname;
+
+  try {
+    if (p === '/api/state') {
+      const config = loadConfig();
+      const n = napcatSettings();
+      const napcatReachable = n.dir ? await probePort(n.wsPort) : false;
+      return sendJson(res, {
+        backend: config.backend ?? null,
+        bridge: bridgeState(),
+        wechat: wechatState(),
+        napcat: {
+          reachable: napcatReachable,
+          port: n.wsPort,
+          dir: n.dir,
+          qq: n.qq,
+          exe: n.exe,
+          bundled: n.bundled,
+          // 有面板地址时前端才显示「打开 NapCat 面板」按钮
+          panel: napcatPanel()
+        },
+        secrets: secretPresence(),
+        providers: listProviders(),
+        cliDrivers: Object.values(DRIVERS).map((d) => ({
+          id: d.id,
+          label: d.label,
+          bin: d.bin,
+          verified: d.verified,
+          promptVia: d.promptVia ?? 'stdin',
+          optionsSchema: d.optionsSchema ?? [],
+          ...cliAvailability(d)
+        })),
+        unverifiedClis: UNVERIFIED,
+        // 本机在跑/装了的模型服务：前端拿它当"示例"，点一下把地址填好
+        localModelServers: await detectLocalModelServers(),
+        configPath: configFile(),
+        secretsPath: secretsFile(),
+        modelsPath: modelsFile(),
+        projectRoot: getRoot(),
+        settingsPath: SETTINGS_FILE,
+        // 后端这块前端要显示「实例在不在」，只读注册文件，不碰它
+        matrix: ocInstance(),
+        updates: (() => {
+          const s = readJson(SETTINGS_FILE);
+          return {
+            app: { found: s.app?.lastUpdateFound ?? '', reminded: s.app?.lastReminded ?? '' },
+            napcat: { found: s.napcat?.lastUpdateFound ?? '', reminded: s.napcat?.lastReminded ?? '' }
+          };
+        })(),
+        automation: { ...loadAutomation(), autostart: autostartState() },
+        bootAt: BOOT_AT,
+        // 四档模型配置原样带出去，前端「当前状态」页据此判断哪档可用
+        modelSlots: readModelProfiles(),
+        // 真正在跑的是模型池（桥接走 oc-server，不读 modelSlots）。
+        // 两档都没配时，状态页得能说清「靠池子顶着」，而不是干巴巴一句「未配置」。
+        pool: (() => {
+          const p = loadPool();
+          return {
+            enabled: p.enabled !== false,
+            free: (p.free ?? []).length,
+            paid: p.allowPaid ? (p.paid ?? []).length : 0
+          };
+        })(),
+        chatOnly: config.socialV2?.chatOnly === true,
+        version: APP_VERSION
+      });
+    }
+
+    if (p === '/api/settings') {
+      if (req.method === 'GET') {
+        return sendJson(res, {
+          bridgeRoot: getRoot(),
+          defaultRoot: DEFAULT_ROOT,
+          napcat: napcatSettings(),
+          app: appSettings()
+        });
+      }
+      const body = await readBody(req);
+      const current = readJson(SETTINGS_FILE);
+      if ('bridgeRoot' in body) current.bridgeRoot = String(body.bridgeRoot ?? '').trim();
+      if ('napcat' in body) {
+        const napcat = { ...(current.napcat ?? {}), ...(body.napcat ?? {}) };
+        // 空串 = "用默认值"。删掉键而不是存空串 —— 否则 settings.json 里会留一堆
+        // `"wsPort": ""` 这种键，看着像配了个空端口，实际又回落默认，很误导。
+        for (const [k, v] of Object.entries(napcat)) {
+          if (v === '' || v == null) delete napcat[k];
+        }
+        current.napcat = napcat;
+      }
+      if ('app' in body) {
+        const app = { ...(current.app ?? {}), ...(body.app ?? {}) };
+        for (const [k, v] of Object.entries(app)) {
+          if (v === '' || v == null) delete app[k];
+        }
+        current.app = app;
+      }
+      writeJson(SETTINGS_FILE, current);
+      return sendJson(res, { ok: true, bridgeRoot: getRoot(), napcat: napcatSettings(), app: appSettings() });
+    }
+
+    /* ── 模型 API 实例 / 会话设置 ─────────────────────── */
+
+    if (p === '/api/matrix') {
+      /* 「默认方案」和「会话标题」跟着平台走 —— 微信的会话不该叫「QQ 聊天」。
+       * 其余字段（实例地址 / 隔离目录 / 会话目录 / 删不删归档）是同一个模型 API
+       * 服务的设置，两个平台共用，切平台不动它们。 */
+      const platform = url.searchParams.get('platform') === 'wechat' ? 'wechat' : 'qq';
+
+      if (req.method === 'GET') {
+        const cfg = loadConfig();
+        const wx = cfg.platforms?.wechat ?? {};
+        return sendJson(res, {
+          platform,
+          baseUrl: cfg.matrix?.baseUrl ?? '',
+          stateDir: cfg.matrix?.stateDir ?? '',
+          deleteArchived: cfg.matrix?.deleteArchived === true,
+          sessionCwd: cfg.sessionCwd ?? '',
+          // 微信没单独选过就跟着全局走，不会因为漏配而变成空值
+          agentPreset: (platform === 'wechat' ? wx.agentPreset : null) ?? cfg.agentPreset ?? 'qq-chat',
+          workspaceTitle:
+            (platform === 'wechat' ? wx.workspaceTitle : cfg.workspaceTitle) ?? '',
+          instance: ocInstance()
+        });
+      }
+      const body = await readBody(req);
+      const cfg = loadConfig();
+      cfg.matrix = {
+        ...(cfg.matrix ?? {}),
+        baseUrl: String(body.baseUrl ?? '').trim(),
+        stateDir: String(body.stateDir ?? '').trim(),
+        deleteArchived: body.deleteArchived === true
+      };
+      if ('sessionCwd' in body) cfg.sessionCwd = String(body.sessionCwd ?? '').trim();
+
+      const preset = 'agentPreset' in body ? body.agentPreset : undefined;
+      const title = 'workspaceTitle' in body ? String(body.workspaceTitle ?? '').trim() : undefined;
+      if (platform === 'wechat') {
+        cfg.platforms = {
+          ...(cfg.platforms ?? {}),
+          wechat: {
+            ...(cfg.platforms?.wechat ?? {}),
+            ...(preset !== undefined ? { agentPreset: preset } : {}),
+            ...(title !== undefined ? { workspaceTitle: title } : {})
+          }
+        };
+      } else {
+        if (preset !== undefined) cfg.agentPreset = preset;
+        if (title !== undefined) cfg.workspaceTitle = title;
+      }
+      writeJson(configFile(), cfg);
+      return sendJson(res, { ok: true, platform });
+    }
+
+    /* ── 模型池 ───────────────────────────────────────── */
+
+    if (p === '/api/model-pool') {
+      if (req.method === 'GET') {
+        const pool = loadPool();
+        return sendJson(res, {
+          enabled: pool.enabled !== false,
+          allowPaid: pool.allowPaid === true,
+          exhaustedNotice: pool.exhaustedNotice ?? '',
+          free: (pool.free ?? []).map(String),
+          paid: (pool.paid ?? []).map(String),
+          spent: spentInPool(pool),
+          usage: await readModelUsage(),
+          path: modelsFile(),
+          configPath: configFile()
+        });
+      }
+
+      // 「废池」手动解除：清掉这个模型的熔断记录。
+      // 桥接内存里的熔断表不会回读这个文件，所以和「保存模型池」一样：在跑就重启桥接。
+      if (p === '/api/model-pool/restore' && req.method === 'POST') {
+        const body = await readBody(req);
+        const id = String(body.id ?? '').trim();
+        if (!id) return sendJson(res, { ok: false, error: '缺少模型 id' });
+        const file = chainStateFile();
+        const d = readJson(file, null);
+        let removed = 0;
+        if (d && Array.isArray(d.health)) {
+          const before = d.health.length;
+          d.health = d.health.filter((e) => baseModelId(e.key) !== baseModelId(id));
+          removed = before - d.health.length;
+          if (removed > 0) writeJson(file, d);
+        }
+        let bridgeRestarted = false;
+        if (removed > 0 && bridge.child) {
+          stopBridge();
+          await new Promise((r) => setTimeout(r, 1200));
+          bridgeRestarted = startBridge().ok === true;
+        }
+        return sendJson(res, {
+          ok: true,
+          removed,
+          bridgeRestarted,
+          note: removed === 0
+            ? '这个模型现在不在废池里（可能已经自己冷却完了）'
+            : bridgeRestarted ? '已解除，桥接已重启让模型回到队列' : '已解除，下次桥接启动时生效'
+        });
+      }
+
+      const body = await readBody(req);
+      const pool = loadPool();
+      const clean = (v) => [...new Set((Array.isArray(v) ? v : []).map((x) => String(x).trim()).filter(Boolean))];
+
+      pool.enabled = body.enabled !== false;
+      pool.allowPaid = body.allowPaid === true;
+      pool.exhaustedNotice = String(body.exhaustedNotice ?? '').trim() || '我这会儿 API 连不上了，等会儿再聊吧。';
+      pool.free = clean(body.free);
+      pool.paid = clean(body.paid);
+
+      const wrapped = {
+        _comment: pool._comment ?? '模型池：QQ 机器人按什么顺序试模型、能不能花钱、全用完了回什么话。改这个文件不用改代码。密钥在 secrets.json（那是凭据，这是策略）。',
+        _comment_free: pool._comment_free ?? '免费档，按优先级从上到下。上一个用光了（余额/无权/连不上）会自动换下一个；限流只冷却 60 秒后自动切回。',
+        _comment_paid: pool._comment_paid ?? '付费档，默认不启用。allowPaid 打开后，免费档全部耗尽会自动降级到这里。',
+        _comment_notice: pool._comment_notice ?? '所有候选都用完时，在群里回的这一句。',
+        _comment_cooldown: pool._comment_cooldown ?? '冷却覆盖（毫秒），一般不用改。kind 取值：quota / rate / unavailable / auth / unreachable。',
+        enabled: pool.enabled,
+        allowPaid: pool.allowPaid,
+        exhaustedNotice: pool.exhaustedNotice,
+        free: pool.free,
+        paid: pool.paid,
+        cooldownMs: pool.cooldownMs ?? {}
+      };
+      writeJson(modelsFile(), wrapped);
+
+      const regen = await regenerateConfig();
+
+      // 模型链是**桥接启动时**读进内存的，光改 opencode.json 不会换链 ——
+      // 所以要真想"保存完就生效"，得顺手把桥接重启了。没在跑就跳过。
+      let bridgeRestarted = false;
+      if (bridge.child) {
+        stopBridge();
+        await new Promise((r) => setTimeout(r, 1200));
+        const started = startBridge();
+        bridgeRestarted = started.ok === true;
+      }
+
+      return sendJson(res, {
+        ok: true,
+        configRegenerated: regen.ok,
+        bridgeRestarted,
+        lines: regen.lines.slice(-8)
+      });
+    }
+
+    /* ── 设置页：schema + 批量写值 ─────────────────────── */
+
+    /* ── 价目表 ───────────────────────────────────────── */
+
+    /* config.json 的 pricing 是「覆盖表」：名字和内置表撞了就用这里的价，
+     * 没撞就新增一条。花多少钱全靠它算 —— 换了中转模型不改这张表，
+     * 花费统计会按兜底价（flash）算，静默算错。 */
+    if (p === '/api/pricing') {
+      const cfg = loadConfig();
+      const price = cfg.pricing && typeof cfg.pricing === 'object' ? cfg.pricing : {};
+
+      if (req.method === 'GET') {
+        const models = {};
+        for (const [name, entry] of Object.entries(price.models ?? {})) {
+          if (!entry || typeof entry !== 'object') continue;
+          const off = entry.off && typeof entry.off === 'object' ? entry.off : {};
+          models[name] = {
+            label: String(entry.label ?? name),
+            cacheHit: Number.isFinite(Number(off.cacheHit)) ? Number(off.cacheHit) : null,
+            cacheMiss: Number.isFinite(Number(off.cacheMiss)) ? Number(off.cacheMiss) : null,
+            cacheWrite: Number.isFinite(Number(off.cacheWrite)) ? Number(off.cacheWrite) : null,
+            output: Number.isFinite(Number(off.output)) ? Number(off.output) : null
+          };
+        }
+        return sendJson(res, {
+          ok: true,
+          models,
+          fallbackModel: String(price.fallbackModel ?? ''),
+          peakMultiplier: Number.isFinite(Number(price.peakMultiplier)) ? Number(price.peakMultiplier) : null,
+          builtin: PRICE_BUILTIN_MODELS,
+          configPath: configFile()
+        });
+      }
+
+      const body = await readBody(req);
+      const incoming = body?.models && typeof body.models === 'object' ? body.models : {};
+      const next = {};
+      for (const [rawName, entry] of Object.entries(incoming)) {
+        const name = String(rawName ?? '').trim();
+        // 模型名就是配置里的键，空名字写进去等于一条坏数据
+        if (!name || name.length > 120 || !entry || typeof entry !== 'object') continue;
+        const num = (v) => {
+          if (v === null || v === undefined || v === '') return null;
+          const n = Number(v);
+          return Number.isFinite(n) && n >= 0 ? n : null;
+        };
+        const off = {};
+        for (const key of ['cacheHit', 'cacheMiss', 'cacheWrite', 'output']) {
+          const v = num(entry[key]);
+          if (v !== null) off[key] = v;
+        }
+        next[name] = { label: String(entry.label ?? '').trim() || name, off };
+      }
+
+      const merged = { ...(cfg.pricing ?? {}), models: next };
+      const fallback = String(body?.fallbackModel ?? '').trim();
+      if (fallback) merged.fallbackModel = fallback;
+      else delete merged.fallbackModel;
+      const peak = Number(body?.peakMultiplier);
+      if (Number.isFinite(peak) && peak > 0) merged.peakMultiplier = peak;
+      else delete merged.peakMultiplier;
+
+      cfg.pricing = merged;
+      writeJson(configFile(), cfg);
+      // 价目表是桥接启动时读一次的，不重启的话花费还按旧价算
+      return sendJson(res, { ok: true, count: Object.keys(next).length, needRestart: true });
+    }
+
+    if (p === '/api/options') {
+      if (req.method === 'GET') {
+        const cfg = loadConfig();
+        const values = {};
+        for (const [dotted] of OPTION_PATHS) {
+          const v = deepGet(cfg, dotted);
+          if (v !== undefined) values[dotted] = v;
+        }
+        return sendJson(res, { groups: OPTION_GROUPS, values });
+      }
+
+      const body = await readBody(req);
+      const incoming = body?.values ?? {};
+      const cfg = loadConfig();
+      let changed = 0;
+      const changedPaths = [];
+
+      for (const [dotted, raw] of Object.entries(incoming)) {
+        const item = OPTION_PATHS.get(dotted);
+        // 只认 schema 里声明过的路径：前端传别的键一律忽略，
+        // 免得一个 bug 或一次手改请求就把 config.json 写坏。
+        if (!item) continue;
+
+        const before = JSON.stringify(deepGet(cfg, dotted));
+        let value = raw;
+
+        if (raw === null || raw === '') {
+          value = null; // 删键，回落默认
+        } else if (item.type === 'bool') {
+          value = raw === true;
+        } else if (item.type === 'number') {
+          const n = Number(raw);
+          if (!Number.isFinite(n)) continue;
+          value = n;
+        } else if (item.type === 'list') {
+          const arr = Array.isArray(raw) ? raw : String(raw).split(/[,，\s]+/);
+          const items = arr.map((x) => String(x).trim()).filter(Boolean);
+          value = item.itemType === 'number' ? items.map(Number).filter(Number.isFinite) : items;
+        } else {
+          value = String(raw);
+        }
+
+        if (JSON.stringify(value) === before) continue;
+        deepSet(cfg, dotted, value);
+        changed++;
+        changedPaths.push(dotted);
+      }
+
+      if (changed) writeJson(configFile(), cfg);
+
+      // chatOnly 决定 opencode.json 里的工具面（权限表 + MCP 注册 + 人设正文）。
+      // 只写 config.json 不重跑生成器的话，模型那边看到的还是旧工具表 ——
+      // 界面上开关变了、实际行为没变，最难查。桥接也要重启：
+      // 唤醒提示词（buildChatWakePromptV2）是在启动时按 cfg 决定走哪一套的。
+      let configRegenerated = null;
+      let bridgeRestarted = false;
+      if (changedPaths.includes('socialV2.chatOnly')) {
+        configRegenerated = await regenerateConfig();
+        if (bridge.child) {
+          stopBridge();
+          await new Promise((r) => setTimeout(r, 1200));
+          bridgeRestarted = startBridge().ok === true;
+        }
+      }
+
+      return sendJson(res, {
+        ok: true,
+        changed,
+        configRegenerated: configRegenerated ? configRegenerated.ok : null,
+        bridgeRestarted
+      });
+    }
+
+    if (p === '/api/up') {
+      const body = await readBody(req);
+      return sendJson(res, await bringUp(body.scope));
+    }
+    if (p === '/api/down') {
+      const body = await readBody(req);
+      return sendJson(res, bringDown(body.scope));
+    }
+    if (p === '/api/wechat/start') return sendJson(res, startWechat());
+    if (p === '/api/wechat/stop') return sendJson(res, stopWechat());
+
+    if (p === '/api/config') {
+      if (req.method === 'GET') return sendJson(res, loadConfig());
+      const body = await readBody(req);
+      const config = loadConfig();
+      Object.assign(config, body);
+      writeJson(configFile(), config);
+      return sendJson(res, { ok: true });
+    }
+
+    if (p === '/api/chat') {
+      /* 平台分开存。
+       *
+       * QQ 仍然用 config.json 顶层那几个键 —— 桥接读的就是它们，一个字都不能动，
+       * 否则老配置立刻失效。微信存进 config.platforms.wechat，明天接官方协议时
+       * 直接读这一块，不用把老配置搬家，两边也不会互相覆盖。
+       * 前端传 ?platform=wechat 就切到微信那一份，不传就是 QQ（默认）。 */
+      const platform = url.searchParams.get('platform') === 'wechat' ? 'wechat' : 'qq';
+      const sectionOf = (cfg) => (platform === 'wechat' ? (cfg.platforms?.wechat ?? {}) : cfg);
+
+      if (req.method === 'GET') {
+        const config = loadConfig();
+        const scope = sectionOf(config);
+        const list = (v) => [...new Set((Array.isArray(v) ? v : []).map((x) => String(x).trim()).filter(Boolean))];
+        const allow = { private: list(scope.allow?.private), groups: list(scope.allow?.groups) };
+        const deny = { private: list(scope.deny?.private), groups: list(scope.deny?.groups) };
+
+        // 「模式」由两个地方共同决定：白名单里的 `*` 通配符，和 allowAllWhenEmpty。
+        // 两套写法表达同一件事，判断散在前端就会出现"界面说只回白名单、其实谁都回"。
+        // 在这里算一次，前端只认 mode。
+        const wildcard = allow.private.includes('*') || allow.groups.includes('*');
+        const mode = wildcard || scope.allowAllWhenEmpty === true ? 'all' : 'list';
+
+        return sendJson(res, {
+          platform,
+          mode,
+          // 微信那边没有 QQ 号这个概念，存的是 ownerId；前端只认 ownerQQ 一个字段
+          ownerQQ: (platform === 'wechat' ? scope.ownerId : scope.ownerQQ) ?? null,
+          allow,
+          deny,
+          allowAllWhenEmpty: scope.allowAllWhenEmpty === true,
+          agentPreset: scope.agentPreset ?? config.agentPreset ?? 'qq-chat',
+          maxInjectChars: scope.maxInjectChars ?? config.role?.maxInjectChars ?? 6000,
+          // 角色卡注入频率：every / every3 / session（桥接读 config.role.injectMode）
+          injectMode: config.role?.injectMode ?? 'session'
+        });
+      }
+
+      const body = await readBody(req);
+      const config = loadConfig();
+      const clean = (v) => [...new Set((Array.isArray(v) ? v : []).map((x) => String(x).trim()).filter(Boolean))];
+      const patch = {};
+
+      if ('ownerQQ' in body) {
+        const owner = body.ownerQQ ? String(body.ownerQQ).trim() : null;
+        if (platform === 'wechat') patch.ownerId = owner;
+        else patch.ownerQQ = owner;
+      }
+
+      // 存进去之前把 `*` 摘掉，统一用 allowAllWhenEmpty 表达"放行所有人"。
+      // 两种写法并存时，`*` 会盖住 allowAllWhenEmpty —— 界面上把模式切到"只回白名单"
+      // 却不生效，是最难查的那种 bug。
+      if ('allow' in body) {
+        patch.allow = {
+          private: clean(body.allow?.private).filter((x) => x !== '*'),
+          groups: clean(body.allow?.groups).filter((x) => x !== '*')
+        };
+      }
+      if ('deny' in body) {
+        patch.deny = {
+          private: clean(body.deny?.private),
+          groups: clean(body.deny?.groups)
+        };
+      }
+      if ('allowAllWhenEmpty' in body) patch.allowAllWhenEmpty = body.allowAllWhenEmpty === true;
+      if ('agentPreset' in body) patch.agentPreset = body.agentPreset;
+      if ('maxInjectChars' in body || 'injectMode' in body) {
+        const rolePatch = { ...(config.role ?? {}) };
+        if ('maxInjectChars' in body) rolePatch.maxInjectChars = Number(body.maxInjectChars) || 6000;
+        if ('injectMode' in body) {
+          const mode = String(body.injectMode ?? '');
+          if (['every', 'every3', 'session'].includes(mode)) rolePatch.injectMode = mode;
+        }
+        patch.role = rolePatch;
+      }
+
+      if (platform === 'wechat') {
+        config.platforms = {
+          ...(config.platforms ?? {}),
+          wechat: { ...(config.platforms?.wechat ?? {}), ...patch }
+        };
+      } else {
+        Object.assign(config, patch);
+      }
+      writeJson(configFile(), config);
+      return sendJson(res, { ok: true, platform });
+    }
+
+    if (p === '/api/roles') {
+      // 顺手把每张卡的字数带上：人格卡会随每条消息注入，超上限就被截断，
+      // 界面上得能一眼看出哪张超了（roles/README.md 建议 3000~5000）。
+      const dir = path.join(getRoot(), 'roles');
+      const names = fs.existsSync(dir)
+        ? fs
+            .readdirSync(dir)
+            .filter((f) => f.endsWith('.md') && f !== 'README.md')
+            .map((f) => f.replace(/\.md$/, ''))
+        : [];
+      const chars = {};
+      for (const n of names) {
+        try {
+          chars[n] = fs.readFileSync(path.join(dir, `${n}.md`), 'utf8').replace(/^\uFEFF/, '').trim().length;
+        } catch {
+          chars[n] = 0;
+        }
+      }
+      return sendJson(res, { ok: true, roles: names, chars, limit: roleInjectLimit() });
+    }
+
+    /* ── 人格卡内容：读一张 / 写一张 / 删一张 ───────────── */
+
+    if (p === '/api/role/organize') {
+      // 只整理、不落盘：结果回前端，用户改完再走 /api/role/file 保存
+      const body = await readBody(req);
+      return sendJson(res, await organizeRoleCard(body));
+    }
+
+    if (p === '/api/role/file') {
+      if (req.method === 'GET') {
+        try {
+          const { name, file } = rolePath(url.searchParams.get('name'));
+          if (!fs.existsSync(file)) return sendJson(res, { ok: false, error: `没有这张人格卡：${name}` });
+          const content = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
+          return sendJson(res, { ok: true, name, content, chars: content.trim().length, limit: roleInjectLimit() });
+        } catch (error) {
+          return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+
+      const body = await readBody(req);
+      try {
+        const { name, dir, file } = rolePath(body.name);
+        const content = String(body.content ?? '');
+        // 空卡等于"设了人格但什么都没说"，比不设还糟 —— 直接拒掉
+        if (!content.trim()) return sendJson(res, { ok: false, error: '内容不能是空的' });
+        if (content.length > ROLE_CHARS_MAX) {
+          return sendJson(res, { ok: false, error: `内容太长（${content.length} 字符，上限 ${ROLE_CHARS_MAX}）` });
+        }
+        const existed = fs.existsSync(file);
+        const backup = existed ? backupRole(file, name) : null; // 新建没什么可备份的
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf8');
+        return sendJson(res, {
+          ok: true,
+          name,
+          created: !existed,
+          chars: content.trim().length,
+          backup
+        });
+      } catch (error) {
+        return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+      }
+    }
+
+    if (p === '/api/role/file/delete') {
+      const body = await readBody(req);
+      try {
+        const { name, file } = rolePath(body.name);
+        if (!fs.existsSync(file)) return sendJson(res, { ok: false, error: `没有这张人格卡：${name}` });
+        // 正在启用中的卡不许删：删了桥接下一轮就找不到文件，人格静默消失，
+        // 而界面上「角色」还显示着这个名字 —— 最难查的那种故障。
+        const inUse = roleInUse(name);
+        if (inUse.length) {
+          return sendJson(res, {
+            ok: false,
+            error: `「${name}」正在启用中（${inUse.join(' / ')}），先在上面切到别的角色或清空，再删`
+          });
+        }
+        const backup = backupRole(file, name);
+        fs.rmSync(file, { force: true });
+        return sendJson(res, { ok: true, name, backup });
+      } catch (error) {
+        return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+      }
+    }
+
+    if (p === '/api/role') {
+      /* 角色**按平台分开存**：
+       *   · QQ   → state/current-role.json（桥接每轮读它；桥接控制台写的是同一个文件）
+       *   · 微信 → config.json 的 platforms.wechat.role（wechat-bot.js 建会话时读一次）
+       *
+       * 以前这里不分平台，在微信页选的角色其实写进了 QQ 那份 —— 微信那边还在用旧
+       * 人格，切回 QQ 页看又确实是刚选的那个，两边都「看起来正常」，最难查。
+       */
+      const platform = url.searchParams.get('platform') === 'wechat' ? 'wechat' : 'qq';
+
+      if (req.method === 'GET') {
+        if (platform === 'wechat') {
+          return sendJson(res, {
+            platform,
+            role: loadConfig().platforms?.wechat?.role ?? null,
+            // 静默模式是 QQ 那份 state 里的字段（群消息不投递），微信这条链路还没有对应实现
+            mode: 'active'
+          });
+        }
+        const cur = readJson(path.join(getRoot(), 'state', 'current-role.json'), { role: null, mode: 'active' });
+        return sendJson(res, { ...cur, platform });
+      }
+
+      const body = await readBody(req);
+
+      // 注入上限是 config.json 的 role.maxInjectChars（桥接每轮读它），两个平台共用；
+      // 和 current-role.json 里那个 "role" 字段只是重名，作用完全不同。
+      if ('maxInjectChars' in body) {
+        const config = loadConfig();
+        const n = Number(body.maxInjectChars);
+        config.role = { ...(config.role ?? {}) };
+        if (Number.isFinite(n) && n > 0) config.role.maxInjectChars = n;
+        else delete config.role.maxInjectChars;
+        writeJson(configFile(), config);
+      }
+
+      // 角色卡注入频率同样是全局项（两个平台共用同一套桥接逻辑）。
+      if ('injectMode' in body) {
+        const mode = String(body.injectMode ?? '');
+        if (['every', 'every3', 'session'].includes(mode)) {
+          const config = loadConfig();
+          config.role = { ...(config.role ?? {}), injectMode: mode };
+          writeJson(configFile(), config);
+        }
+      }
+
+      if (platform === 'wechat') {
+        const role = body.role ? String(body.role).trim() : null;
+        const config = loadConfig();
+        config.platforms = {
+          ...(config.platforms ?? {}),
+          wechat: { ...(config.platforms?.wechat ?? {}), role }
+        };
+        writeJson(configFile(), config);
+        return sendJson(res, { ok: true, platform, role });
+      }
+
+      const file = path.join(getRoot(), 'state', 'current-role.json');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      writeJson(file, { role: body.role || null, mode: body.mode === 'silent' ? 'silent' : 'active' });
+      return sendJson(res, { ok: true, platform });
+    }
+
+    if (p === '/api/backend') {
+      const body = await readBody(req);
+      const next = body.backend ?? null;
+      const config = loadConfig();
+
+      // 以前这里是无条件落盘的：手滑点一下卡片就能写进一个缺 driver 的 cli 段，
+      // 下次重启桥接直接起不来。现在先验证，跑不起来的一律不写。
+      if (next) {
+        // 老值（2026-10 之前叫 opencode）先归一到新值，再校验 —— 否则老界面
+        // 存过一次的配置在后端会变成"不认识的后端类型"。
+        if (next.type === 'opencode') next.type = 'matrix';
+        if (!['matrix', 'model-api', 'cli', 'ui'].includes(next.type)) {
+          return sendJson(res, { ok: false, error: `不认识的后端类型 "${next.type}"` });
+        }
+
+        if (next.type === 'ui') {
+          const uiCfg = next.ui ?? {};
+          if (!String(uiCfg.process ?? '').trim() && !String(uiCfg.titleRegex ?? '').trim()) {
+            return sendJson(res, { ok: false, error: '前台后端要配「进程名」或「窗口标题正则」至少一个' });
+          }
+        }
+
+        if (next.type === 'cli') {
+          const cli = next.cli ?? {};
+          if (cli.customDriver) {
+            if (!cli.customDriver.id || !cli.customDriver.bin) {
+              return sendJson(res, { ok: false, error: '自定义驱动需要同时填「标识」和「可执行文件」' });
+            }
+            if (!resolveBin(cli.customDriver.bin)) {
+              return sendJson(res, { ok: false, error: `找不到可执行文件：${cli.customDriver.bin}` });
+            }
+          } else {
+            const driver = DRIVERS[cli.driver];
+            if (!driver) {
+              return sendJson(res, {
+                ok: false,
+                error: `不认识的驱动 "${cli.driver}"。可选：${Object.keys(DRIVERS).join(' / ')}`
+              });
+            }
+            const avail = cli.bin ? (resolveBin(cli.bin) ? { installed: true } : { installed: false }) : cliAvailability(driver);
+            if (!avail.installed) {
+              return sendJson(res, {
+                ok: false,
+                error: `本机找不到 ${driver.label}（${driver.bin}）。先装它，或在「驱动参数」里指定 bin 绝对路径。`
+              });
+            }
+          }
+        }
+
+        if (next.type === 'model-api') {
+          const m = next.modelApi ?? {};
+          if (!m.baseUrl || !m.model) {
+            return sendJson(res, { ok: false, error: '直连模型 API 至少要填「接口地址」和「模型」' });
+          }
+        }
+      }
+
+      config.backend = next;
+      writeJson(configFile(), config);
+      return sendJson(res, { ok: true });
+    }
+
+    /* ── 模型配置分档：QQ / 微信 × 聊天 / 聊天+指令 ─────────────── */
+
+    if (p === '/api/model-profiles') {
+      if (req.method === 'GET') {
+        return sendJson(res, { ok: true, profiles: readModelProfiles(), slots: MODEL_SLOTS });
+      }
+
+      const body = await readBody(req);
+      const incoming = body.profiles ?? {};
+      const cfg = loadConfig();
+      const profiles = {};
+
+      for (const [pf, slots] of Object.entries(MODEL_SLOTS)) {
+        profiles[pf] = {};
+        for (const slot of slots) {
+          const v = sanitizeModelProfile(incoming?.[pf]?.[slot]);
+          if (v) profiles[pf][slot] = v;
+        }
+      }
+
+      // 只写 profiles 就够；type 等其它字段原样保留，别把后端类型冲掉。
+      const backend = { ...(cfg.backend ?? {}) };
+      backend.profiles = profiles;
+      // 回写旧字段：老版本桥接只认 modelApi，不同步过去会读不到配置。
+      if (profiles.qq?.chat) backend.modelApi = profiles.qq.chat;
+      cfg.backend = backend;
+
+      writeJson(configFile(), cfg);
+
+      // 两档是 opencode.json 的输入：存完必须重新生成一次，否则界面上配好了、
+      // 桥接读到的还是老配置。生成失败不回滚保存（配置已经在盘上了），
+      // 但要把原因带回前端，别让人以为生效了。
+      const regen = await regenerateConfig();
+      return sendJson(res, {
+        ok: true,
+        profiles,
+        regenerated: regen.ok,
+        regenError: regen.ok ? undefined : regen.lines?.slice(-3).join(' / ') ?? '生成配置失败'
+      });
+    }
+
+    if (p === '/api/secrets') {
+      if (req.method === 'GET') return sendJson(res, secretPresence());
+      const body = await readBody(req);
+      const secrets = readJson(secretsFile());
+      for (const [k, v] of Object.entries(body ?? {})) {
+        if (v === null || v === '') delete secrets[k];
+        else secrets[k] = String(v);
+      }
+      writeJson(secretsFile(), secrets);
+      return sendJson(res, { ok: true, secrets: secretPresence() });
+    }
+
+    if (p === '/api/models') {
+      const body = await readBody(req);
+      try {
+        const secrets = readJson(secretsFile());
+        const profile = resolveProfile({ ...body, model: body.model || '__probe__' }, secrets);
+        const models = await listModels(profile);
+        return sendJson(res, { ok: true, models });
+      } catch (error) {
+        return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+      }
+    }
+
+    if (p === '/api/test') {
+      const body = await readBody(req);
+      return sendJson(res, await testBackend(body));
+    }
+
+    /* ── 自动化：看护 / 开机自启 / 定时任务 ───────────── */
+
+    if (p === '/api/automation') {
+      if (req.method === 'GET') return sendJson(res, { ...loadAutomation(), autostart: autostartState() });
+      const body = await readBody(req);
+      const cfg = loadAutomation();
+      if (body.watch) {
+        cfg.watch = { ...cfg.watch, ...Object.fromEntries(Object.entries(body.watch).map(([k, v]) => [k, v === true])) };
+      }
+      if ('schedules' in body) {
+        cfg.schedules = (Array.isArray(body.schedules) ? body.schedules : []).map((t, i) => ({
+          id: String(t.id ?? `task-${Date.now()}-${i}`),
+          name: String(t.name ?? '').slice(0, 60),
+          enabled: t.enabled === true,
+          kind: String(t.kind ?? ''),
+          target: String(t.target ?? '').trim(),
+          text: String(t.text ?? ''),
+          every: { type: t.every?.type === 'interval' ? 'interval' : 'daily', time: String(t.every?.time ?? '09:00'), minutes: Number(t.every?.minutes) || 30 },
+          lastRun: t.lastRun ?? null,
+          lastResult: t.lastResult ?? null
+        }));
+      }
+      if ('launchAtLogin' in body) {
+        cfg.launchAtLogin = body.launchAtLogin === true;
+        if (autostartState().supported) applyAutostart(cfg.launchAtLogin);
+      }
+      saveAutomation(cfg);
+      return sendJson(res, { ok: true, ...loadAutomation(), autostart: autostartState() });
+    }
+
+    if (p === '/api/wechat/hook') {
+      if (req.method === 'GET') {
+        const hook = loadConfig().platforms?.wechat?.hook ?? {};
+        return sendJson(res, {
+          enabled: hook.enabled === true,
+          url: hook.url ?? '',
+          secret: hook.secret ?? '',
+          format: ['default', 'onebot', 'template'].includes(hook.format) ? hook.format : 'default',
+          template: hook.template ?? '',
+          events: Array.isArray(hook.events) ? hook.events : ['message.received', 'message.replied', 'error']
+        });
+      }
+      const body = await readBody(req);
+      const config = loadConfig();
+      config.platforms = {
+        ...(config.platforms ?? {}),
+        wechat: {
+          ...(config.platforms?.wechat ?? {}),
+          hook: {
+            enabled: body.enabled === true,
+            url: String(body.url ?? '').trim(),
+            secret: String(body.secret ?? ''),
+            format: ['default', 'onebot', 'template'].includes(body.format) ? body.format : 'default',
+            template: String(body.template ?? ''),
+            events: ['message.received', 'message.replied', 'error'].filter((e) => (Array.isArray(body.events) ? body.events : []).includes(e))
+          }
+        }
+      };
+      writeJson(configFile(), config);
+      return sendJson(res, { ok: true });
+    }
+
+    if (p === '/api/wechat/hook/test') {
+      // 不经过微信，直接打用户配的 URL —— 验证地址、口令通不通
+      const hook = loadConfig().platforms?.wechat?.hook ?? {};
+      if (!hook.url) return sendJson(res, { ok: false, error: '先填 webhook 地址并保存' });
+      try {
+        const res = await fetch(hook.url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...(hook.secret ? { 'X-DHM-Secret': hook.secret } : {}) },
+          body: renderHookSample(hook.format ?? 'default', hook.template ?? ''),
+          signal: AbortSignal.timeout(10_000)
+        });
+        return sendJson(res, { ok: res.ok, status: res.status, error: res.ok ? '' : `HTTP ${res.status}` });
+      } catch (error) {
+        return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+      }
+    }
+
+    if (p === '/api/wechat/push') {
+      const body = await readBody(req);
+      return sendJson(res, await wechatPush(body));
+    }
+
+    if (p === '/api/qq/send') {
+      const body = await readBody(req);
+      return sendJson(res, await qqSend(body));
+    }
+
+    if (p === '/api/app/update') {
+      // GET：查最新版；软件本体只提醒不自动装
+      try {
+        return sendJson(res, await checkAppUpdateOnce());
+      } catch (error) {
+        return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+      }
+    }
+
+    if (p === '/api/app/update/dismiss') {
+      const s = readJson(SETTINGS_FILE);
+      s.app = { ...(s.app ?? {}), lastReminded: s.app?.lastUpdateFound ?? '' };
+      writeJson(SETTINGS_FILE, s);
+      return sendJson(res, { ok: true });
+    }
+
+    if (p === '/api/app/update/apply') {
+      const body = await readBody(req);
+      return sendJson(res, await applyAppUpdate(body.assetUrl));
+    }
+
+    if (p === '/api/napcat/update') {
+      // GET：查一次最新版并返回资产清单（不落盘安装包、不自动装）
+      try {
+        const info = await napcatUpdateInfo();
+        const updateAvailable = !(info.tag && info.current && info.current.includes(info.tag));
+        // 把「发现的新版本」记下来，前端靠它判断横幅该不该出现；
+        // 和 lastReminded 一比对就知道这个版本提醒过没有。
+        const s = readJson(SETTINGS_FILE);
+        s.napcat = {
+          ...(s.napcat ?? {}),
+          lastUpdateCheck: Date.now(),
+          lastUpdateFound: updateAvailable ? info.tag : ''
+        };
+        writeJson(SETTINGS_FILE, s);
+        return sendJson(res, {
+          ok: true,
+          ...info,
+          updateAvailable,
+          reminded: s.napcat.lastReminded ?? ''
+        });
+      } catch (error) {
+        return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+      }
+    }
+
+    if (p === '/api/napcat/update/dismiss') {
+      const s = readJson(SETTINGS_FILE);
+      s.napcat = { ...(s.napcat ?? {}), lastReminded: s.napcat?.lastUpdateFound ?? '' };
+      writeJson(SETTINGS_FILE, s);
+      return sendJson(res, { ok: true });
+    }
+
+    if (p === '/api/napcat/update/apply') {
+      const body = await readBody(req);
+      return sendJson(res, await applyNapcatUpdate(body.assetUrl));
+    }
+
+    /* 精简安装包用：本机没有 NapCat 时，从 GitHub 下最新 Shell 包装上 */
+    /* 组件：得下载才有、软件本身可以不带的东西 */
+    if (p === '/api/components') {
+      if (req.method === 'GET') {
+        // 装完一分钟就把结果清掉，免得下次进页面又提示一遍「装好了」
+        if (componentJob?.done && Date.now() - (componentJob.startedAt ?? 0) > 60_000) componentJob = null;
+        return sendJson(res, { ok: true, components: componentList(), job: componentJob });
+      }
+      const body = await readBody(req);
+      const id = String(body?.id ?? '');
+      if (!['napcat', 'ffmpeg'].includes(id)) return sendJson(res, { ok: false, error: '没有这个组件' });
+      // 两个都往 userData 下写，同时跑会互相踩
+      if (componentJob && !componentJob.done) return sendJson(res, { ok: false, error: '上一个还在装，等它完' });
+      return sendJson(res, startComponentInstall(id));
+    }
+
+    /* 从本地 zip 装：国内 GitHub 下不动时，用户自己下好的包直接用 */
+    if (p === '/api/components/upload') {
+      const id = String(req.headers['x-component-id'] ?? '');
+      if (!['napcat', 'ffmpeg'].includes(id)) return sendJson(res, { ok: false, error: '没有这个组件' });
+      if (componentJob && !componentJob.done) return sendJson(res, { ok: false, error: '上一个还在装，等它完' });
+
+      const tmp = path.join(os.tmpdir(), `comp-upload-${Date.now()}.zip`);
+      try {
+        const size = await saveRawBody(req, tmp);
+        componentJob = { id, pct: 70, note: '解压中', done: false, error: null, startedAt: Date.now() };
+        const r =
+          id === 'napcat'
+            ? await installNapcatFromZip(tmp, `local-${Date.now().toString(36)}`, size)
+            : await installFfmpegFromZip(tmp);
+        fs.rmSync(tmp, { force: true });
+        componentJob = {
+          ...componentJob,
+          pct: 100,
+          note: r.ok ? '装好了' : '失败',
+          done: true,
+          error: r.ok ? null : (r.error ?? '失败')
+        };
+        if (!r.ok) pushLog(`装 ${id} 失败：${r.error ?? ''}`, 'err', 'sys');
+        return sendJson(res, { ok: r.ok === true, ...r });
+      } catch (error) {
+        fs.rmSync(tmp, { force: true });
+        const msg = String(error?.message ?? error);
+        componentJob = {
+          id,
+          pct: 100,
+          note: '失败',
+          done: true,
+          error: msg,
+          startedAt: Date.now()
+        };
+        return sendJson(res, { ok: false, error: msg });
+      }
+    }
+
+    if (p === '/api/napcat/install') {
+      if (req.method === 'GET') {
+        try {
+          const info = await napcatUpdateInfo();
+          return sendJson(res, {
+            ok: true,
+            tag: info.tag,
+            asset: info.picked,
+            current: info.current,
+            installed: Boolean(napcatSettings().dir),
+            bundled: napcatSettings().bundled
+          });
+        } catch (error) {
+          return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+      return sendJson(res, await installNapcat());
+    }
+
+    if (p === '/api/napcat/start') return sendJson(res, startNapcat());
+    if (p === '/api/napcat/stop') return sendJson(res, stopNapcat());
+
+    if (p === '/api/qq/contacts') return sendJson(res, await qqContacts());
+    if (p === '/api/wechat/targets') return sendJson(res, { targets: wechatTargets() });
+
+    if (p === '/api/messages') {
+      const wanted = url.searchParams.get('platform');
+      const platform = wanted === 'wechat' ? 'wechat' : wanted === 'phone' ? 'phone' : 'qq';
+      const limit = Math.min(2000, Math.max(20, Number(url.searchParams.get('limit')) || 300));
+      return sendJson(res, { ok: true, platform, ...readMessages(platform, limit) });
+    }
+    /* ── 省流总结：最近聊天 → 模型 → 省流版 ─────────────────────────── */
+    if (p === '/api/summarize') {
+      const body = await readBody(req);
+      return sendJson(res, await summarizeChat(body ?? {}));
+    }
+
+    /* ── Webhook 通知枢纽：配置读写 ────────────────────────────────── */
+    if (p === '/api/notify') {
+      if (req.method === 'GET') return sendJson(res, { ok: true, ...loadNotify() });
+      const body = await readBody(req);
+      const hub = loadNotify();
+      if (typeof body.enabled === 'boolean') hub.enabled = body.enabled;
+      if (body.default) {
+        hub.default = {
+          platform: body.default.platform === 'wechat' ? 'wechat' : 'qq',
+          to: String(body.default.to ?? '').trim()
+        };
+      }
+      if (body.mirror) {
+        hub.mirror = {
+          enabled: body.mirror.enabled === true,
+          from: String(body.mirror.from ?? '').trim(),
+          keyword: String(body.mirror.keyword ?? '').trim(),
+          platform: body.mirror.platform === 'wechat' ? 'wechat' : 'qq',
+          to: String(body.mirror.to ?? '').trim()
+        };
+      }
+      saveNotify(hub);
+      return sendJson(res, { ok: true, ...hub });
+    }
+
+    if (p === '/api/notify/regenerate' && req.method === 'POST') {
+      const hub = loadNotify();
+      hub.token = randomBytes(9).toString('base64url');
+      saveNotify(hub);
+      return sendJson(res, { ok: true, token: hub.token });
+    }
+
+    if (p === '/api/notify/test' && req.method === 'POST') {
+      const body = await readBody(req);
+      const hub = loadNotify();
+      if (!hub.enabled) return sendJson(res, { ok: false, error: '通知枢纽没启用' });
+      const platform = body.platform === 'wechat' ? 'wechat' : 'qq';
+      const to = String(body.to ?? hub.default?.to ?? '').trim();
+      if (!to) return sendJson(res, { ok: false, error: '没有目标：填一个 QQ 号 / group:群号 / 微信 id' });
+      const text = `[DualHabitat Matrix 通知测试] ${new Date().toLocaleString('zh-CN')}`;
+      // dryRun：微信走 wechat-bot 的 --dry-run（不碰微信、不需要登录态）；QQ 没有预览模式，只回确认
+      if (body.dryRun) {
+        if (platform === 'wechat') return sendJson(res, await wechatPush({ to, text, dryRun: true }));
+        return sendJson(res, { ok: true, dryRun: true, note: 'QQ 没有预览模式，真实发送要 NapCat 在跑' });
+      }
+      return sendJson(res, await notifyDispatch({ platform, to, text }));
+    }
+
+    /* ── 插件：列表（直接读 plugins/ 目录）+ 重载（转发给桥接控制台）───── */
+    if (p === '/api/plugins') {
+      if (req.method === 'GET') {
+        const dir = path.join(getRoot(), 'plugins');
+        let files = [];
+        try {
+          files = fs
+            .readdirSync(dir)
+            .filter((f) => f.endsWith('.js') || f.endsWith('.mjs'))
+            .map((f) => {
+              const full = path.join(dir, f);
+              let size = 0;
+              let desc = '';
+              try {
+                size = fs.statSync(full).size;
+              } catch {
+                /* 文件可能正被写 */
+              }
+              try {
+                const head = fs.readFileSync(full, 'utf8').slice(0, 2000);
+                const first = head.split('\n').map((l) => l.trim()).find((l) => l.startsWith('//'));
+                if (first) desc = first.replace(/^\/\/\s*/, '').slice(0, 120);
+              } catch {
+                /* 读不了就空着 */
+              }
+              return { file: f, size, desc };
+            });
+        } catch {
+          /* 目录不存在 = 还没装插件 */
+        }
+        return sendJson(res, { ok: true, dir, files });
+      }
+      if (req.method === 'POST') {
+        const cfg = loadConfig();
+        const port = Number(cfg.consolePort ?? 3100);
+        let token = '';
+        try {
+          token = fs.readFileSync(path.join(getRoot(), 'state', 'console-token'), 'utf8').trim();
+        } catch {
+          /* 还没跑过桥接 */
+        }
+        try {
+          const upstream = await fetch(`http://127.0.0.1:${port}/api/plugins/reload`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...(token ? { 'x-console-token': token } : {}) },
+            body: '{}',
+            signal: AbortSignal.timeout(10_000)
+          });
+          const data = await upstream.json().catch(() => ({}));
+          return sendJson(res, {
+            ok: upstream.ok && data.ok !== false,
+            count: data.count ?? null,
+            errors: data.errors ?? []
+          });
+        } catch (error) {
+          return sendJson(res, {
+            ok: false,
+            error: `桥接控制台（127.0.0.1:${port}）连不上：${String(error?.message ?? error)}。桥接没在跑的话，下次启动时会自动装载插件。`
+          });
+        }
+      }
+    }
+
+    /* ── Webhook 通知枢纽：接收端 ────────────────────────────────────
+     * POST /hook/notify/<口令>  body: {text, platform?, to?}
+     *   或微信 hook 事件 {event:'message.received', from, text}（把微信
+     *   webhook 指到这里，就能按「转发规则」把微信消息转去 QQ / 微信）。
+     * GET  /hook/notify/<口令>?text=...  方便脚本一行调用。
+     * 口令错 / 没启用 → 404，不区分是哪种，免得帮人探测。 */
+    if (p.startsWith('/hook/notify/')) {
+      const hub = loadNotify();
+      const token = p.slice('/hook/notify/'.length);
+      if (!hub.enabled || !hub.token || token !== hub.token) {
+        return sendJson(res, { ok: false, error: 'not found' }, 404);
+      }
+      let payload = {};
+      if (req.method === 'POST') {
+        payload = await readBody(req);
+      } else if (req.method === 'GET') {
+        payload = {
+          text: url.searchParams.get('text') ?? '',
+          platform: url.searchParams.get('platform') ?? undefined,
+          to: url.searchParams.get('to') ?? undefined
+        };
+      } else {
+        return sendJson(res, { ok: false, error: 'method not allowed' }, 405);
+      }
+      const text = String(payload.text ?? '').trim();
+      if (!text) return sendJson(res, { ok: false, error: '缺少 text' }, 400);
+
+      // 微信消息转发规则
+      if (payload.event === 'message.received' && hub.mirror?.enabled) {
+        const m = hub.mirror;
+        const fromOk = !m.from || String(payload.from ?? '') === m.from;
+        const kwOk = !m.keyword || text.includes(m.keyword);
+        if (fromOk && kwOk && m.to) {
+          const r = await notifyDispatch({ platform: m.platform, to: m.to, text: `微信 ${payload.from ?? ''}：${text}` });
+          return sendJson(res, { ok: r.ok, forwarded: 1, detail: r });
+        }
+        return sendJson(res, { ok: true, forwarded: 0 });
+      }
+
+      // 直接通知：请求里带了目标就用；否则用默认目标
+      const reqPlatform = payload.platform === 'wechat' ? 'wechat' : payload.platform === 'qq' ? 'qq' : null;
+      const reqTo = String(payload.to ?? '').trim();
+      const target = reqPlatform && reqTo
+        ? { platform: reqPlatform, to: reqTo }
+        : hub.default?.to
+          ? { platform: hub.default.platform === 'wechat' ? 'wechat' : 'qq', to: hub.default.to }
+          : null;
+      if (!target) {
+        return sendJson(res, { ok: false, error: '请求里没带 platform/to，服务端也没配默认目标' }, 400);
+      }
+      const r = await notifyDispatch({ platform: target.platform, to: target.to, text });
+      return sendJson(res, r, r.ok ? 200 : 502);
+    }
+
+    /* ── 手机推送（Android 通知转发）────────────────────────────────────
+     * 手机端把通知 POST 到局域网端口，这里只管开关、地址和自测。
+     * 真正的接收在 handlePhoneRequest() 里。 */
+    if (p === '/api/phone') {
+      if (req.method === 'GET') {
+        const s = phoneSettings();
+        const port = phoneListening || s.port;
+        return sendJson(res, {
+          ok: true,
+          enabled: s.enabled,
+          port: s.port,
+          listening: phoneListening,
+          token: s.token,
+          notifyAi: s.notifyAi,
+          notifyKey: s.notifyKey || (loadConfig().ownerQQ ? `private:${loadConfig().ownerQQ}` : ''),
+          urls: lanAddresses().map((i) => ({
+            name: i.name,
+            address: i.address,
+            url: `http://${i.address}:${port}/hook/${s.token}`,
+            // 二维码扫这个：手机打开是一页配置说明，不是空的 POST 端点
+            setup: `http://${i.address}:${port}/setup/${s.token}`
+          })),
+          count: s.count,
+          lastAt: s.lastAt,
+          recent: readPhoneInbox()
+        });
+      }
+
+      const body = await readBody(req);
+      const patch = {};
+      if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+      if (typeof body.notifyAi === 'boolean') patch.notifyAi = body.notifyAi;
+      if (typeof body.notifyKey === 'string') patch.notifyKey = body.notifyKey.trim();
+      if (body.port != null) {
+        const n = Number(body.port);
+        if (!Number.isFinite(n) || n < 1024 || n > 65535) {
+          return sendJson(res, { ok: false, error: '端口要在 1024~65535 之间' });
+        }
+        patch.port = n;
+      }
+      if (body.regenerate === true) patch.token = newPhoneToken();
+      else if (!phoneSettings().token) patch.token = newPhoneToken();
+
+      writePhoneSettings(patch);
+      const started = await startPhoneListener();
+      const s = phoneSettings();
+      return sendJson(res, {
+        // ok 放在 spread 后面：startPhoneListener 在"没启用"时返回 ok:false，
+        // 那说的是"没在监听"，不是"保存失败"。保存失败另有 error 字段。
+        ...started,
+        ok: true,
+        enabled: s.enabled,
+        port: s.port,
+        token: s.token,
+        notifyAi: s.notifyAi,
+        reason: started.reason ?? null
+      });
+    }
+
+    if (p === '/api/phone/test') {
+      const body = await readBody(req).catch(() => ({}));
+      const result = recordPhonePush({
+        app: body.app || '测试',
+        from: '电脑',
+        text: body.text || `这是一条测试推送，链路是通的（${new Date().toLocaleTimeString('zh-CN', { hour12: false })}）`
+      });
+      return sendJson(res, result);
+    }
+
+    /* 只测「投给模型」这一段：桥接在不在、管理员 QQ 配没配、控制台口令对不对 */
+    if (p === '/api/phone/notify-test') {
+      try {
+        const data = await notifyAiAboutPhone({
+          app: '自测',
+          from: '电脑',
+          text: '这条是「让模型看到」的测试，模型那边应该会收到一条后台提醒。'
+        });
+        return sendJson(res, { ok: true, ...data });
+      } catch (error) {
+        return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+      }
+    }
+
+    /* ── 模型能用哪些工具 ─────────────────────────────────────────────── */
+    if (p === '/api/tools') {
+      if (req.method === 'GET') {
+        const cfg = loadConfig();
+        const values = {};
+        const defaults = {};
+        for (const g of TOOL_GROUPS) {
+          for (const it of g.items) {
+            const v = cfg.socialV2?.tools?.[it.flag];
+            values[it.flag] = typeof v === 'boolean' ? v : it.default !== false;
+            defaults[it.flag] = it.default !== false;
+          }
+        }
+        return sendJson(res, {
+          ok: true,
+          groups: TOOL_GROUPS,
+          values,
+          // 前端「只看不说 / 出厂默认」两个预设直接用这两份，不重复维护一份表
+          presets: { standard: defaults, readonlyOff: [...TOOL_PRESET_READONLY] },
+          chatOnly: cfg.socialV2?.chatOnly === true
+        });
+      }
+
+      const body = await readBody(req);
+      const incoming = body?.values ?? {};
+      const cfg = loadConfig();
+      if (!cfg.socialV2 || typeof cfg.socialV2 !== 'object') cfg.socialV2 = {};
+      if (!cfg.socialV2.tools || typeof cfg.socialV2.tools !== 'object') cfg.socialV2.tools = {};
+
+      let changed = 0;
+      for (const g of TOOL_GROUPS) {
+        for (const it of g.items) {
+          if (!(it.flag in incoming)) continue;
+          const next = incoming[it.flag] === true;
+          if (cfg.socialV2.tools[it.flag] === next) continue;
+          cfg.socialV2.tools[it.flag] = next;
+          changed += 1;
+        }
+      }
+      if (changed) writeJson(configFile(), cfg);
+      // 工具表是桥接启动时读的，改完不重启就只是界面上好看
+      return sendJson(res, { ok: true, changed, needRestart: changed > 0 });
+    }
+
+    /* 原始配置文件读写 —— 「高级」页最后一道口子。
+     * 只认白名单里的三个文件：别的路径一律不认，免得这个接口变成任意文件读写。 */
+    if (p === '/api/raw') {
+      const RAW_FILES = {
+        config: configFile(),
+        models: modelsFile(),
+        proxy: path.join(getRoot(), 'proxy.json'),
+        secrets: secretsFile()
+      };
+      const which = String(url.searchParams.get('file') ?? 'config');
+      const file = RAW_FILES[which];
+      if (!file) return sendJson(res, { ok: false, error: `不认识的配置文件：${which}` });
+      if (req.method === 'GET') {
+        let content = '';
+        try {
+          content = fs.readFileSync(file, 'utf8');
+        } catch {
+          content = '';
+        }
+        return sendJson(res, { ok: true, file: which, path: file, content, exists: Boolean(content) });
+      }
+      const body = await readBody(req);
+      const text = String(body.content ?? '');
+      try {
+        JSON.parse(text);
+      } catch (error) {
+        return sendJson(res, { ok: false, error: `不是合法 JSON：${error?.message ?? error}` });
+      }
+      // 写之前留一份，改坏了能从 state/config-backups 捞回来
+      try {
+        if (fs.existsSync(file)) {
+          const dir = path.join(getRoot(), 'state', 'config-backups');
+          fs.mkdirSync(dir, { recursive: true });
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          fs.copyFileSync(file, path.join(dir, `${which}.${stamp}.json`));
+        }
+      } catch { /* 备份失败不拦保存 */ }
+      fs.writeFileSync(file, text, 'utf8');
+      pushLog(`手动编辑已保存：${path.basename(file)}`, 'sys', 'app');
+      return sendJson(res, { ok: true, file: which });
+    }
+
+    if (p === '/api/providers/import') {
+      const body = await readBody(req);
+      return sendJson(res, importProviders(body));
+    }
+
+    if (p === '/api/bridge/start') return sendJson(res, startBridge());
+    if (p === '/api/bridge/stop') return sendJson(res, stopBridge());
+
+    if (p === '/api/napcat/panel') return sendJson(res, napcatPanel());
+
+    if (p === '/api/logs') {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive'
+      });
+      // 补发最近日志，新连上的窗口不会看到空白
+      for (const entry of logs) res.write(`data: ${JSON.stringify(entry)}\n\n`);
+      logClients.add(res);
+      req.on('close', () => logClients.delete(res));
+      return;
+    }
+
+    return serveStatic(req, res, p);
+  } catch (error) {
+    return sendJson(res, { ok: false, error: String(error?.message ?? error) }, 500);
+  }
+});
+
+/** 监听一次。失败必须 reject —— 不挂 error 监听的话 EADDRINUSE 会变成未捕获异常，直接弹红框。 */
+function listenOnce(port) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      const actual = server.address().port;
+      pushLog(`桌面服务已就绪：http://127.0.0.1:${actual}`, 'sys');
+      resolve({ port: actual, url: `http://127.0.0.1:${actual}` });
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, '127.0.0.1');
+  });
+}
+
+/**
+ * 起服务。端口被占就自动往后找，不跟用户报错。
+ * 常见场景：上一次没退干净、或者同时开了开发模式。
+ * 最后一个候选是 0 —— 让系统随便给一个，基本不可能失败。
+ */
+export async function startServer(preferred = PORT) {
+  const candidates = [
+    preferred,
+    ...Array.from({ length: 9 }, (_, i) => preferred + i + 1),
+    0
+  ];
+
+  let lastError;
+  for (const port of candidates) {
+    try {
+      const result = await listenOnce(port);
+      // NapCat 常常是开机自启或手动开的，等用户点「一键启动」才挂日志就太晚了
+      ensureNapcatFileLog();
+      startNapcatTail();
+      initAutomation();
+      // 手机推送是可选功能，没启用时这里什么都不做（也不会占端口）
+      if (phoneSettings().enabled) startPhoneListener();
+      scheduleNapcatUpdateCheck();
+      scheduleAppUpdateCheck();
+      if (port !== preferred) {
+        pushLog(`端口 ${preferred} 被占用，改用 ${result.port}`, 'sys');
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== 'EADDRINUSE') throw error;
+    }
+  }
+  throw lastError;
+}
+
+/* 直接 `node server.mjs` 时自己起服务。
+ *
+ * ⚠️ 比 realpath，不能比 `fileURLToPath(import.meta.url) === path.resolve(argv[1])`：
+ * 本项目目录常被做成 junction 绕开中文路径（`C:\Users\<用户>\DualHabitatMatrix` →
+ * `Documents\默认项目\DualHabitat-Matrix`），经 junction 调用时两边字符串不相等，
+ * 服务就静默不起来了。同样的坑在 `src/oc-config.js` 也踩过一次。 */
+const isDirectRun = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(entry);
+  } catch {
+    return false;
+  }
+})();
+
+if (isDirectRun) {
+  const { url } = await startServer();
+  console.log(`桌面端已启动：${url}`);
+}

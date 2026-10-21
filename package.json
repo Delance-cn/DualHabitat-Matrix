@@ -1,0 +1,32 @@
+{
+  "name": "dualhabitat-matrix",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "QQ (OneBot v11 / SnowLuma) / 微信与「对话后端」之间的桥接：群聊和私聊消息变成 agent prompt，回复回到原处。后端可换 —— 内置隔离实例、直连模型 API、或任意 CLI agent（契约见 src/backends/CONTRACT.md）。",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node src/bridge.js",
+    "self-test": "node src/self-test.js",
+    "postinstall": "node scripts/patch-snowluma-sdk.mjs",
+    "patch:sdk": "node scripts/patch-snowluma-sdk.mjs",
+    "gen:config": "node src/oc-config.js",
+    "spike:serve": "node spike/start-server.mjs",
+    "spike:stop": "node spike/stop-server.mjs",
+    "spike:probe": "node spike/probe.mjs",
+    "spike:tools": "node spike/probe-tools.mjs",
+    "spike:models": "node spike/list-models.mjs",
+    "spike:agents": "node spike/dump-agents.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@opencode/client": "^2.0.32",
+    "@snowluma/sdk": "^1.14.22",
+    "js-yaml": "^4.3.2",
+    "qrcode": "^1.5.4",
+    "zod": "^4.4.3"
+  }
+}
