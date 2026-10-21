@@ -139,12 +139,18 @@ bailian/qwen3.8-max → bailian/kimi-k3 → bailian/MiniMax-M2.5 → bailian/qwe
 
 ## 文档
 
-- 交接文档（源码位置、构建、数据目录、待办）：[docs/HANDOVER.md](docs/HANDOVER.md)
+- 模型接入与二次开发：[docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md)
 - 上游移植记录：[docs/PHASE0-FINDINGS.md](docs/PHASE0-FINDINGS.md)、[docs/PHASE1-PORT.md](docs/PHASE1-PORT.md)
 - 会话权限与安全：[RULES.md](RULES.md)
 - 发布包校验（Sigstore）：[docs/VERIFY-RELEASE.md](docs/VERIFY-RELEASE.md)
 - 原上游文档（DSH 版）：[upstream/](upstream/)（本地参考备份，不在版本管理内）
 
-## License
+## 联系
 
-MIT（沿袭上游 [Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge)）
+邮箱：2585175752@qq.com（Delance／杜继承）。遇到问题、想提需求或参与开发，欢迎来信。
+
+## 许可证
+
+本项目采用 [MIT](LICENSE) 许可证发布：**欢迎任何商业使用与闭源分发**，但请务必在副本中保留原作者（杜继承）的版权声明。
+
+> 沿袭上游 [Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge)（MIT），感谢原作者。
