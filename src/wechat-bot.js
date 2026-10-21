@@ -688,6 +688,32 @@ async function getPluginState() {
   return pluginState;
 }
 
+/** 插件事件分发：微信侧与 QQ 侧同一套钩子；异常互相隔离。 */
+async function firePluginHook(hook, payload) {
+  try {
+    const ps = await getPluginState();
+    for (const p of ps.plugins) {
+      const fn = p.hooks?.[hook];
+      if (typeof fn !== 'function') continue;
+      const pluginName = p.name;
+      try {
+        Promise.resolve(fn({ ...payload, plugin: pluginName })).catch((error) => {
+          log(`⚠️ 插件 ${pluginName}.${hook} 异步异常：${error?.message ?? error}`);
+        });
+      } catch (error) {
+        log(`⚠️ 插件 ${pluginName}.${hook} 异常：${error?.message ?? error}`);
+      }
+    }
+  } catch (error) {
+    log(`⚠️ 插件事件 ${hook} 分发失败：${error?.message ?? error}`);
+  }
+}
+
+// 插件心跳：每分钟一次 onTick
+setInterval(() => {
+  try { firePluginHook('onTick', { platform: 'wechat' }).catch(() => { }); } catch { }
+}, 60_000).unref?.();
+
 async function handleMessage(msg) {
   if (msg.message_type === 2) return;                      // bot 自己发的
   if (String(msg.from_user_id ?? '').endsWith('@im.bot')) return;
@@ -707,6 +733,16 @@ async function handleMessage(msg) {
   log(`收到 ${from}（${kinds}）：${text.slice(0, 60)}`);
   appendActivity(from, '对方', text || `[${kinds}]`);
   fireHook('message.received', { from, text, kinds });
+  firePluginHook('onMessage', {
+    platform: 'wechat',
+    kind: 'private',
+    chatId: from,
+    from,
+    fromName: from,
+    text,
+    isOwner: Boolean(wx.ownerId) && from === String(wx.ownerId),
+    reply: (t) => sendText(from, ctx, String(t)).catch((e) => log('插件回复失败：', e?.message ?? e))
+  });
 
   if (!text) {
     await sendText(from, ctx, `收到你的${kinds}消息，我现在只能看文字。`).catch(() => {});
@@ -749,6 +785,7 @@ async function handleMessage(msg) {
         for (const part of parts) await sendText(from, ctx, part);
         log(`回复 ${from}：${reply.slice(0, 60)}`);
         appendActivity(from, 'agent 回复', reply);
+        firePluginHook('onBotReply', { platform: 'wechat', chatId: from, text: reply });
         fireHook('message.replied', { to: from, text: reply.slice(0, 2000) });
       } catch (error) {
         log('处理失败：', error?.message ?? error);

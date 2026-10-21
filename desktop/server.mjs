@@ -2672,6 +2672,7 @@ function loadNotify() {
     enabled: true,
     token: randomBytes(9).toString('base64url'),
     default: { platform: 'qq', to: '' },
+    push: { kind: 'ntfy', endpoint: '' },
     mirror: { enabled: false, from: '', keyword: '', platform: 'qq', to: '' }
   };
   const c = readJson(NOTIFY_FILE, null);
@@ -2684,8 +2685,12 @@ function loadNotify() {
     enabled: c.enabled !== false,
     token: String(c.token ?? '') || d.token,
     default: {
-      platform: c.default?.platform === 'wechat' ? 'wechat' : 'qq',
+      platform: c.default?.platform === 'wechat' ? 'wechat' : c.default?.platform === 'push' ? 'push' : 'qq',
       to: String(c.default?.to ?? '')
+    },
+    push: {
+      kind: ['ntfy', 'serverchan', 'bark', 'pushplus'].includes(c.push?.kind) ? c.push.kind : 'ntfy',
+      endpoint: String(c.push?.endpoint ?? '')
     },
     mirror: {
       enabled: c.mirror?.enabled === true,
@@ -2735,12 +2740,77 @@ async function qqSendAny(target, text) {
   return qqSend({ qq: spec, text });
 }
 
-/** 统一出口：platform + to + text → QQ 或微信 */
+/** 推送到手机/手表：ntfy / Server酱 / Bark / PushPlus。endpoint 在「消息与任务」页配。 */
+async function sendPush(hub, text) {
+  const kind = hub.push?.kind ?? 'ntfy';
+  const endpoint = String(hub.push?.endpoint ?? '').trim();
+  if (!endpoint) return { ok: false, error: '推送渠道没配：先在「消息与任务 → Webhook 通知枢纽」里选渠道并填密钥/主题' };
+  const firstLine = String(text ?? '').split('\n')[0].slice(0, 30);
+  try {
+    if (kind === 'ntfy') {
+      // endpoint = 完整主题地址，如 https://ntfy.sh/my-secret-topic
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { Title: firstLine, Tags: 'robot' },
+        body: String(text ?? ''),
+        signal: AbortSignal.timeout(15_000)
+      });
+      if (!res.ok) return { ok: false, error: `ntfy 返回 HTTP ${res.status}` };
+      return { ok: true };
+    }
+    if (kind === 'serverchan') {
+      // Server酱·Turbo：https://sctapi.ftqq.com/<SENDKEY>.send
+      const form = new URLSearchParams({ title: firstLine, desp: String(text ?? '') });
+      const res = await fetch(`https://sctapi.ftqq.com/${encodeURIComponent(endpoint)}.send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: form.toString(),
+        signal: AbortSignal.timeout(15_000)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.code !== 0) return { ok: false, error: `Server酱失败：${data.message ?? 'HTTP ' + res.status}` };
+      return { ok: true };
+    }
+    if (kind === 'bark') {
+      // Bark（iOS）：https://api.day.app/push
+      const res = await fetch('https://api.day.app/push', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ device_key: endpoint, title: firstLine, body: String(text ?? '') }),
+        signal: AbortSignal.timeout(15_000)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.code !== 200) return { ok: false, error: `Bark 失败：${data.message ?? 'HTTP ' + res.status}` };
+      return { ok: true };
+    }
+    if (kind === 'pushplus') {
+      // PushPlus：http://www.pushplus.plus/send（微信公众号通道）
+      const res = await fetch('https://www.pushplus.plus/send', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ token: endpoint, title: firstLine, content: String(text ?? '') }),
+        signal: AbortSignal.timeout(15_000)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.code !== 200) return { ok: false, error: `PushPlus 失败：${data.msg ?? 'HTTP ' + res.status}` };
+      return { ok: true };
+    }
+    return { ok: false, error: `不认识的推送渠道 ${kind}` };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+/** 统一出口：platform + to + text → QQ / 微信 / 推送渠道 */
 async function notifyDispatch({ platform, to, text }) {
   const body = String(text ?? '').trim();
   if (!body) return { ok: false, error: '没有要发的内容' };
   const target = String(to ?? '').trim();
   if (!target) return { ok: false, error: '没有目标' };
+  if (platform === 'push') {
+    const hub = loadNotify();
+    return sendPush(hub, body);
+  }
   if (platform === 'wechat') return wechatPush({ to: target, text: body });
   return qqSendAny(target, body);
 }
@@ -4999,6 +5069,12 @@ const server = http.createServer(async (req, res) => {
           to: String(body.default.to ?? '').trim()
         };
       }
+      if (body.push) {
+        hub.push = {
+          kind: ['ntfy', 'serverchan', 'bark', 'pushplus'].includes(body.push.kind) ? body.push.kind : 'ntfy',
+          endpoint: String(body.push.endpoint ?? '').trim()
+        };
+      }
       if (body.mirror) {
         hub.mirror = {
           enabled: body.mirror.enabled === true,
@@ -5023,7 +5099,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const hub = loadNotify();
       if (!hub.enabled) return sendJson(res, { ok: false, error: '通知枢纽没启用' });
-      const platform = body.platform === 'wechat' ? 'wechat' : 'qq';
+      const platform = body.platform === 'push' ? 'push' : body.platform === 'wechat' ? 'wechat' : 'qq';
       const to = String(body.to ?? hub.default?.to ?? '').trim();
       if (!to) return sendJson(res, { ok: false, error: '没有目标：填一个 QQ 号 / group:群号 / 微信 id' });
       const text = `[DualHabitat Matrix 通知测试] ${new Date().toLocaleString('zh-CN')}`;
@@ -5138,12 +5214,15 @@ const server = http.createServer(async (req, res) => {
       }
 
       // 直接通知：请求里带了目标就用；否则用默认目标
-      const reqPlatform = payload.platform === 'wechat' ? 'wechat' : payload.platform === 'qq' ? 'qq' : null;
+      const reqPlatform = payload.platform === 'wechat' ? 'wechat'
+        : payload.platform === 'qq' ? 'qq'
+        : payload.platform === 'push' ? 'push'
+        : null;
       const reqTo = String(payload.to ?? '').trim();
       const target = reqPlatform && reqTo
         ? { platform: reqPlatform, to: reqTo }
         : hub.default?.to
-          ? { platform: hub.default.platform === 'wechat' ? 'wechat' : 'qq', to: hub.default.to }
+          ? { platform: hub.default.platform === 'push' ? 'push' : hub.default.platform === 'wechat' ? 'wechat' : 'qq', to: hub.default.to }
           : null;
       if (!target) {
         return sendJson(res, { ok: false, error: '请求里没带 platform/to，服务端也没配默认目标' }, 400);

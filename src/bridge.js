@@ -1422,6 +1422,28 @@ async function main() {
     log(`插件：已装载 ${pluginState.plugins.length} 个${pluginState.errors.length ? `，失败 ${pluginState.errors.length} 个` : ''}`);
   }
 
+  // 插件事件分发：逐个插件调用，互不阻塞、互不牵连（异步异常只记日志）。
+  // payload 里带 reply 的钩子可以让插件回消息；不带的就是纯观察。
+  function firePluginHook(hook, payload) {
+    for (const p of pluginState.plugins) {
+      const fn = p.hooks?.[hook];
+      if (typeof fn !== 'function') continue;
+      const pluginName = p.name;
+      try {
+        Promise.resolve(fn({ ...payload, plugin: pluginName })).catch((error) => {
+          log(`⚠️ 插件 ${pluginName}.${hook} 异步异常：${error?.message ?? error}`);
+        });
+      } catch (error) {
+        log(`⚠️ 插件 ${pluginName}.${hook} 异常：${error?.message ?? error}`);
+      }
+    }
+  }
+
+  // 插件心跳：每分钟一次 onTick。没挂 onTick 的插件零开销；时段判断交给插件自己。
+  setInterval(() => {
+    try { firePluginHook('onTick', { platform: 'qq' }); } catch { }
+  }, 60_000).unref?.();
+
   // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
   let slangEntries = [];
   // 读失败时（被占用 / 权限 / JSON 损坏）必须**暂停写入**：否则内存里的空数组
@@ -3536,7 +3558,8 @@ async function main() {
               file: p.file,
               name: p.name,
               description: p.description,
-              commands: p.commands.map((c) => ({ name: c.name, usage: c.usage, description: c.description }))
+              commands: p.commands.map((c) => ({ name: c.name, usage: c.usage, description: c.description })),
+              hooks: Object.keys(p.hooks ?? {})
             })),
             errors: pluginState.errors
           });
@@ -7234,6 +7257,10 @@ async function main() {
         })
         .then(() => sleep(cfg.sendDelayMs));
     }
+    // 插件事件：onBotReply（进发送队列后触发一次；分条细节不暴露）
+    sendChain = sendChain.then(() => {
+      firePluginHook('onBotReply', { platform: 'qq', chatId: key, text: safeMsg });
+    }).catch(() => { });
     return sendChain;
   }
 
@@ -10541,6 +10568,20 @@ async function main() {
       return;
     }
 
+    // 插件事件：onMessage（不 await——插件慢不能拖累回话主流程；异常在 firePluginHook 内隔离）
+    firePluginHook('onMessage', {
+      platform: 'qq',
+      kind,
+      chatId: key,
+      from: String(event.user_id ?? ''),
+      fromName: kind === 'group' ? (event.sender?.card || event.sender?.nickname || '') : '',
+      text: plainContent,
+      isOwner,
+      reply: (msg) => sendToQQ(key, String(msg)),
+      // 发语音：传本地音频文件路径（插件自己负责 TTS/素材）；微信侧无此能力
+      sendVoice: (filePath) => sendVoiceV2(key, String(filePath), { guard: true })
+    });
+
     // 控制类话语：仅管理员（ownerQQ）可下达；群友触发直接拦截
     if (!isOwner && /进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(plainContent)) {
       await sendToQQ(key, '角色切换仅管理员可在管理端操作，群内不支持。');
@@ -10667,6 +10708,7 @@ async function main() {
             '/model 等 DSH 斜杠命令 —— 原样转发给模型 API'
           ],
           reply: (msg) => sendToQQ(key, msg),
+          sendVoice: (filePath) => sendVoiceV2(key, String(filePath), { guard: true }),
           replyImage: async (buffer) => {
             // 发本地截图：与 onebotSend 同一条 HTTP 通道，消息段换成 image base64
             const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');

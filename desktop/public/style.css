@@ -61,6 +61,12 @@
 
 * { box-sizing: border-box; }
 
+html {
+  /* 主题背景必须铺到 html 层：字体缩放（zoom）或内容不满一屏时，
+     .app 底下露出的就是这层底色，不设就是白条 */
+  background: var(--bg);
+}
+
 html, body { height: 100%; }
 
 body {
