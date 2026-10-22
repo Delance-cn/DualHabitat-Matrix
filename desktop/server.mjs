@@ -2166,6 +2166,63 @@ async function bringUp(scope = 'all') {
   };
 }
 
+/**
+ * 一键把「当前通道的机器人」整条链拉起来（/api/bots/start）。
+ *
+ * 和 bringUp 的区别：bringUp 面向「把服务开起来」，这里面向引导面板——
+ * 每一步给人话结果（✓/✗ + 原因），先查密钥再动进程，失败不猜。
+ * QQ：查密钥 → NapCat（没起就起并等端口，复用 bringUp 的等待逻辑）→ 桥接。
+ * 微信：查密钥 → 微信接入（没登录它会自己出二维码到 state/wechat-qr.json）。
+ */
+async function startBotFlow(platform = 'qq') {
+  const steps = [];
+  const mark = (name, ok, detail = '') => { steps.push({ name, ok, detail }); return ok; };
+  const hasKey = secretPresence().some((s) => s.set);
+
+  if (platform === 'wechat') {
+    mark('模型密钥', hasKey, hasKey ? '已配置' : '还没填 —— 在引导第 2 步粘一下就行');
+    const w0 = wechatState();
+    if (w0.running) {
+      mark('微信接入', true, '已在运行');
+    } else {
+      const r = startWechat();
+      if (!mark('微信接入', r.ok === true, r.ok ? '已启动' : (r.error ?? '启动失败'))) {
+        return { ok: false, platform, steps };
+      }
+      // 给它两秒把二维码写进 state/wechat-qr.json，前端马上就有图可扫
+      await new Promise((r2) => setTimeout(r2, 2000));
+    }
+    const w = wechatState();
+    mark(
+      '登录',
+      true,
+      w.loggedIn
+        ? `已登录${w.botId ? `（${w.botId}）` : ''}`
+        : w.qr
+          ? '二维码已出，用手机微信扫'
+          : '还没出二维码 —— 等几秒再刷一次，或到日志页看微信输出'
+    );
+    return {
+      ok: true,
+      platform,
+      steps,
+      wechat: { running: w.running, loggedIn: w.loggedIn, qr: w.qr }
+    };
+  }
+
+  mark('模型密钥', hasKey, hasKey ? '已配置' : '还没填 —— 在引导第 2 步粘一下就行');
+  const n = napcatSettings();
+  if (!n.dir) {
+    mark('NapCat', false, '还没装 NapCat —— 回总览页点横幅「下载并装好」，或到「高级」页手动配目录');
+    return { ok: false, platform, steps };
+  }
+  const up = await bringUp('qq');
+  mark('NapCat', !up.napcatError, up.napcatError ?? 'OneBot 端口已通');
+  const bridgeOk = Boolean(up.bridge?.ok) || up.bridge?.error === '桥接已在运行';
+  mark('QQ 桥接', bridgeOk, up.bridge?.error ?? (up.bridge?.external ? '复用已在运行的桥接' : '已启动'));
+  return { ok: !up.napcatError && bridgeOk, platform, steps };
+}
+
 function bringDown(scope = 'all') {
   const wantQq = scope !== 'wechat';
   const wantWx = scope !== 'qq';
@@ -4437,6 +4494,10 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, bringDown(body.scope));
     }
     if (p === '/api/wechat/start') return sendJson(res, startWechat());
+    if (p === '/api/bots/start') {
+      const body = await readBody(req);
+      return sendJson(res, await startBotFlow(body?.platform === 'wechat' ? 'wechat' : 'qq'));
+    }
     if (p === '/api/wechat/stop') return sendJson(res, stopWechat());
 
     if (p === '/api/config') {
@@ -5434,6 +5495,23 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/bridge/stop') return sendJson(res, stopBridge());
 
     if (p === '/api/napcat/panel') return sendJson(res, napcatPanel());
+
+    /* NapCat 面板开在应用内的子窗口里（Electron 主进程注入 opener）。
+     * 裸跑（node server.mjs）没有 Electron：返回 inApp:false，前端自己开新标签。 */
+    if (p === '/api/napcat/window') {
+      const panel = napcatPanel();
+      if (!panel.ok) return sendJson(res, panel);
+      const opener = globalThis.dhmOpenChildWindow;
+      if (typeof opener === 'function') {
+        try {
+          opener(panel.url, 'NapCat 面板 — 扫码 / 快登');
+          return sendJson(res, { ok: true, inApp: true, url: panel.url });
+        } catch (error) {
+          return sendJson(res, { ok: true, inApp: false, url: panel.url, warn: String(error?.message ?? error) });
+        }
+      }
+      return sendJson(res, { ok: true, inApp: false, url: panel.url });
+    }
 
     if (p === '/api/logs') {
       res.writeHead(200, {

@@ -11,7 +11,9 @@
  * ══════════════════════════════════════════════════════════════════════════ */
 
 :root {
-  /* 深色（默认）—— 长时间盯着看不刺眼 */
+  /* 深色 —— 兜底变量组（长时间盯着看不刺眼）。2026-10-22 起默认主题是浅色：
+     index.html 的内联脚本把 data-theme 定成 light，首屏走下面那组变量；
+     只有用户在设置里选「深色」时才落到这里 */
   --bg: #0e1114;
   --bg-soft: #12161a;
   --panel: #161b20;
@@ -1832,3 +1834,31 @@ html[data-view="home"] .app { grid-template-columns: minmax(0, 1fr); }
 }
 .wizard-float-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
 .wizard-float-sub { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+/* ══ 开机器人在地面板（bot sheet）══ */
+.home-setup-row { display: flex; align-items: center; gap: 8px; margin: 10px 0 2px; flex-wrap: wrap; }
+.bot-sheet {
+  position: fixed; left: 50%; transform: translateX(-50%); bottom: 18px; z-index: 70;
+  width: min(560px, calc(100vw - 36px));
+  max-height: min(74vh, 660px); overflow: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4); padding: 14px 16px;
+}
+.bot-sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.bs-row { display: flex; gap: 6px; align-items: baseline; margin: 4px 0; }
+.bs-actions { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+.bs-label { display: block; font-size: 12px; color: var(--text-3); margin: 10px 0 4px; }
+.bs-input { width: 100%; box-sizing: border-box; }
+.bs-inline { display: flex; gap: 8px; align-items: center; }
+.bs-inline .bs-input { flex: 1; }
+.bs-qr { margin: 10px 0; text-align: center; }
+.bs-qr img { width: 200px; height: 200px; border-radius: 8px; border: 1px solid var(--line-soft); background: #fff; }
+.bs-step { display: flex; gap: 8px; align-items: baseline; padding: 6px 8px; border: 1px solid var(--line-soft); border-radius: 8px; margin: 6px 0; font-size: 12.5px; flex-wrap: wrap; }
+.bs-step.ok span:first-child { color: var(--ok); }
+.bs-step.bad span:first-child { color: var(--err); }
+.bs-step-detail { color: var(--text-3); }
+.bs-msgs { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.bs-msg { display: flex; gap: 8px; font-size: 12px; padding: 4px 6px; border-radius: 6px; background: var(--bg-soft); }
+.bs-msg.self { opacity: 0.85; }
+.bs-msg-clock { color: var(--text-3); flex: none; }
+.bs-msg-who { flex: none; font-weight: 600; }
+.bs-msg-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -11,7 +11,7 @@
   (function () {
     var d = document.documentElement;
     try {
-      d.dataset.theme = localStorage.getItem('dhm-theme') === 'light' ? 'light' : 'dark';
+      d.dataset.theme = localStorage.getItem('dhm-theme') === 'dark' ? 'dark' : 'light';
       // 简易 = 行话翻成人话、纯技术字段收起；高级 = 原始术语全在
       d.dataset.mode = localStorage.getItem('dhm-mode') === 'advanced' ? 'advanced' : 'simple';
       // 平台只影响「聊天 / 消息」两页显示哪一份配置，运行状态两边同屏
@@ -23,7 +23,7 @@
       var dhmFont = parseFloat(localStorage.getItem('dhm-font') || '1');
       if (dhmFont >= 0.8 && dhmFont <= 1.6) d.style.zoom = String(dhmFont);
     } catch (e) {
-      d.dataset.theme = 'dark';
+      d.dataset.theme = 'light';
       d.dataset.mode = 'simple';
       d.dataset.platform = 'qq';
       d.dataset.view = 'home';
@@ -107,6 +107,12 @@
             <span id="home-state-wx">未登录</span>
           </span>
         </button>
+      </div>
+
+      <div class="home-setup-row">
+        <span class="hint">想把一个机器人直接跑起来：</span>
+        <button class="btn btn-sm" id="home-setup-qq">开 QQ 机器人</button>
+        <button class="btn btn-sm btn-ghost" id="home-setup-wechat">开微信机器人</button>
       </div>
 
       <div class="banner" id="banner-app" hidden>
@@ -1840,6 +1846,15 @@
 </div>
 
 <div id="toast"></div>
+    <!-- 开机器人在地面板：引导四步都在这里就地完成，不再跳页 -->
+    <div class="bot-sheet" id="bot-sheet" hidden>
+      <div class="bot-sheet-head">
+        <strong id="bot-sheet-title">开机器人</strong>
+        <button class="btn btn-sm btn-ghost" id="bot-sheet-close" title="收起">✕</button>
+      </div>
+      <div class="bot-sheet-body" id="bot-sheet-body"></div>
+    </div>
+
     <!-- 新手引导：悬浮面板（可关；4 步全亮自动收起） -->
     <div class="wizard-float" id="wizard-float" hidden>
       <div class="wizard-float-head">

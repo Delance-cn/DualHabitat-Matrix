@@ -176,7 +176,8 @@ async function confirmBox(opts) {
 
 /* 主题 */
 function applyTheme(theme) {
-  const next = theme === 'light' ? 'light' : 'dark';
+  // 2026-10-22 起默认浅色：没存过偏好的新机器直接进浅色；明确选过「深色」的照旧
+  const next = theme === 'dark' ? 'dark' : 'light';
   document.documentElement.dataset.theme = next;
   try {
     localStorage.setItem('dhm-theme', next);
@@ -429,6 +430,13 @@ const pagesOf = (p) => NAV[p].map(([page]) => page);
 
 let currentPage = 'overview';
 
+/* 开机器人在地面板（bot sheet）：null = 关着；0-3 = 当前展开的引导步骤。
+ * 声明放在这里（而不是下面的面板代码段），因为 refreshState 和 applyPlatform
+ * 在脚本求值期就会引用它，放后面会踩 let 的暂时性死区。 */
+let botSheetStep = null;
+let botSheetPoll = null;
+let bsImpReport = null;
+
 /* 模型两块配置的状态。声明放这里是因为 applyPlatform 会用到，
    放到函数定义旁边会踩 let 的暂时性死区。 */
 let modelProfiles = { qq: {}, wechat: {} };
@@ -454,6 +462,7 @@ function applyPlatform(value, opts = {}) {
     try { stashAllSlots(); } catch { /* 模型页还没渲染，跳过 */ }
   }
   document.documentElement.dataset.platform = next;
+  if (prev !== next) closeBotSheet();
 
   const wx = next === 'wechat';
   $('#pf-ribbon-text').textContent = wx ? '微信 · iLink 通道' : 'QQ · NapCat 通道';
@@ -583,6 +592,7 @@ async function refreshState() {
   S = next;
   renderShell();
   renderWizard();
+  if (botSheetStep !== null) updateBotSheetLive();
   if (currentPage === 'overview') {
     renderOverview();
     renderHomeCards();
@@ -1059,17 +1069,17 @@ function wizardSteps() {
   const running = wx ? S.wechat?.running === true : Boolean(S.bridge?.running || S.napcat?.reachable === true);
   if (wx) {
     return [
-      { title: '登录微信', desc: '「登录」页先点「启动」，二维码出来后用手机微信扫', done: S.wechat?.running === true, go: () => wizardGo('wechat', 'wx-overview'), btn: '去扫码' },
-      { title: '填模型密钥', desc: '「API 与模型」页：厂商选智谱 GLM 等，密钥从厂商控制台复制（只显示一次）。填好自动保存', done: hasKey, go: () => wizardGo('wechat', 'models'), btn: '去填' },
-      { title: '选模型和人格', desc: '「API 与模型」页选模型；「对话与人格」页挑个预设人格。选了自动保存', done: hasSource, go: () => wizardGo('wechat', 'chat'), btn: '去选' },
-      { title: '发条消息试', desc: '用手机微信给机器人发一句话。第一次要等模型服务自启（约十几秒），没回话隔一会再发', done: running, go: () => wizardGo('wechat', 'status'), btn: '去状态页' }
+      { title: '登录微信', desc: '点「去扫码」——这里直接启动微信接入并就地显示二维码，手机微信扫一下', done: S.wechat?.running === true, go: () => openBotSheet(0), btn: '去扫码' },
+      { title: '填模型密钥', desc: '在弹出的面板里粘贴 key（厂商控制台复制，只显示一次）。填好自动保存', done: hasKey, go: () => openBotSheet(1), btn: '去填' },
+      { title: '选模型和人格', desc: '在弹出的面板里选厂商和模型、挑个人格。选了自动保存', done: hasSource, go: () => openBotSheet(2), btn: '去选' },
+      { title: '发条消息试', desc: '面板里确认已登录，然后用手机微信给机器人发一句话。第一次要等模型服务自启（约十几秒）', done: running, go: () => openBotSheet(3), btn: '去启动' }
     ];
   }
   return [
-    { title: '登录 QQ', desc: '点「去扫码」打开 NapCat 面板，用手机 QQ 扫一下', done: S.napcat?.reachable === true, go: openNapcatPanel, btn: '去扫码' },
-    { title: '填模型密钥', desc: '「API 与模型」页：厂商选智谱 GLM 等，接口地址自动带出；密钥在厂商控制台生成，只显示一次，复制粘贴进来（填好自动保存）', done: hasKey, go: () => wizardGo('qq', 'models'), btn: '去填' },
-    { title: '选模型和人格', desc: '「API 与模型」页选模型；「对话与人格」页挑个预设人格（比如塔菲）。选了自动保存', done: hasSource, go: () => wizardGo('qq', 'chat'), btn: '去选' },
-    { title: '开起来，发条消息试', desc: '点「一键全开」，然后用手机 QQ 给机器人发一句话。没回话看「当前状态」哪个灯不亮', done: running, go: () => $('#btn-up').click(), btn: '一键全开' }
+    { title: '登录 QQ', desc: '点「去扫码」——NapCat 面板会在应用内打开，用手机 QQ 扫一下', done: S.napcat?.reachable === true, go: () => openBotSheet(0), btn: '去扫码' },
+    { title: '填模型密钥', desc: '在弹出的面板里粘贴 key，程序自动认厂商（密钥在厂商控制台生成，只显示一次）。填好自动保存', done: hasKey, go: () => openBotSheet(1), btn: '去填' },
+    { title: '选模型和人格', desc: '在弹出的面板里选厂商和模型、挑个人格（比如塔菲）。选了自动保存', done: hasSource, go: () => openBotSheet(2), btn: '去选' },
+    { title: '开起来，发条消息试', desc: '面板里点「启动这个机器人」，然后用手机 QQ 给它发一句话。没回话就看启动步骤里哪一步打了 ✗', done: running, go: () => openBotSheet(3), btn: '去启动' }
   ];
 }
 
@@ -1102,6 +1112,8 @@ function renderWizard() {
 function applyWizardVisibility(allDone) {
   const box = $('#wizard-float');
   if (!box) return;
+  // 在地面板开着时，悬浮卡让位（关掉面板会按原逻辑回来）
+  if (botSheetStep !== null) { box.hidden = true; return; }
   const st = wizardState();
   if (st === 'done' || st === 'dismissed') { box.hidden = true; return; }
   if (allDone) {
@@ -1115,6 +1127,344 @@ function applyWizardVisibility(allDone) {
 }
 
 $('#wizard-close')?.addEventListener('click', () => wizardMark('dismissed'));
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 开机器人在地面板（bot sheet）
+ *
+ * 引导的四步不再跳页：点哪一步，那一步的操作控件就地展开在这块面板里；
+ * 状态（NapCat 连没连上 / 微信二维码 / 有没有 key）跟着轮询实时变，勾自动亮。
+ * 后端编排走 /api/bots/start；NapCat 面板在应用内开子窗口（/api/napcat/window）。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const BS_TITLES = ['登录', '填模型密钥', '选模型和人格', '启动并测试'];
+
+function closeBotSheet() {
+  botSheetStep = null;
+  const box = $('#bot-sheet');
+  if (box) box.hidden = true;
+  if (botSheetPoll) {
+    clearInterval(botSheetPoll);
+    botSheetPoll = null;
+  }
+  applyWizardVisibility();
+}
+
+async function openBotSheet(step) {
+  botSheetStep = Math.max(0, Math.min(3, Number(step) || 0));
+  $('#bot-sheet').hidden = false;
+  if (!S) await refreshState();
+  await renderBotSheet();
+  applyWizardVisibility(); // 悬浮引导立刻让位，不等下一轮轮询
+  if (!botSheetPoll) botSheetPoll = setInterval(() => refreshState(), 3000);
+}
+
+$('#bot-sheet-close')?.addEventListener('click', closeBotSheet);
+
+$('#home-setup-qq')?.addEventListener('click', async () => {
+  applyPlatform('qq', { animate: true });
+  showPage(NAV.qq[0][0]);
+  await openBotSheet(0);
+});
+
+$('#home-setup-wechat')?.addEventListener('click', async () => {
+  applyPlatform('wechat', { animate: true });
+  showPage(NAV.wechat[0][0]);
+  await openBotSheet(0);
+});
+
+async function renderBotSheet() {
+  if (botSheetStep === null || !S) return;
+  const wx = platform() === 'wechat';
+  $('#bot-sheet-title').textContent = `开机器人 · ${wx ? '微信' : 'QQ'} · ${BS_TITLES[botSheetStep]}`;
+  const body = $('#bot-sheet-body');
+  if (botSheetStep === 0) body.innerHTML = wx ? bsLoginWxHtml() : bsLoginQqHtml();
+  else if (botSheetStep === 1) body.innerHTML = bsSecretsHtml();
+  else if (botSheetStep === 2) body.innerHTML = await bsModelRoleHtml();
+  else body.innerHTML = bsStartHtml();
+  bindBotSheet();
+  updateBotSheetLive();
+}
+
+function bsLoginQqHtml() {
+  return `
+    <div class="bs-row"><span class="hint">NapCat 状态：</span><strong id="bs-napcat-state">—</strong></div>
+    <div class="bs-actions"><button class="btn btn-primary" id="bs-napcat-open">在应用内打开 NapCat 面板</button></div>
+    <p class="hint">扫码和快登都在面板里。这里变成「已连接」这一步就自动打勾；面板可以留着，也可以关掉。</p>
+    <div class="result" id="bs-result-0"></div>`;
+}
+
+function bsLoginWxHtml() {
+  return `
+    <div class="bs-row"><span class="hint">微信接入：</span><strong id="bs-wx-state">—</strong></div>
+    <div class="bs-actions"><button class="btn btn-primary" id="bs-wx-start">启动微信接入</button></div>
+    <div class="bs-qr"><img id="bs-wx-qr" alt="微信登录二维码" hidden /><div class="hint" id="bs-wx-qr-status"></div></div>
+    <p class="hint">二维码四分钟过期；过期了再点一次「启动微信接入」换一张（在跑就不会重复起进程）。</p>
+    <div class="result" id="bs-result-0"></div>`;
+}
+
+function bsSecretsHtml() {
+  const anyKey = (S?.secrets ?? []).some((s) => s.set);
+  return `
+    <div class="bs-row"><span class="hint">当前状态：</span><strong>${anyKey ? '已有密钥' : '还没有密钥'}</strong></div>
+    <textarea class="bs-input" id="bs-imp-text" rows="3" placeholder="把 key 粘进来，一行一条；程序会自动认出是哪家的"></textarea>
+    <div class="bs-actions">
+      <button class="btn" id="bs-imp-scan">识别</button>
+      <button class="btn btn-primary" id="bs-imp-apply" hidden>确认写入</button>
+    </div>
+    <div id="bs-imp-report"></div>
+    <div class="result" id="bs-result-1"></div>`;
+}
+
+async function bsModelRoleHtml() {
+  const pf = platform();
+  const prof = S?.backend?.profiles?.[pf]?.chat ?? {};
+  const provOpts = (S?.providers ?? [])
+    .map((p) => `<option value="${esc(p.id)}" ${p.id === (prof.provider ?? '') ? 'selected' : ''}>${esc(p.label)}${p.needsKey ? '' : '（无需 key）'}</option>`)
+    .join('');
+  if (!roleNames.length) {
+    const r = await api('/api/roles');
+    if (r?.ok !== false) roleNames = r.roles ?? [];
+  }
+  const cur = await api(`/api/role?platform=${pf}`);
+  const curRole = cur?.ok === false ? '' : (cur.role ?? '');
+  const roleOpts = roleNames.map((n) => `<option value="${esc(n)}" ${n === curRole ? 'selected' : ''}>${esc(n)}</option>`).join('');
+  return `
+    <label class="bs-label">厂商</label>
+    <select class="bs-input" id="bs-provider"><option value="">自定义 / 中转站</option>${provOpts}</select>
+    <div class="hint" id="bs-provider-note"></div>
+    <label class="bs-label">接口地址（要填到 /v1 为止）</label>
+    <input class="bs-input" id="bs-baseUrl" value="${esc(prof.baseUrl ?? '')}" placeholder="https://open.bigmodel.cn/api/paas/v4" spellcheck="false" />
+    <label class="bs-label">模型名</label>
+    <div class="bs-inline">
+      <input class="bs-input" id="bs-model" value="${esc(prof.model ?? '')}" placeholder="glm-4.5-flash" spellcheck="false" />
+      <button class="btn btn-sm" id="bs-models">拉列表</button>
+    </div>
+    <label class="bs-label">密钥（存过就留空）</label>
+    <input class="bs-input" id="bs-apiKey" type="password" placeholder="粘一次就行，之后留空" autocomplete="off" spellcheck="false" />
+    <div class="hint" id="bs-key-hint"></div>
+    <label class="bs-label">人格</label>
+    <select class="bs-input" id="bs-role"><option value="">（不用人格卡）</option>${roleOpts}</select>
+    <div class="hint">模型和人格都是改完自动保存（停手 1 秒），不用找保存按钮。</div>
+    <div class="result" id="bs-result-2"></div>`;
+}
+
+function bsStartHtml() {
+  const wx = platform() === 'wechat';
+  return `
+    <div class="bs-actions"><button class="btn btn-primary" id="bs-start-run">启动这个机器人</button></div>
+    <div id="bs-start-steps"></div>
+    <p class="hint">启动完，用手机${wx ? '微信' : 'QQ'}给机器人发一句话试试。收发会出现在下面（几秒刷一次）。</p>
+    <div class="bs-msgs" id="bs-msgs"></div>
+    <div class="result" id="bs-result-3"></div>`;
+}
+
+function bindBotSheet() {
+  const step = botSheetStep;
+  if (step === 0) {
+    $('#bs-napcat-open')?.addEventListener('click', () => openNapcatPanel());
+    $('#bs-wx-start')?.addEventListener('click', async (e) => {
+      await busy(e.target.closest('button'), '启动中…', async () => {
+        const r = await post('/api/bots/start', { platform: 'wechat' });
+        renderBsSteps($('#bs-result-0'), r);
+        await refreshState();
+      });
+    });
+  } else if (step === 1) {
+    $('#bs-imp-scan')?.addEventListener('click', async (e) => {
+      const text = $('#bs-imp-text').value;
+      if (!text.trim()) return setResult('#bs-result-1', '先粘点东西进来', 'err');
+      await busy(e.target.closest('button'), '识别中…', async () => {
+        const r = await post('/api/providers/import', { text, apply: false });
+        if (r.ok === false) return setResult('#bs-result-1', r.error, 'err');
+        bsImpReport = r.report ?? [];
+        renderImportReport(bsImpReport, $('#bs-imp-report'));
+        const good = bsImpReport.filter((x) => x.env && !x.dup).length;
+        setResult('#bs-result-1', `识别 ${bsImpReport.length} 行，可导入 ${good} 行 —— 确认后点「确认写入」`, 'ok');
+        $('#bs-imp-apply').hidden = false;
+      });
+    });
+    $('#bs-imp-apply')?.addEventListener('click', async (e) => {
+      const text = $('#bs-imp-text').value;
+      if (!text.trim()) return setResult('#bs-result-1', '先粘点东西进来', 'err');
+      const items = bsImpReport ? collectImportItems($('#bs-imp-report')) : [];
+      const ok = await confirmBox({
+        title: '写入这些 key？',
+        text: '会把 key 存进 secrets.json（明文，和现有 key 放一起）。已经存在的 key 会跳过。',
+        list: bsImpReport ? bsImpReport.filter((x) => !x.dup).slice(0, 6).map((x) => `${x.env || '（未指定）'} ← ${x.keyMasked}`) : [],
+        okLabel: '写入'
+      });
+      if (!ok) return;
+      await busy(e.target.closest('button'), '写入中…', async () => {
+        const r = await post('/api/providers/import', { text, apply: true, items });
+        if (r.ok === false) return setResult('#bs-result-1', r.error, 'err');
+        setResult('#bs-result-1', `写入了 ${r.applied} 条 ✓`, 'saved');
+        await refreshState();
+      });
+    });
+  } else if (step === 2) {
+    bindBsModelRole();
+  } else if (step === 3) {
+    $('#bs-start-run')?.addEventListener('click', async (e) => {
+      await busy(e.target.closest('button'), '启动中…', async () => {
+        const r = await post('/api/bots/start', { platform: platform() });
+        renderBsSteps($('#bs-start-steps'), r);
+        await refreshState();
+      });
+    });
+  }
+}
+
+function renderBsSteps(box, r) {
+  if (!box) return;
+  const steps = Array.isArray(r?.steps) ? r.steps : [];
+  if (steps.length) {
+    box.innerHTML = steps
+      .map((s) => `<div class="bs-step ${s.ok ? 'ok' : 'bad'}"><span>${s.ok ? '✓' : '✗'}</span><strong>${esc(s.name)}</strong><span class="bs-step-detail">${esc(s.detail ?? '')}</span></div>`)
+      .join('');
+  } else if (r?.ok === false) {
+    box.innerHTML = `<div class="bs-step bad"><span>✗</span><strong>启动失败</strong><span class="bs-step-detail">${esc(r.error ?? '')}</span></div>`;
+  }
+}
+
+/* 第二步：模型 + 人格（复用模型页的自动保存链与字段语义，聊天档不给工具） */
+function bsCollect() {
+  const pf = platform();
+  const id = $('#bs-provider').value;
+  const p = providerById(id);
+  const out = {
+    provider: id || undefined,
+    protocol: p?.protocol ?? S?.backend?.profiles?.[pf]?.chat?.protocol ?? 'openai',
+    baseUrl: $('#bs-baseUrl').value.trim(),
+    model: $('#bs-model').value.trim()
+  };
+  for (const k of Object.keys(out)) if (out[k] === undefined || out[k] === '') delete out[k];
+  return out;
+}
+
+function updateBsKeyHint() {
+  const el = $('#bs-key-hint');
+  if (!el) return;
+  const p = providerById($('#bs-provider')?.value);
+  const env = p?.keyEnv;
+  if (!env) {
+    el.textContent = '自定义接入：key 会存进 secrets.json，界面上只显示有没有，不回显内容。';
+    return;
+  }
+  el.textContent = secretSet(env) ? `已保存 ${env}（留空 = 继续用已存的）` : `还没存 ${env}。粘进来保存一次就行，之后留空。`;
+}
+
+async function bsSaveModel() {
+  const pf = platform();
+  const data = bsCollect();
+  if (!data.baseUrl && !data.model) return;
+  const mark = sig(data) + '|' + $('#bs-apiKey').value;
+  if (autoSavedSig.get(`bs-slot-${pf}`) === mark) return;
+  const p = providerById($('#bs-provider').value);
+  const key = $('#bs-apiKey').value.trim();
+  if (key && p?.keyEnv) {
+    const sr = await post('/api/secrets', { [p.keyEnv]: key });
+    if (sr.ok === false) return setResult('#bs-result-2', sr.error ?? '保存密钥失败', 'err');
+  }
+  data.allowTools = false; // 引导配的是「普通聊天」档：只说话，不给工具
+  if (!modelProfiles[pf]) modelProfiles[pf] = {};
+  modelProfiles[pf].chat = data;
+  const r = await post('/api/model-profiles', { profiles: modelProfiles });
+  $('#bs-apiKey').value = '';
+  if (r.ok === false) return setResult('#bs-result-2', r.error ?? '保存失败', 'err');
+  if (r.regenerated === false) return setResult('#bs-result-2', `已保存，但生成配置失败：${r.regenError ?? '看日志'}`, 'err');
+  autoSavedSig.set(`bs-slot-${pf}`, mark);
+  setResult('#bs-result-2', r.botsRestarted ? '已保存 ✓ 服务已重启生效' : '已保存 ✓ 下次服务启动生效', 'saved');
+  await refreshState();
+}
+
+async function bsSaveRole() {
+  const r = await post(`/api/role?platform=${platform()}`, { role: $('#bs-role').value || null });
+  if (r.ok === false) setResult('#bs-result-2', r.error, 'err');
+}
+
+function bindBsModelRole() {
+  const kick = () => scheduleAutoSave('bs-slot', () => bsSaveModel());
+  for (const id of ['#bs-provider', '#bs-baseUrl', '#bs-model', '#bs-apiKey']) {
+    $(id)?.addEventListener('change', kick);
+    $(id)?.addEventListener('input', kick);
+  }
+  $('#bs-provider')?.addEventListener('change', () => {
+    const p = providerById($('#bs-provider').value);
+    $('#bs-provider-note').textContent = p?.note ?? (p ? '' : '自己填地址：要填到 /v1 为止，例如 https://your-relay.com/v1');
+    if (p?.baseUrl) $('#bs-baseUrl').value = p.baseUrl;
+    if (p?.models?.length && !$('#bs-model').value.trim()) $('#bs-model').value = p.models[0];
+    updateBsKeyHint();
+  });
+  $('#bs-models')?.addEventListener('click', async (e) => {
+    await busy(e.target.closest('button'), '…', async () => {
+      const payload = bsCollect();
+      const key = $('#bs-apiKey').value.trim();
+      if (key) payload.apiKey = key;
+      const r = await post('/api/models', payload);
+      if (r.ok === false) return setResult('#bs-result-2', r.error, 'err');
+      const models = r.models ?? [];
+      if (!models.length) return setResult('#bs-result-2', '服务端没返回模型列表', 'err');
+      const pick = await openModal({
+        title: `这个地址下有 ${models.length} 个模型`,
+        text: '点一个填进「模型名」。',
+        choices: models.slice(0, 200).map((m) => ({ value: m, label: m }))
+      });
+      if (pick) {
+        $('#bs-model').value = pick;
+        toast(`已选 ${pick}`);
+        scheduleAutoSave('bs-slot', () => bsSaveModel());
+      }
+    });
+  });
+  $('#bs-role')?.addEventListener('change', () => scheduleAutoSave('bs-role', () => bsSaveRole()));
+  updateBsKeyHint();
+}
+
+/* 面板开着时的实时刷新：只动状态位，不重建表单（不然打字会被打断） */
+function updateBotSheetLive() {
+  if (botSheetStep === null) return;
+  const wx = platform() === 'wechat';
+  if (botSheetStep === 0) {
+    if (wx) {
+      const w = S?.wechat ?? {};
+      const st = $('#bs-wx-state');
+      if (st) st.textContent = w.loggedIn ? `已登录${w.botId ? `（${w.botId}）` : ''}` : w.running ? '在跑，等扫码' : '未启动';
+      const img = $('#bs-wx-qr');
+      if (img) {
+        if (w.qr) {
+          if (img.getAttribute('src') !== w.qr) img.src = w.qr;
+          img.hidden = false;
+        } else {
+          img.hidden = true;
+        }
+      }
+      const qs = $('#bs-wx-qr-status');
+      if (qs) qs.textContent = w.qr ? (w.qrStatus === 'scanned' ? '已扫码，请在手机上确认' : '用手机微信扫一扫') : '';
+      const btn = $('#bs-wx-start');
+      if (btn) btn.hidden = w.loggedIn === true;
+    } else {
+      const st = $('#bs-napcat-state');
+      if (st) st.textContent = S?.napcat?.reachable ? '已连接' : '未连接';
+    }
+  } else if (botSheetStep === 3) {
+    refreshBsMessages();
+  }
+}
+
+async function refreshBsMessages() {
+  const box = $('#bs-msgs');
+  if (!box) return;
+  const r = await api(`/api/messages?platform=${platform()}&limit=8`);
+  if (!r || r.ok === false) return;
+  const entries = (r.entries ?? []).slice(-8);
+  box.innerHTML = entries.length
+    ? entries
+        .map(
+          (e) => `<div class="bs-msg ${e.self ? 'self' : ''}"><span class="bs-msg-clock">${esc(e.clock)}</span><span class="bs-msg-who">${esc(e.who)}</span><span class="bs-msg-text">${esc(String(e.text ?? '').slice(0, 90))}</span></div>`
+        )
+        .join('')
+    : '<div class="hint">还没有消息往来 —— 发一条试试。</div>';
+}
 
 async function loadOverview() {
   await refreshState();
@@ -1215,13 +1565,15 @@ $('#btn-refresh').addEventListener('click', () => loadOverview());
 $('#btn-goto-backend').addEventListener('click', () => showPage('backend'));
 
 async function openNapcatPanel() {
-  const r = await api('/api/napcat/panel');
+  const r = await api('/api/napcat/window');
   if (!r.ok) {
     toast(r.error ?? '拿不到 NapCat 面板地址 —— NapCat 可能还没装/没启动，先去「高级」页配好');
     wizardGo('qq', 'advanced');
     return false;
   }
-  window.open(r.url, '_blank');
+  // inApp = Electron 主进程开了子窗口；裸跑（浏览器模式）回落到新标签
+  if (r.inApp) toast('NapCat 面板已在应用内打开（扫码 / 快登都在里面）');
+  else window.open(r.url, '_blank');
   return true;
 }
 
@@ -1780,8 +2132,7 @@ $('#btn-save-pool').addEventListener('click', async (e) => {
 /* 批量导入 */
 let impReport = null;
 
-function renderImportReport(report) {
-  const box = $('#imp-report');
+function renderImportReport(report, box = $('#imp-report')) {
   if (!report?.length) {
     box.innerHTML = '';
     return;
@@ -1812,8 +2163,9 @@ function renderImportReport(report) {
   </table>`;
 }
 
-function collectImportItems() {
-  return $$('#imp-report tr[data-index]').map((tr) => ({
+function collectImportItems(scope = document) {
+  const rootEl = typeof scope === 'string' ? $(scope) : scope;
+  return $$('tr[data-index]', rootEl ?? document).map((tr) => ({
     index: Number(tr.dataset.index),
     provider: $('[data-imp="provider"]', tr).value,
     env: $('[data-imp="env"]', tr).value.trim()

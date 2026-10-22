@@ -80,7 +80,7 @@ async function createWindow() {
     height: 740,
     minWidth: 940,
     minHeight: 620,
-    backgroundColor: '#0d0f13',
+    backgroundColor: '#f4f6f9',
     title: 'DualHabitat Matrix',
     // 窗口/任务栏图标。不给的话标题栏和任务栏显示的是 Electron 默认的原子球。
     icon: path.join(here, 'public', 'icon.png'),
@@ -180,6 +180,33 @@ function createTray() {
   tray.on('click', showWindow);
   tray.on('double-click', showWindow);
 }
+
+/**
+ * 应用内子窗口（NapCat 面板等本地页面）。
+ *
+ * 以前「扫码 / 登录」是 window.open → 被 setWindowOpenHandler 交给系统浏览器，
+ * 人直接离开了应用。现在 server.mjs 通过 globalThis.dhmOpenChildWindow 调这里，
+ * 在应用里开一个独立小窗口。裸跑（node server.mjs）没有这段，server 会自己降级。
+ */
+function openChildWindow(url, title) {
+  if (!app.isReady()) return null;
+  const child = new BrowserWindow({
+    width: 1020,
+    height: 720,
+    title: title ?? '子窗口',
+    backgroundColor: '#ffffff',
+    autoHideMenuBar: true,
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true }
+  });
+  child.webContents.setWindowOpenHandler(({ url: target }) => {
+    if (/^https?:/.test(target)) shell.openExternal(target);
+    return { action: 'deny' };
+  });
+  child.loadURL(url);
+  return child.id;
+}
+
+globalThis.dhmOpenChildWindow = openChildWindow;
 
 // 同一时间只允许一个实例，否则两个窗口抢同一个端口和同一个桥接进程
 if (!app.requestSingleInstanceLock()) {
