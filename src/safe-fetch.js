@@ -156,7 +156,7 @@ function validateLimit(value, name) {
 
 // 使用已校验的 IP 发起请求，保留原始 Host/SNI，禁止重新解析 DNS。
 // 总时限包含 TCP/TLS、响应头和响应体；仅 socket idle timeout 无法阻止慢速滴流。
-function requestOnce(url, ip, limit, binary = false) {
+function requestOnce(url, ip, limit, binary = false, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let req;
@@ -176,18 +176,22 @@ function requestOnce(url, ip, limit, binary = false) {
     }, REQUEST_TIMEOUT_MS);
     const mod = url.protocol === 'https:' ? https : http;
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
+    // 允许调用方补 UA / Referer / Cookie（B 站和抖音的 CDN 都会校验这几个头）。
+    // host 必须最后写，避免调用方误改 Host 造成 SNI/证书不匹配。
+    const headers = {
+      'user-agent': 'Mozilla/5.0',
+      accept: binary ? '*/*' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'zh-CN,zh;q=0.9',
+      ...extraHeaders,
+      host: url.host,
+    };
     try {
       req = mod.request({
         hostname: ip,
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
         path: url.pathname + url.search,
         method: 'GET',
-        headers: {
-          host: url.host,
-          'user-agent': 'Mozilla/5.0',
-          accept: binary ? 'image/*,*/*;q=0.8' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'accept-language': 'zh-CN,zh;q=0.9',
-        },
+        headers,
         servername: url.protocol === 'https:' && !net.isIP(hostname) ? hostname : undefined,
         rejectUnauthorized: url.protocol === 'https:',
         timeout: REQUEST_TIMEOUT_MS,
@@ -224,7 +228,7 @@ function requestOnce(url, ip, limit, binary = false) {
           if (!binary) { appendText(decoder.write(chunk)); return; }
           size += chunk.length;
           if (size > limit) {
-            finish(new Error(`图片超过大小限制（${limit} 字节）`));
+            finish(new Error(`内容超过大小限制（${limit} 字节）`));
             res.destroy();
             return;
           }
@@ -254,12 +258,12 @@ function requestOnce(url, ip, limit, binary = false) {
   });
 }
 
-export async function safeFetch(urlString, maxChars = 50000) {
+export async function safeFetch(urlString, maxChars = 50000, options = {}) {
   validateLimit(maxChars, 'maxChars');
   const MAX_REDIRECTS = 5;
   let { url, ip } = await validateFetchUrl(urlString);
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, ip, maxChars);
+    const result = await requestOnce(url, ip, maxChars, false, options.headers);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
@@ -277,6 +281,30 @@ export async function safeFetch(urlString, maxChars = 50000) {
   throw new Error('重定向次数过多，已停止');
 }
 
+/**
+ * 抓取任意二进制（视频/音频/图片），带 SSRF 防护、重定向逐跳校验和字节上限。
+ * 与 safeFetchBuffer 的区别：不校验图片签名，供视频下载使用。
+ */
+export async function safeFetchBinary(urlString, maxBytes = 8 * 1024 * 1024, options = {}) {
+  validateLimit(maxBytes, 'maxBytes');
+  const MAX_REDIRECTS = 5;
+  let { url, ip } = await validateFetchUrl(urlString);
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    const result = await requestOnce(url, ip, maxBytes, true, options.headers);
+    if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
+      if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
+      const next = new URL(result.redirect, url).toString();
+      ({ url, ip } = await validateFetchUrl(next));
+      continue;
+    }
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      throw new Error(`二进制抓取失败：HTTP ${result.statusCode}`);
+    }
+    return { url: url.toString(), statusCode: result.statusCode, buffer: result.buffer };
+  }
+  throw new Error('重定向次数过多，已停止');
+}
+
 /** 仅接受 DSH 支持的四种图片格式：PNG/JPEG/GIF/WebP。 */
 export function looksLikeImageBuffer(buf) {
   if (!buf || buf.length < 12) return false;
@@ -288,25 +316,11 @@ export function looksLikeImageBuffer(buf) {
 }
 
 /** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
-export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024) {
-  validateLimit(maxBytes, 'maxBytes');
-  const MAX_REDIRECTS = 5;
-  let { url, ip } = await validateFetchUrl(urlString);
-  for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, ip, maxBytes, true);
-    if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
-      if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
-      const next = new URL(result.redirect, url).toString();
-      ({ url, ip } = await validateFetchUrl(next));
-      continue;
-    }
-    if (result.statusCode < 200 || result.statusCode >= 300) {
-      throw new Error(`图片抓取失败：HTTP ${result.statusCode}`);
-    }
-    if (!looksLikeImageBuffer(result.buffer)) {
-      throw new Error(`抓取内容不是有效图片（PNG/JPEG/GIF/WebP）`);
-    }
-    return { url: url.toString(), statusCode: result.statusCode, buffer: result.buffer };
+export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024, options = {}) {
+  const result = await safeFetchBinary(urlString, maxBytes, options);
+  if (!looksLikeImageBuffer(result.buffer)) {
+    throw new Error(`抓取内容不是有效图片（PNG/JPEG/GIF/WebP）`);
   }
-  throw new Error('重定向次数过多，已停止');
+  return result;
 }
+

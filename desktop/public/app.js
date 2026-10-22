@@ -1078,7 +1078,9 @@ function wizardSteps() {
   const hasKey = (S.secrets ?? []).some((x) => x.set);
   const prof = S.backend?.profiles?.[platform()]?.chat ?? null;
   const hasSource = Boolean((prof?.baseUrl && prof?.model) || (!wx && S.backend?.modelApi?.baseUrl && S.backend?.modelApi?.model));
-  const running = wx ? S.wechat?.running === true : Boolean(S.bridge?.running || S.napcat?.reachable === true);
+  // 第 4 步是“开起来，发条消息试”：通道就绪（NapCat 连着）不等于机器人已经在回话，
+  // 必须桥接/微信通道自己在跑，才算走完。
+  const running = wx ? S.wechat?.running === true : S.bridge?.running === true;
   if (wx) {
     return [
       { title: '登录微信', desc: '点「去扫码」——这里直接启动微信接入并就地显示二维码，手机微信扫一下', done: S.wechat?.running === true, go: () => openBotSheet(0), btn: '去扫码' },
@@ -1860,6 +1862,41 @@ async function loadModelProfiles() {
   }
 }
 
+/* 推理等级（全局）：config.json 的 dsh.reasoningEffort。
+ * 桥接在跑时走它的热切换接口，下一条消息生效；没跑就只写配置，下次启动生效。 */
+async function loadReasoning() {
+  const sel = $('#reasoning-effort');
+  const hint = $('#reasoning-hint');
+  if (!sel) return;
+  const r = await api('/api/reasoning');
+  if (r?.ok === false) {
+    if (hint) hint.textContent = r.error ?? '读取失败';
+    return;
+  }
+  sel.value = r.effort ?? 'max';
+  if (hint) hint.textContent = `当前 ${sel.value}。改完自动保存，下一条消息生效。`;
+}
+
+async function saveReasoning() {
+  const sel = $('#reasoning-effort');
+  const hint = $('#reasoning-hint');
+  if (!sel) return;
+  const effort = sel.value;
+  if (hint) hint.textContent = '保存中…';
+  const r = await post('/api/reasoning', { effort });
+  if (r?.ok === false) {
+    if (hint) hint.textContent = r.error ?? '保存失败';
+    return;
+  }
+  if (hint) {
+    hint.textContent = r.applied === false
+      ? `已保存 ${effort}，桥接下次启动生效`
+      : `已保存 ${effort}，下一条消息生效`;
+  }
+}
+
+$('#reasoning-effort')?.addEventListener('change', saveReasoning);
+
 function profileOf(slot) {
   return modelProfiles?.[platform()]?.[slot] ?? null;
 }
@@ -2244,6 +2281,7 @@ async function loadModels() {
   buildSlotPanels();
   bindSlotEvents();
   await loadModelProfiles();
+  await loadReasoning();
   fillAllSlots();
   for (const def of SLOT_DEFS) renderLocalServers(def.key);
 

@@ -147,7 +147,8 @@
       "stickerNote": false,
       "collectSticker": false,
       "getSelfImage": false,
-      "sendVoice": false
+      "sendVoice": false,
+      "video": true
     },
     "wake": {
       "defaultMode": "diving",
@@ -256,6 +257,22 @@
       "wakeMessageLimit": 12,
       "wakeRecentLimit": 4,
       "wakeMaxChars": 6000
+    },
+    "images": {
+      "_comment": "哪些模型能真看图片。不在这里的一律只给文字占位，避免纯文本模型收到图片块直接 400。",
+      "visionModels": [
+        "qwen3-vl-plus",
+        "qwen3.8-max",
+        "deepseek-flash"
+      ],
+      "placeholder": "【图片信息】"
+    },
+    "video": {
+      "_comment": "抖音/B站视频：下载上限、抽帧数量；ffmpegPath/browserPath 留空则自动找 PATH / Edge/Chrome。",
+      "maxDownloadBytes": 83886080,
+      "frames": 4,
+      "ffmpegPath": "",
+      "browserPath": ""
     }
   }
 }

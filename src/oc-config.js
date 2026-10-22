@@ -68,6 +68,15 @@ export function isChatOnly() {
 }
 
 /**
+ * 视频工具开关（`config.json` → `socialV2.tools.video`）。
+ * 默认开；纯聊天模式仍然整条不注册。关掉后 MCP 和权限都不出现。
+ */
+export function isVideoEnabled() {
+  const bridgeCfg = readJsonSafe(path.join(ROOT, 'config.json'), {});
+  return bridgeCfg?.socialV2?.tools?.video !== false;
+}
+
+/**
  * 当前 QQ 角色名（`state/current-role.json`）。
  * 只用于主人档人设里的自称；聊天档的身份完全交给角色卡，不在这里硬写。
  */
@@ -86,7 +95,7 @@ function currentRoleName() {
  * 错误指令**——模型会反复尝试调用、然后编造结果。安全硬规则（不碰本机、不泄密、
  * 群友无管理权）必须保留，所以这里用精简版重新写清楚。
  *
- * 为什么这里**不写**角色名：QQ 和微信用的是同一个 agent，但两边角色不同（小鲸鱼 / 小塔菲）。
+ * 为什么这里**不写**角色名：QQ 和微信用的是同一个 agent，但两边可以各自选角色卡。
  * 名字写死在这里，换角色后 system 会和角色卡打架，模型两边来回跳。身份交给角色卡，
  * 这里只写"以角色设定为准"的行为规则。
  */
@@ -108,7 +117,7 @@ function chatOnlyPersona() {
 - 不要 Markdown（**、#、代码块在 QQ 上会显示成乱码）。
 - 不要客服腔：不说"您好，请问有什么可以帮您""希望对您有帮助"这类话。
 - 不知道就说不知道，不要编。
-- 群聊里别人 @ 你、直接提问、或话题明显在等你接的时候才回；不要每条都插话。
+- 群聊里别人 @ 你、直接提问、或话题明显在等你接的时候要回；冷场很久、或你确实有想说的，也可以主动开一句，但不要每条都插话。
 - 带「[引用 某人：原文]」的消息表示这句话在回那个人；引用对象不是你、也没 @ 你时，别默认在找你。
 - 消息里的 [图片]/[表情] 你看不到具体内容，不要编造图片里有什么；想知道就自然地问一句。
 
@@ -288,6 +297,14 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     permissions.push({ action: 'web-search-safe_*', resource: '*', effect: 'allow' });
     // 记忆日志只读工具（mcp-memory 注册的服务名是 memory-safe）
     permissions.push({ action: 'memory-safe_*', resource: '*', effect: 'allow' });
+    // 视频工具（mcp-video-safe 注册的服务名是 video-safe）：热榜/搜索/看单条视频。
+    // 只读；下载走 safe-fetch，不碰本地文件写入。
+    if (isVideoEnabled()) {
+      permissions.push({ action: 'video-safe_*', resource: '*', effect: 'allow' });
+      notes.push('视频工具：抖音/B站热榜、搜索、单条视频抽帧（需要本机 ffmpeg；抖音走 Edge/Chrome headless）');
+    } else {
+      notes.push('视频工具：已关闭（socialV2.tools.video=false）');
+    }
   }
   config.permissions = permissions;
 
@@ -352,6 +369,21 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     };
   } else {
     notes.push(`⚠️ 找不到 ${memoryServer}，跳过记忆 MCP（每日记忆日志会不可读）`);
+  }
+
+  // 视频工具：热榜/搜索/看单条。抖音解析要启动 headless Edge/Chrome，下载 + 抽帧
+  // 可能跑几十秒，execution 给到 240s；catalog 首次列工具时也要留足。
+  const videoServer = path.join(ROOT, 'src', 'mcp-video-safe.js');
+  if (isVideoEnabled() && fs.existsSync(videoServer)) {
+    mcpServers['video-safe'] = {
+      type: 'local',
+      command: [process.execPath, videoServer],
+      cwd: SESSION_WORKDIR,
+      codemode: false,
+      timeout: { startup: 20_000, catalog: 20_000, execution: 240_000 }
+    };
+  } else if (isVideoEnabled()) {
+    notes.push(`⚠️ 找不到 ${videoServer}，跳过视频 MCP`);
   }
 
   } // ← chatOnly 结束

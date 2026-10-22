@@ -1308,7 +1308,7 @@ async function segmentsToText(segments, options = {}) {
         }
         break;
       }
-      case 'face': out.push(`[表情${d.id ?? ''}]`); break;
+      case 'face': out.push(facePreviewText(d)); break;
       case 'image': out.push('[图片]'); break;
       case 'record': out.push('[语音]'); break;
       case 'video': out.push('[视频]'); break;
@@ -1371,11 +1371,84 @@ function extractMediaFromSegments(segments) {
     } else if (seg.type === 'face') {
       media.push({
         kind: 'face',
-        faceId: String(d.id ?? '')
+        faceId: String(d.id ?? ''),
+        // 网关偶尔会带表情的中文名/摘要（不同实现字段不同），有就直接用，
+        // 没有就查下面的内置表；再不行才退回 fetch_face_entity。
+        summary: String(d.summary ?? d.faceText ?? d.name ?? '')
       });
     }
   }
   return media;
+}
+
+/**
+ * QQ 内置表情 id → 中文名。
+ *
+ * 为什么需要本地表：`[表情178]` 对模型没有任何语义（它只能猜），而
+ * `fetch_face_entity` / `fetch_sys_faces` 是 SnowLuma 扩展 API，NapCat 直接回
+ * 「不支持的API」——实测每条带表情的消息都会刷一条失败日志，而且永远拿不到名字。
+ * 内置表覆盖 QQ 经典表情 0~104 + 两个高频新表情（178 捂脸 / 179 doge），
+ * 命中就不发网络请求；未收录的 id 仍走网关查询，查不到就保留 id。
+ */
+const QQ_FACE_NAMES = {
+  0: '惊讶', 1: '撇嘴', 2: '色', 3: '发呆', 4: '得意', 5: '流泪', 6: '害羞', 7: '闭嘴',
+  8: '睡', 9: '大哭', 10: '尴尬', 11: '发怒', 12: '调皮', 13: '呲牙', 14: '微笑', 15: '难过',
+  16: '酷', 17: '冷汗', 18: '抓狂', 19: '吐', 20: '偷笑', 21: '可爱', 22: '白眼', 23: '傲慢',
+  24: '饥饿', 25: '困', 26: '惊恐', 27: '流汗', 28: '憨笑', 29: '大兵', 30: '奋斗', 31: '咒骂',
+  32: '疑问', 33: '嘘', 34: '晕', 35: '折磨', 36: '衰', 37: '骷髅', 38: '敲打', 39: '再见',
+  40: '擦汗', 41: '抠鼻', 42: '鼓掌', 43: '糗大了', 44: '坏笑', 45: '左哼哼', 46: '右哼哼',
+  47: '哈欠', 48: '鄙视', 49: '委屈', 50: '快哭了', 51: '阴险', 52: '亲亲', 53: '吓',
+  54: '可怜', 55: '菜刀', 56: '西瓜', 57: '啤酒', 58: '篮球', 59: '乒乓', 60: '咖啡',
+  61: '饭', 62: '猪头', 63: '玫瑰', 64: '凋谢', 65: '示爱', 66: '爱心', 67: '心碎',
+  68: '蛋糕', 69: '闪电', 70: '炸弹', 71: '刀', 72: '足球', 73: '瓢虫', 74: '便便',
+  75: '月亮', 76: '太阳', 77: '礼物', 78: '拥抱', 79: '强', 80: '弱', 81: '握手',
+  82: '胜利', 83: '抱拳', 84: '勾引', 85: '拳头', 86: '差劲', 87: '爱你', 88: 'NO',
+  89: 'OK', 90: '爱情', 91: '飞吻', 92: '跳跳', 93: '发抖', 94: '怄火', 95: '转圈',
+  96: '磕头', 97: '回头', 98: '跳绳', 99: '挥手', 100: '激动', 101: '街舞', 102: '献吻',
+  103: '左太极', 104: '右太极', 178: '捂脸', 179: 'doge'
+};
+
+/** 表情段 → 给模型看的文字。有中文名就用名字，没有才退回 id。 */
+function facePreviewText(data) {
+  const id = String(data?.id ?? '');
+  const name = String(data?.summary ?? data?.faceText ?? data?.name ?? '').trim()
+    || QQ_FACE_NAMES[id]
+    || '';
+  return name ? `[表情:${name}]` : `[表情${id}]`;
+}
+
+/**
+ * 模型输出清洗：把内部标记挡在 QQ 之外（**只作用于出站文本**）。
+ *
+ * 实测（deepseek-flash / openrouter free 都会）模型会把审核状态当正文吐出来：
+ *   `User Safety: safe` / `Response Safety: safe`
+ * 还有括号内心戏、以「？」开头的半截话。这些不是给人看的内容，出现在群里就是事故。
+ * 处理原则：能确定是内部标记的就剥掉，拿不准的内容一律保留（宁可少删，不可误删正文）。
+ */
+function sanitizeAgentText(input) {
+  let s = String(input ?? '');
+  // 零宽字符：模型/复制粘贴会带进来，QQ 上不可见但会污染匹配
+  s = s.replace(/[\u200b\u200c\u200d\ufeff]/g, '');
+
+  // 1) 审核/安全标记：整行、以及粘在正文尾部/开头的单行标记
+  s = s.split(/\r?\n/)
+    .filter((line) => !/^\s*(?:user|response)\s*safety\s*[:：]/i.test(line))
+    .join('\n');
+  s = s.replace(/[ \t]*(?:user|response)\s*safety\s*[:：][^\n]*/gi, '');
+
+  // 2) 括号旁白：整行只有一对括号的内容直接丢掉；开头的括号旁白剥掉、保留后面的正文
+  s = s.split(/\r?\n/)
+    .filter((line) => {
+      const t = line.trim();
+      return !/^[（(][^（）()]{0,300}[）)]$/.test(t);
+    })
+    .join('\n');
+  s = s.replace(/^[ \t]*[（(][^（）()]{1,300}[）)][ \t]*/, '');
+
+  // 3) 行首多余的问号（内部标记/半截话），只在后面还有文字时去掉
+  s = s.replace(/^[ \t]*[？?]+(?=\S)/, '');
+
+  return s.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function allowed(kind, id, cfg) {
@@ -7264,7 +7337,7 @@ async function main() {
       // 每日记忆日志：机器人发出去的也记（按当前角色）
       try {
         appendMemory({
-          root: ROOT, channel: 'qq', role: roleState.role,
+          root: ROOT, channel: 'qq', role: readRoleState().role,
           conv: key, who: 'bridge', self: true, text: safeMsg
         });
       } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }
@@ -7695,9 +7768,16 @@ async function main() {
     return null;
   }
 
+  // 网关不支持表情实体查询时（NapCat 实测会回「不支持的API fetch_face_entity」）只提示一次：
+  // 每条带表情的消息都打一条失败日志，既刷屏又让人以为功能坏了。
+  let faceEntityUnsupported = false;
+
   async function fetchFaceMedia(media) {
     const faceId = Number(media.faceId);
     if (!Number.isInteger(faceId)) return { text: `[表情#${media.faceId}]` };
+    const localName = String(media.summary ?? '').trim() || QQ_FACE_NAMES[String(faceId)] || '';
+    if (localName) return { text: `[表情:${localName}]` };
+    if (faceEntityUnsupported) return { text: `[表情#${faceId}]` };
     try {
       const face = await bot.fetchFaceEntity(faceId);
       if (face && typeof face === 'object') {
@@ -7718,7 +7798,13 @@ async function main() {
         return { text: desc ? `[表情:${desc}]` : `[表情#${media.faceId}]` };
       }
     } catch (error) {
-      log(`fetchFaceEntity 失败: ${error?.message ?? error}`);
+      const msg = String(error?.message ?? error);
+      if (/不支持/.test(msg)) {
+        faceEntityUnsupported = true;
+        log('当前网关不支持表情实体查询（fetch_face_entity），改用内置表情名表');
+      } else {
+        log(`fetchFaceEntity 失败: ${msg}`);
+      }
     }
     return { text: `[表情#${media.faceId}]` };
   }
@@ -7975,6 +8061,7 @@ async function main() {
 
   // 统一出站消息：先完整文本审计，再发送。返回是否真的发出。
   async function auditAndSend(key, text) {
+    text = sanitizeAgentText(text);
     const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && String(text ?? '').includes(t));
     if (shouldAuditKey(key) && (SENSITIVE_RE.test(text) || hasKnownToken)) {
       log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
@@ -8901,9 +8988,15 @@ async function main() {
   function buildProactivePrompt(key, roleHint) {
     let p = '';
     if (roleHint) p += roleHint + '\n\n';
-    p += `【群聊上下文】\n${buildContextBlock(key)}\n\n群内已经长时间没人说话了，你打算开启一个新话题。优先结合你的人格/角色设定的兴趣，其次结合群里大家的兴趣，挑一个合适的话题。可以联网搜索一些新鲜话题来聊。如果你觉得现在不适合开口，可以只输出 ${SILENT_MARKER}。\n${SPACE_SPLIT_HINT}`;
+    p += `【群聊上下文】\n${buildContextBlock(key)}\n\n群内已经长时间没人说话了，你打算开启一个新话题。优先结合你的人格/角色设定的兴趣，其次结合群里大家的兴趣，挑一个合适的话题。可以联网搜索一些新鲜话题来聊；如果这次工具里有视频能力，也可以先刷刷抖音/B站热榜，挑一条你真正看过画面的视频来聊（没看到画面就别编内容）。如果你觉得现在不适合开口，可以只输出 ${SILENT_MARKER}。\n${SPACE_SPLIT_HINT}`;
     return p;
   }
+
+  // 串行回合的阈值/时间戳放在这里（而不是 waitTurnIdle 旁边），确保任何早期投递
+  // 走到 waitTurnIdle 时它们已经初始化，不会踩 const 的 TDZ。
+  const TURN_BARRIER_TIMEOUT_MS = 120_000;
+  const TURN_BARRIER_GRACE_MS = 1500;
+  const turnAcceptedAt = new Map(); // sessionId -> 最近一次 prompt 被接受的时间
 
   // 实际的 DSH prompt 投递（不再直接对外暴露，统一走 promptQueues 串行队列）。
   async function deliverPromptNow(key, promptText, opts = {}) {
@@ -8962,7 +9055,11 @@ async function main() {
       const imageParts = await resolveMediaList(opts.media, { canSeeImages: sessionSeesImages(sessionId) });
       content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
     }
-    // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
+    // 串行回合：上一轮还在跑（或刚提交、turn/start 还没到）时先等它结束，
+    // 否则两条消息会挤进同一个回合，上下文和工具调用互相打架。
+    // 超时兜底在 waitTurnIdle 内部，真挂死也会放行，不会把队列永久卡住。
+    await waitTurnIdle(sessionId);
+    // 等待期间会话可能被重置/切模式，投递前再确认一次。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     if (opts.farewell) social.exitingSessions.add(sessionId);
     let accepted;
@@ -8981,6 +9078,9 @@ async function main() {
     }
     // 投递成功才记一轮：失败/被拒的消息不该把会话推向轮换上限。
     noteSessionTurn(key);
+    // 记下“刚提交”的时间，给 turn/start 事件到达前的窗口也算忙；
+    // waitTurnIdle 会用这个时间戳避免下一条消息在事件延迟时插队。
+    turnAcceptedAt.set(sessionId, Date.now());
     if (wakeSnapshot && isCurrentSession(key, sessionId)
         && socialV2.conversations.get(canonicalV2Key(key)) === wakeState
         && wakeState.agentToken === wakeToken) {
@@ -10314,6 +10414,7 @@ async function main() {
         log(`[reserved2] 回合超时未结束（${Math.round((Date.now() - startedAt) / 60000)} 分钟），清掉繁忙标记放行 ${key}`);
         v2TurnStartAt.delete(sid);
         collectors.delete(sid);
+        turnAcceptedAt.delete(sid);
         sendToolSucceededSessions.delete(sid);
         pendingSendToolCalls.delete(sid);
         toolCallNames.delete(sid);
@@ -10321,6 +10422,31 @@ async function main() {
       if (v2TurnStartAt.has(sid) || collectors.has(sid)) return true;
     }
     return false;
+  }
+
+  /* ── 回合级隔离 ──────────────────────────────────────────────────────────
+   * deliverPrompt 只保证「提交」按顺序，不保证「上一回合结束」。而
+   * sessions.prompt(mode:'queue') 会把后到的消息**并进正在跑的回合**——
+   * 表现就是：几个 @ 同时进来，AI 用一条 QQ 消息回答了三四句不同语境的话，
+   * 甚至把另一段对话的上下文串进来（实测 16:17:09 / 16:32:26 / 16:34:09）。
+   *
+   * 这里在提交前等上一回合的 turn/end（collectors 被清空），把「串行提交」
+   * 升级成「串行回合」。超时兜底：真遇到挂死回合也不能把队列永久卡住。
+   * ──────────────────────────────────────────────────────────────────────── */
+
+  async function waitTurnIdle(sessionId) {
+    const startedAt = Date.now();
+    for (;;) {
+      // 刚提交过、但 turn/start 事件还没到的窗口也算忙，避免两条消息抢同一个回合。
+      const acceptedAgo = Date.now() - (turnAcceptedAt.get(sessionId) ?? 0);
+      const busy = collectors.has(sessionId) || acceptedAgo < TURN_BARRIER_GRACE_MS;
+      if (!busy) return true;
+      if (Date.now() - startedAt >= TURN_BARRIER_TIMEOUT_MS) {
+        log(`等待上一回合结束超时（${Math.round(TURN_BARRIER_TIMEOUT_MS / 1000)}s），本次照常投递`);
+        return false;
+      }
+      await sleep(150);
+    }
   }
 
   const WAKE_PRIORITY = {
@@ -11329,7 +11455,7 @@ async function main() {
                 }
               }
               if (ended.reason.kind === 'completed' && ended.text.trim()) {
-                const plain = mdToPlain(ended.text);
+                const plain = sanitizeAgentText(mdToPlain(ended.text));
                 // 纯 Markdown/空白输出按“无文本”处理，避免后续 planSocialTimeline 拿空串崩溃。
                 if (!plain.trim()) {
                   log(`agent 回复为空（仅格式/空白）(${key})`);

@@ -943,6 +943,14 @@ const TOOL_GROUPS = [
     ]
   },
   {
+    id: 'video',
+    title: '视频 · 刷抖音/B站',
+    hint: '热榜/搜索/看单条。抖音要本机 Edge/Chrome，抽帧要 ffmpeg',
+    items: [
+      { flag: 'video', tool: 'video_hot / video_feed / video_search / video_watch', label: '视频工具', default: true, hint: '关掉后模型看不到视频 MCP' }
+    ]
+  },
+  {
     id: 'wake',
     title: '自己的状态',
     hint: '让模型自己决定什么时候睡、什么时候醒',
@@ -3280,6 +3288,26 @@ function bridgeConsole() {
 }
 
 /**
+ * 把思考强度推给正在跑的桥接（热切换，下一条消息生效）。
+ * 返回 false 不代表保存失败：配置已落盘，桥接没跑时下次启动会读新值。
+ */
+async function pushReasoningEffort(effort) {
+  try {
+    const { port, token } = bridgeConsole();
+    const upstream = await fetch(`http://127.0.0.1:${port}/api/dsh/effort`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(token ? { 'x-console-token': token } : {}) },
+      body: JSON.stringify({ reasoningEffort: effort }),
+      signal: AbortSignal.timeout(5000)
+    });
+    const data = await upstream.json().catch(() => ({}));
+    return upstream.ok && data.ok !== false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 把一条手机通知作为「后台提醒」投给模型。
  *
  * 目标会话默认是管理员私聊（private:ownerQQ）—— 手机通知本来就该让管理员知道，
@@ -4439,6 +4467,38 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, { ok: true, count: Object.keys(next).length, needRestart: true });
     }
 
+    /* ── 推理等级（全局）───────────────────────────────────────────────
+     * 写 config.json 的 dsh.reasoningEffort；桥接在跑就顺手调它的
+     * /api/dsh/effort 热切换（下一条消息生效），免得为了一个档位重启整条链路。
+     * 取值必须和桥接的 normalizeReasoningEffort 保持一致：low / high / max。 */
+    if (p === '/api/reasoning') {
+      const REASONING_EFFORTS = [
+        { value: 'low', label: 'low（快，想得浅）' },
+        { value: 'high', label: 'high（想得深一点）' },
+        { value: 'max', label: 'max（最慢最深）' }
+      ];
+      if (req.method === 'GET') {
+        const cfg = loadConfig();
+        const raw = String(cfg.dsh?.reasoningEffort ?? 'max').trim().toLowerCase();
+        const effort = REASONING_EFFORTS.some((o) => o.value === raw) ? raw : 'max';
+        return sendJson(res, { ok: true, effort, options: REASONING_EFFORTS });
+      }
+
+      const body = await readBody(req);
+      const effort = String(body?.effort ?? '').trim().toLowerCase();
+      if (!REASONING_EFFORTS.some((o) => o.value === effort)) {
+        return sendJson(res, { ok: false, error: '推理等级只能是 low / high / max' }, 400);
+      }
+      const cfg = loadConfig();
+      cfg.dsh = { ...(cfg.dsh ?? {}), reasoningEffort: effort };
+      writeJson(configFile(), cfg);
+
+      // 热切换：桥接没在跑、或版本太旧没有这个接口，都不算保存失败 ——
+      // 配置已经落盘，下次启动会按新档位 selectModel。
+      const applied = await pushReasoningEffort(effort);
+      return sendJson(res, { ok: true, effort, applied });
+    }
+
     if (p === '/api/options') {
       if (req.method === 'GET') {
         const cfg = loadConfig();
@@ -4489,6 +4549,13 @@ const server = http.createServer(async (req, res) => {
 
       if (changed) writeJson(configFile(), cfg);
 
+      // 高级页也有一份「思考强度」。在那边改的时候同样热切换，
+      // 否则两个入口一个立刻生效、一个要等重启，最难排查。
+      let reasoningApplied = null;
+      if (changedPaths.includes('dsh.reasoningEffort')) {
+        reasoningApplied = await pushReasoningEffort(String(deepGet(cfg, 'dsh.reasoningEffort')));
+      }
+
       // chatOnly 决定 opencode.json 里的工具面（权限表 + MCP 注册 + 人设正文）。
       // 只写 config.json 不重跑生成器的话，模型那边看到的还是旧工具表 ——
       // 界面上开关变了、实际行为没变，最难查。桥接也要重启：
@@ -4508,7 +4575,8 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         changed,
         configRegenerated: configRegenerated ? configRegenerated.ok : null,
-        bridgeRestarted
+        bridgeRestarted,
+        reasoningApplied
       });
     }
 

@@ -19,6 +19,7 @@
 | 模型来源 | DeepSeek 官方 | 任意 模型 API provider：实测跑通**阿里云百炼**（OpenAI 兼容端点 + `{env:}` 注入 key）、智谱、Cloudflare Workers AI（cf-shim 兼容代理）、OpenRouter |
 | 群聊引擎 | 一代直通（每条消息必回） | 上游**二代仿真（socialV2）**全保留，并修通 `reserved2` 模式：唤醒规则（@/名字/提问/关键词/概率）、潜水与沉睡前观察、轻量记忆、表情包、拍一拍 |
 | 联网能力 | — | 新增 `web-search-safe` MCP（`src/mcp-web-search-safe.js`：必应搜索 + safeFetch 抓正文），人设可自主查资料 |
+| 视频能力 | — | 新增 `video-safe` MCP（`src/mcp-video-safe.js`）：抖音/B站热榜、匿名热榜视频流、B站搜索、单条视频下载抽帧；抖音单条用本机 Edge/Chrome headless 解析，抽帧需要 ffmpeg |
 | 白名单 | 手填 QQ 号/群号 | 支持 `"*"` **通配符**：新好友/新拉群默认放行，`deny` 仍优先 |
 | 密钥管理 | — | 统一收敛到 `secrets.json`（扁平「环境变量名 → 值」），增删换 provider 零代码改动 |
 
@@ -33,7 +34,7 @@ QQ 消息 ──► NapCat（OneBot v11，HTTP 3000 / WS 3001）──► 本桥
                     │
                     ├─► 阿里云百炼 / 智谱 / OpenRouter（直连）
                     ├─► Cloudflare Workers AI（经 cf-shim 4600 兼容代理）
-                    └─► MCP：snowluma（QQ 工具安全子集）+ web-search-safe（联网搜索）
+                    └─► MCP：snowluma（QQ 工具安全子集）+ web-search-safe（联网搜索）+ video-safe（抖音/B站视频）
 ```
 
 ## 快速开始
@@ -105,7 +106,7 @@ bailian/qwen3.8-max → bailian/kimi-k3 → bailian/MiniMax-M2.5 → bailian/qwe
 | `config.json` | 桥接主配置：snowluma 连接、ownerQQ、allow/deny 白名单、socialV2 全套参数 | **不入库**，模板见 `config.example.json` |
 | `secrets.json` | 所有 API 密钥（环境变量名 → 值） | **绝不入库** |
 | `models.json` | 模型池策略：免费/付费顺序、allowPaid、全灭提示语、冷却覆盖 | 可入库存策略 |
-| `opencode.json` | 模型 API 实例配置：provider、MCP（snowluma / web-search-safe）、agents 人设 | 路径需按本机适配 |
+| `opencode.json` | 模型 API 实例配置：provider、MCP（snowluma / web-search-safe / memory-safe / video-safe）、agents 人设 | 路径需按本机适配 |
 | `state/mode.json` | 运行模式（`chat` / `reserved2`）。**二代仿真只在 `reserved2` 下生效** | 不入库 |
 
 ### 会话轮换（省 token 的关键）

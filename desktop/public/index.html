@@ -427,6 +427,22 @@
         <p data-i18n="这里管理模型供应商、密钥与切换顺序。批量粘贴多个 key，程序会自动识别厂商并分类，确认后即可保存。">这里管理模型供应商、密钥与切换顺序。批量粘贴多个 key，程序会自动识别厂商并分类，确认后即可保存。</p>
       </header>
 
+      <div class="panel">
+        <div class="panel-head">
+          <h2>推理等级</h2>
+          <span class="hint">越高越慢越贵，但想得更透。QQ 和微信共用，改完下一条消息生效</span>
+        </div>
+        <div class="field">
+          <label for="reasoning-effort">推理等级</label>
+          <select id="reasoning-effort">
+            <option value="low">low（快，想得浅）</option>
+            <option value="high">high（想得深一点）</option>
+            <option value="max">max（最慢最深）</option>
+          </select>
+          <span class="hint" id="reasoning-hint">正在读取…</span>
+        </div>
+      </div>
+
       <!-- 两个用途板块由脚本从下面的模板克隆生成，HTML 里不写两份 -->
       <div id="slot-panels"></div>
 
