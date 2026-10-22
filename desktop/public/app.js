@@ -546,7 +546,7 @@ $$('.home-card').forEach((card) => {
   });
 });
 
-function showPage(name) {
+function showPage(name, anchor) {
   const home = name === 'overview';
   // 总览是外层首页，不在导航列表里；其它页必须在当前平台的列表内
   if (!home && !pagesOf(platform()).includes(name)) name = NAV[platform()][0][0];
@@ -564,6 +564,21 @@ function showPage(name) {
     localStorage.setItem(`${PLATFORM_KEY}-page-${platform()}`, name);
   } catch { /* 同上 */ }
   loadPage(name);
+  // 可选锚点：状态页的「调工具」按钮要直接落到工具面板，不是停在页面顶部。
+  // 不能只等一帧 —— 工具分组是异步拉 /api/tools 再渲染的，容器先空着，滚过去也是空的。
+  // 所以轮询到容器真的有子节点再滚，最多等 ~1 秒。
+  if (anchor) {
+    let tries = 0;
+    const scroll = () => {
+      const el = document.getElementById(anchor);
+      if (el && el.children.length > 0) {
+        el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        return;
+      }
+      if (tries++ < 12) setTimeout(scroll, 80);
+    };
+    requestAnimationFrame(() => requestAnimationFrame(scroll));
+  }
 }
 
 function loadPage(name) {
@@ -873,20 +888,24 @@ function renderStatus() {
       slotBox.dataset.bound = '1';
       slotBox.addEventListener('click', (e) => {
         const b = e.target.closest('[data-goto]');
-        if (b) showPage(b.dataset.goto);
+        if (b) showPage(b.dataset.goto, b.dataset.anchor);
       });
     }
     const has = chatOk || poolN > 0;
     const modelShow = chatOk ? esc(slots.chat.model) : poolN ? `模型池 · ${poolN} 个候选` : '—';
     const tag = chatOk ? '已配置' : poolN ? '模型池' : '未配置';
     const note = compN > 0
-      ? `可以干活：电脑操作开了 ${compN} 项（工具清单在「对话与人格」页）`
+      ? `可以干活：电脑操作开了 ${compN} 项`
       : has
-        ? '只聊天：没开电脑操作（想让它干活去「对话与人格」页勾）'
+        ? '只聊天：没开电脑操作'
         : '还没接入模型';
     const btn = chatOk
       ? '<button class="btn btn-sm" data-goto="models">管理模型</button>'
       : `<button class="btn btn-sm btn-primary" data-goto="models">${poolN ? '管理模型池' : '去配置模型'}</button>`;
+    // 工具开关在「对话与人格」页 —— 名字跟"工具"对不上，靠这按钮直达，别指望人自己找。
+    const toolBtn = has
+      ? '<button class="btn btn-sm" data-goto="chat" data-anchor="tool-groups">调工具</button>'
+      : '';
     slotBox.innerHTML = `
       <div class="status-slot${has ? ' is-ok' : ''}">
         <div class="status-slot-head">
@@ -895,7 +914,7 @@ function renderStatus() {
         </div>
         <div class="status-slot-model">${modelShow}</div>
         <div class="status-slot-note">${note}</div>
-        <div class="status-slot-actions">${btn}</div>
+        <div class="status-slot-actions">${btn}${toolBtn}</div>
       </div>`;
   }
 

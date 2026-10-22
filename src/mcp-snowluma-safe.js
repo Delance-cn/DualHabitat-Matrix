@@ -245,10 +245,59 @@ const TOOL_CONFIG_FLAGS = {
   qq_sticker_note: 'stickerNote',
   qq_set_sticker_remark: 'setStickerRemark',
 };
+// ── 跨模式工具：同时服务 chat / reserved / closed-agent ─────────────────────
+//
+// 这三个不能无条件按 `socialV2.tools` 过滤：closed-agent（管理员私聊操控）也靠它们发消息，
+// 拿聊天档的开关去管，会让主人档突然发不出话。所以只在 reserved2 下按开关过滤。
+const CROSS_MODE_TOOLS = {
+  qq_send_group_message: 'sendGroup',
+  qq_send_private_message: 'sendPrivate',
+  qq_reply: 'reply'
+};
+
+// ── 旧只读工具：只有 closed-agent 用得上 ────────────────────────────────────
+//
+// 群聊模式下这三个一进函数就判 legacyReadToolAllowed() 并返回「仅在封闭 agent 模式可用」，
+// 注册它们只是白占上下文、诱导模型调用再吃一个错误。非 closed-agent 模式直接不注册。
+const LEGACY_ONLY_TOOLS = new Set([
+  'qq_status',
+  'qq_list_groups',
+  'qq_get_group_members',
+  'qq_get_group_history'
+]);
+
+/**
+ * 当前桥接模式（同步读 state/mode.json）。
+ * 读不到返回空串 = 未知 —— 此时**保持原有行为**（旧工具照注册、跨模式工具不过滤），
+ * 免得状态文件缺失或首次启动把主人档弄哑。
+ */
+function currentBridgeMode() {
+  try {
+    const raw = fs.readFileSync(path.join(ROOT, 'state', 'mode.json'), 'utf8');
+    return String(JSON.parse(raw)?.mode ?? '').trim();
+  } catch {
+    return '';
+  }
+}
+
 const disabledTools = [];
+const BRIDGE_MODE = currentBridgeMode();
 {
   const registerTool = server.tool.bind(server);
+  const mode = BRIDGE_MODE;
   server.tool = (name, ...rest) => {
+    // 1) 旧只读工具：非 closed-agent 不注册
+    if (mode && LEGACY_ONLY_TOOLS.has(name) && mode !== 'closed-agent') {
+      disabledTools.push(`${name}(legacy:仅closed-agent)`);
+      return undefined;
+    }
+    // 2) 跨模式工具：只在 reserved2 下按 v2 开关过滤
+    const crossFlag = CROSS_MODE_TOOLS[name];
+    if (mode === 'reserved2' && crossFlag && cfg.socialV2?.tools?.[crossFlag] === false) {
+      disabledTools.push(`${name}(${crossFlag})`);
+      return undefined;
+    }
+    // 3) v2 专属工具：按开关过滤
     const flag = TOOL_CONFIG_FLAGS[name];
     if (flag && cfg.socialV2?.tools?.[flag] === false) {
       disabledTools.push(`${name}(${flag})`);
@@ -1271,6 +1320,12 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
       }
     }
   );
+}
+
+// 工具注册在模块加载期完成（上面每个 server.tool 调用），这里把结果打到 stderr。
+// stdout 是 JSON-RPC 通道，一个字节都不能碰；排查「明明开了却看不见」时先看这行。
+if (disabledTools.length) {
+  process.stderr.write(`[snowluma-safe] 模式=${BRIDGE_MODE || '未知'} 未注册 ${disabledTools.length} 个工具：${disabledTools.join(', ')}\n`);
 }
 
 await server.connect(new StdioServerTransport());

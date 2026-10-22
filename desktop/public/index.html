@@ -966,6 +966,42 @@
         <p data-i18n="谁能让机器人回话、用什么人格回。QQ 和微信各存一份配置，上面的平台按钮切的就是这一页。">谁能让机器人回话、用什么人格回。QQ 和微信各存一份配置，上面的平台按钮切的就是这一页。</p>
       </header>
 
+      <!-- 工具开关：模型手里有什么牌，在这里给 -->
+      <div class="panel" data-pf="qq">
+        <div class="panel-head">
+          <h2>模型能用哪些工具</h2>
+          <span class="hint">关掉的工具模型调不到，它也不知道自己有这个功能</span>
+        </div>
+
+        <div class="tool-presets">
+          <button class="btn btn-sm btn-primary" data-tool-preset="chat">只聊天</button>
+          <button class="btn btn-sm btn-primary" data-tool-preset="work">可以干活</button>
+          <button class="btn btn-sm" data-tool-preset="readonly">只看不说</button>
+          <button class="btn btn-sm" data-tool-preset="standard">出厂默认</button>
+          <button class="btn btn-sm" data-tool-preset="all">全部打开</button>
+          <span class="hint" id="tools-count">—</span>
+        </div>
+
+        <div id="tool-groups" data-adv></div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btn-tools-save">保存工具开关</button>
+          <button class="btn" id="btn-tools-restart" hidden>重启桥接</button>
+          <span class="result" id="tools-result"></span>
+        </div>
+
+        <details class="help">
+          <summary>保存后怎么生效</summary>
+          <div class="help-body">
+            <p>点「保存工具开关」会自动重写模型配置并重启在跑的 BOT（几秒空窗，正在回的消息会中断）——
+              不用再手动重启。BOT 没在跑就下次启动生效。</p>
+            <p>「电脑操作」一组就是「可以干活」模式：勾了机器人才能读写本机文件、跑命令；
+              全关就是纯聊天。它同时管主人档和聊天档。</p>
+            <p>微信那边的工具面不走这里：它只有「收发消息 + 看图」，由微信 Hook 决定。</p>
+          </div>
+        </details>
+      </div>
+
       <div class="panel">
         <div class="panel-head">
           <h2>谁能对话</h2>
@@ -1149,41 +1185,7 @@
         </div>
       </div>
 
-      <!-- 工具开关：模型手里有什么牌，在这里给 -->
-      <div class="panel" data-pf="qq">
-        <div class="panel-head">
-          <h2>模型能用哪些工具</h2>
-          <span class="hint">关掉的工具模型调不到，它也不知道自己有这个功能</span>
-        </div>
 
-        <div class="tool-presets">
-          <button class="btn btn-sm btn-primary" data-tool-preset="chat">只聊天</button>
-          <button class="btn btn-sm btn-primary" data-tool-preset="work">可以干活</button>
-          <button class="btn btn-sm" data-tool-preset="readonly">只看不说</button>
-          <button class="btn btn-sm" data-tool-preset="standard">出厂默认</button>
-          <button class="btn btn-sm" data-tool-preset="all">全部打开</button>
-          <span class="hint" id="tools-count">—</span>
-        </div>
-
-        <div id="tool-groups" data-adv></div>
-
-        <div class="actions">
-          <button class="btn btn-primary" id="btn-tools-save">保存工具开关</button>
-          <button class="btn" id="btn-tools-restart" hidden>重启桥接</button>
-          <span class="result" id="tools-result"></span>
-        </div>
-
-        <details class="help">
-          <summary>保存后怎么生效</summary>
-          <div class="help-body">
-            <p>点「保存工具开关」会自动重写模型配置并重启在跑的 BOT（几秒空窗，正在回的消息会中断）——
-              不用再手动重启。BOT 没在跑就下次启动生效。</p>
-            <p>「电脑操作」一组就是「可以干活」模式：勾了机器人才能读写本机文件、跑命令；
-              全关就是纯聊天。它同时管主人档和聊天档。</p>
-            <p>微信那边的工具面不走这里：它只有「收发消息 + 看图」，由微信 Hook 决定。</p>
-          </div>
-        </details>
-      </div>
     </section>
 
     <!-- ══════════════════ 消息 ══════════════════ -->
