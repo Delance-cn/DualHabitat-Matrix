@@ -406,8 +406,8 @@
 
       <div class="panel">
         <div class="panel-head">
-          <h2>模型两档</h2>
-          <span class="hint">分开配置，各用各的</span>
+          <h2>模型</h2>
+          <span class="hint">只聊天还是可以干活，看下面那行说明</span>
         </div>
         <div class="status-slots" id="status-slots"></div>
       </div>
@@ -1141,6 +1141,8 @@
         </div>
 
         <div class="tool-presets">
+          <button class="btn btn-sm btn-primary" data-tool-preset="chat">只聊天</button>
+          <button class="btn btn-sm btn-primary" data-tool-preset="work">可以干活</button>
           <button class="btn btn-sm" data-tool-preset="readonly">只看不说</button>
           <button class="btn btn-sm" data-tool-preset="standard">出厂默认</button>
           <button class="btn btn-sm" data-tool-preset="all">全部打开</button>
@@ -1156,11 +1158,12 @@
         </div>
 
         <details class="help">
-          <summary>为什么改了要重启桥接</summary>
+          <summary>保存后怎么生效</summary>
           <div class="help-body">
-            <p>工具清单是桥接<strong>启动时</strong>读进内存的。只写配置文件的话，界面上开关变了、
-              模型那边还是旧的一套 —— 最难查的那种「看着生效其实没生效」。</p>
-            <p>点击「重启桥接」会断开 QQ 几秒，重新连上后新工具表才生效。正在回复的那条消息会中断。</p>
+            <p>点「保存工具开关」会自动重写模型配置并重启在跑的 BOT（几秒空窗，正在回的消息会中断）——
+              不用再手动重启。BOT 没在跑就下次启动生效。</p>
+            <p>「电脑操作」一组就是「可以干活」模式：勾了机器人才能读写本机文件、跑命令；
+              全关就是纯聊天。它同时管主人档和聊天档。</p>
             <p>微信那边的工具面不走这里：它只有「收发消息 + 看图」，由微信 Hook 决定。</p>
           </div>
         </details>

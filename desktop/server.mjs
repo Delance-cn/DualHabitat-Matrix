@@ -859,6 +859,19 @@ const OPTION_PATHS = new Map(
 
 const TOOL_GROUPS = [
   {
+    id: 'computer',
+    title: '电脑操作 · 勾了才是「可以干活」模式',
+    hint: '打开 = 机器人能在本机读写文件、跑命令；只聊天就全关',
+    items: [
+      { flag: 'computerRead', ns: 'computer', label: '读文件', default: false, hint: '看本机文件内容' },
+      { flag: 'computerWrite', ns: 'computer', label: '写文件', default: false, hint: '新建 / 覆盖文件' },
+      { flag: 'computerEdit', ns: 'computer', label: '改文件', default: false, hint: '精确修改现有文件' },
+      { flag: 'computerGlob', ns: 'computer', label: '找文件', default: false, hint: '按名字模式找文件' },
+      { flag: 'computerGrep', ns: 'computer', label: '搜内容', default: false, hint: '按内容搜文件' },
+      { flag: 'computerShell', ns: 'computer', label: '运行命令', default: false, hint: '执行命令 —— 权力最大，想清楚再开' }
+    ]
+  },
+  {
     id: 'read',
     title: '读消息',
     hint: '关掉这些，模型就看不见上下文，只会瞎回',
@@ -2300,8 +2313,13 @@ function relay(stream, level, source) {
  */
 function nodeRunner() {
   const isElectron = Boolean(process.versions.electron);
-  if (!isElectron) return { command: process.execPath, env: {} };
-  return { command: process.execPath, env: { ELECTRON_RUN_AS_NODE: '1' } };
+  const env = isElectron ? { ELECTRON_RUN_AS_NODE: '1' } : {};
+  // 真实模型池在 models.local.json（公开仓只带空模板，个人池不进 git）。
+  // 桥接、微信 bot、oc-config 重生成配置都从 QQ_BRIDGE_MODELS 拿池子——
+  // 不注入的话，本机就一直在按空池跑，regen 还会报「模型池是空的」。
+  const localPool = path.join(getRoot(), 'models.local.json');
+  if (fs.existsSync(localPool)) env.QQ_BRIDGE_MODELS = localPool;
+  return { command: process.execPath, env };
 }
 
 /**
@@ -4101,6 +4119,7 @@ const server = http.createServer(async (req, res) => {
       const napcatReachable = n.dir ? await probePort(n.wsPort) : false;
       return sendJson(res, {
         backend: config.backend ?? null,
+        computerTools: config.computerTools ?? null,
         bridge: bridgeState(),
         wechat: wechatState(),
         napcat: {
@@ -5408,6 +5427,14 @@ const server = http.createServer(async (req, res) => {
         const defaults = {};
         for (const g of TOOL_GROUPS) {
           for (const it of g.items) {
+            if (it.ns === 'computer') {
+              // 电脑操作用专属命名空间 config.computerTools，由 oc-config 生成权限时消费。
+              // 不放 config.tools 下：config.json 里历史上还有一个扁平的 "tools" 键
+              // （社交工具标志的旧副本），重复键会让「谁后写谁生效」变成玄学。
+              values[it.flag] = cfg.computerTools?.[it.flag] === true;
+              defaults[it.flag] = false;
+              continue;
+            }
             const v = cfg.socialV2?.tools?.[it.flag];
             values[it.flag] = typeof v === 'boolean' ? v : it.default !== false;
             defaults[it.flag] = it.default !== false;
@@ -5417,8 +5444,14 @@ const server = http.createServer(async (req, res) => {
           ok: true,
           groups: TOOL_GROUPS,
           values,
-          // 前端「只看不说 / 出厂默认」两个预设直接用这两份，不重复维护一份表
-          presets: { standard: defaults, readonlyOff: [...TOOL_PRESET_READONLY] },
+          // 前端预设直接用这几份，不重复维护一份表
+          presets: {
+            standard: defaults,
+            readonlyOff: [...TOOL_PRESET_READONLY],
+            // 两个模式预设：只聊天 = 出厂默认且电脑操作全关；可以干活 = 出厂默认且电脑操作全开
+            chat: { ...defaults, computerRead: false, computerWrite: false, computerEdit: false, computerGlob: false, computerGrep: false, computerShell: false },
+            work: { ...defaults, computerRead: true, computerWrite: true, computerEdit: true, computerGlob: true, computerGrep: true, computerShell: true }
+          },
           chatOnly: cfg.socialV2?.chatOnly === true
         });
       }
@@ -5428,20 +5461,39 @@ const server = http.createServer(async (req, res) => {
       const cfg = loadConfig();
       if (!cfg.socialV2 || typeof cfg.socialV2 !== 'object') cfg.socialV2 = {};
       if (!cfg.socialV2.tools || typeof cfg.socialV2.tools !== 'object') cfg.socialV2.tools = {};
+      if (!cfg.computerTools || typeof cfg.computerTools !== 'object') cfg.computerTools = {};
 
       let changed = 0;
       for (const g of TOOL_GROUPS) {
         for (const it of g.items) {
           if (!(it.flag in incoming)) continue;
           const next = incoming[it.flag] === true;
+          if (it.ns === 'computer') {
+            if (cfg.computerTools[it.flag] === next) continue;
+            cfg.computerTools[it.flag] = next;
+            changed += 1;
+            continue;
+          }
           if (cfg.socialV2.tools[it.flag] === next) continue;
           cfg.socialV2.tools[it.flag] = next;
           changed += 1;
         }
       }
-      if (changed) writeJson(configFile(), cfg);
-      // 工具表是桥接启动时读的，改完不重启就只是界面上好看
-      return sendJson(res, { ok: true, changed, needRestart: changed > 0 });
+      let applied = false;
+      let regenError;
+      if (changed) {
+        writeJson(configFile(), cfg);
+        // 「电脑操作」直接决定 opencode.json 的 agent 权限，聊天工具表也是桥接启动时读的——
+        // 索性保存即生效：重新生成配置，再把在跑的 BOT 就地重启（几秒空窗）。
+        const regen = await regenerateConfig();
+        if (regen.ok) {
+          if (bridge.child) applied = await restartBotsFor('qq');
+          if (wechat.child) applied = (await restartBotsFor('wechat')) || applied;
+        } else {
+          regenError = (regen.lines ?? []).filter((l) => l.trim()).slice(-2).join(' ｜ ');
+        }
+      }
+      return sendJson(res, { ok: true, changed, applied, regenError, needRestart: changed > 0 && !applied });
     }
 
     /* 原始配置文件读写 —— 「高级」页最后一道口子。
@@ -5497,10 +5549,22 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/napcat/panel') return sendJson(res, napcatPanel());
 
     /* NapCat 面板开在应用内的子窗口里（Electron 主进程注入 opener）。
+     * 面板地址是 NapCat WebUI——NapCat 没在跑时它就是死链，直接开窗必然白屏。
+     * 所以先探活：没跑就顺手拉起并等端口通了再开；等不到就把人话带回前端。
      * 裸跑（node server.mjs）没有 Electron：返回 inApp:false，前端自己开新标签。 */
     if (p === '/api/napcat/window') {
-      const panel = napcatPanel();
+      let panel = napcatPanel();
       if (!panel.ok) return sendJson(res, panel);
+      if (!(await probePort(panel.port))) {
+        const started = startNapcat();
+        if (!started.ok) return sendJson(res, { ok: false, error: `NapCat 没在跑，自动启动失败：${started.error ?? '未知原因'}` });
+        pushLog('NapCat 没在跑，已自动拉起，等面板端口就绪…', 'sys', 'napcat');
+        const ready = await waitForPort(panel.port, 20_000);
+        panel = napcatPanel();
+        if (!ready || !(await probePort(panel.port))) {
+          return sendJson(res, { ok: false, error: 'NapCat 拉起来了，但面板端口 20 秒内没通——看日志页的 NapCat 输出，稍等再点一次' });
+        }
+      }
       const opener = globalThis.dhmOpenChildWindow;
       if (typeof opener === 'function') {
         try {

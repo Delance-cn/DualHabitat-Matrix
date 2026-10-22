@@ -854,37 +854,32 @@ function renderStatus() {
   const slots = S.modelSlots?.[platform()] ?? {};
   const ready = (x) => !!(x && x.baseUrl && x.model);
   const chatOk = ready(slots.chat);
-  const workOk = ready(slots.work);
+  const comp = S?.computerTools ?? null;
+  const compN = comp ? Object.values(comp).filter(Boolean).length : 0;
 
-  // 两档都没配时，桥接其实还在用模型池顶着 —— 别谎报「未配置」
+  // 没配时桥接其实还在用模型池顶着 —— 别谎报「未配置」
   const poolN = S.pool?.enabled ? (S.pool.free ?? 0) + (S.pool.paid ?? 0) : 0;
 
   const mode = $('#status-mode');
   if (mode) {
-    mode.textContent = workOk
-      ? '闲聊 + 指令'
-      : chatOk
-        ? '普通聊天'
-        : poolN
-          ? `普通聊天 · 池 ${poolN}`
-          : '未配置';
+    mode.textContent = chatOk
+      ? compN > 0 ? '可以干活' : '只聊天'
+      : poolN
+        ? `只聊天 · 池 ${poolN}`
+        : '未配置';
   }
 
   const slotBox = $('#status-slots');
   if (slotBox) {
-    const card = (name, data, good, note) => `
-      <div class="status-slot${good ? ' is-ok' : ''}">
+    slotBox.innerHTML = `
+      <div class="status-slot${chatOk ? ' is-ok' : ''}">
         <div class="status-slot-head">
-          <span class="status-slot-name">${name}</span>
-          <span class="status-slot-tag">${good ? '已配置' : '未配置'}</span>
+          <span class="status-slot-name">模型</span>
+          <span class="status-slot-tag">${chatOk ? '已配置' : '未配置'}</span>
         </div>
-        <div class="status-slot-model">${good ? esc(data.model) : poolN ? '模型池' : '—'}</div>
-        <div class="status-slot-note">${note}</div>
+        <div class="status-slot-model">${chatOk ? esc(slots.chat.model) : poolN ? '模型池' : '—'}</div>
+        <div class="status-slot-note">${compN > 0 ? `可以干活：电脑操作开了 ${compN} 项（工具清单在「对话与人格」页）` : '只聊天：没开电脑操作（想让它干活去「对话与人格」页勾）'}</div>
       </div>`;
-    // 两档的差别要一直看得见，所以说明文字不随配置状态变
-    slotBox.innerHTML =
-      card('普通聊天', slots.chat ?? {}, chatOk, '只说话，不给工具') +
-      card('LLMs', slots.work ?? {}, workOk, '能执行指令、读文件');
   }
 
   const svcBox = $('#status-services');
@@ -1076,7 +1071,7 @@ function wizardSteps() {
     ];
   }
   return [
-    { title: '登录 QQ', desc: '点「去扫码」——NapCat 面板会在应用内打开，用手机 QQ 扫一下', done: S.napcat?.reachable === true, go: () => openBotSheet(0), btn: '去扫码' },
+    { title: '登录 QQ', desc: '点「去扫码」——NapCat 没在跑会自动拉起，面板在应用内打开，用手机 QQ 扫一下', done: S.napcat?.reachable === true, go: () => openBotSheet(0), btn: '去扫码' },
     { title: '填模型密钥', desc: '在弹出的面板里粘贴 key，程序自动认厂商（密钥在厂商控制台生成，只显示一次）。填好自动保存', done: hasKey, go: () => openBotSheet(1), btn: '去填' },
     { title: '选模型和人格', desc: '在弹出的面板里选厂商和模型、挑个人格（比如塔菲）。选了自动保存', done: hasSource, go: () => openBotSheet(2), btn: '去选' },
     { title: '开起来，发条消息试', desc: '面板里点「启动这个机器人」，然后用手机 QQ 给它发一句话。没回话就看启动步骤里哪一步打了 ✗', done: running, go: () => openBotSheet(3), btn: '去启动' }
@@ -1188,8 +1183,8 @@ async function renderBotSheet() {
 function bsLoginQqHtml() {
   return `
     <div class="bs-row"><span class="hint">NapCat 状态：</span><strong id="bs-napcat-state">—</strong></div>
-    <div class="bs-actions"><button class="btn btn-primary" id="bs-napcat-open">在应用内打开 NapCat 面板</button></div>
-    <p class="hint">扫码和快登都在面板里。这里变成「已连接」这一步就自动打勾；面板可以留着，也可以关掉。</p>
+    <div class="bs-actions"><button class="btn btn-primary" id="bs-napcat-open">打开 NapCat 面板（没在跑会自动启动）</button></div>
+    <p class="hint">NapCat 没在跑会自动拉起（十几秒），扫码和快登都在面板里。这里变成「已连接」就自动打勾。</p>
     <div class="result" id="bs-result-0"></div>`;
 }
 
@@ -1365,9 +1360,10 @@ async function bsSaveModel() {
     const sr = await post('/api/secrets', { [p.keyEnv]: key });
     if (sr.ok === false) return setResult('#bs-result-2', sr.error ?? '保存密钥失败', 'err');
   }
-  data.allowTools = false; // 引导配的是「普通聊天」档：只说话，不给工具
+  data.allowTools = false; // 聊天档不给工具；工作档同款模型，能力差异在工具清单
   if (!modelProfiles[pf]) modelProfiles[pf] = {};
   modelProfiles[pf].chat = data;
+  modelProfiles[pf].work = { ...data, allowTools: true };
   const r = await post('/api/model-profiles', { profiles: modelProfiles });
   $('#bs-apiKey').value = '';
   if (r.ok === false) return setResult('#bs-result-2', r.error ?? '保存失败', 'err');
@@ -1818,8 +1814,9 @@ function fillSource(s, ma) {
  * 配置落在 config.json 的 backend.profiles 下，QQ 和微信各一套。
  */
 const SLOT_DEFS = [
-  { key: 'chat', title: '普通聊天', hint: '只说话，不给工具。群里闲聊用这一档。', tools: false },
-  { key: 'work', title: 'LLMs', hint: '能执行指令、读工作区文件。建议配强一些的模型。', tools: true }
+  // 0.4.1 起只有一份模型配置：机器人的大脑就一个。「只聊天 / 可以干活」的差异
+  // 全在工具清单里配（对话与人格页），不再让人配两遍模型。
+  { key: 'chat', title: '模型', hint: '机器人的大脑，一份就够。只聊天 / 可以干活的差别在「对话与人格」页的工具清单。', tools: false }
 ];
 
 async function loadModelProfiles() {
@@ -1980,6 +1977,8 @@ function bindSlotEvents() {
       const pf = platform();
       if (!modelProfiles[pf]) modelProfiles[pf] = {};
       modelProfiles[pf][s] = data;
+      // 工作档同款模型：能力差异全在工具清单（对话与人格页），不在这份配置里
+      modelProfiles[pf].work = { ...data, allowTools: true };
       const r = await post('/api/model-profiles', { profiles: modelProfiles });
       el('apiKey').value = '';
       if (r.ok === false) return setResult(res, r.error ?? '保存失败', 'err');
@@ -4039,16 +4038,27 @@ $('#tool-groups').addEventListener('change', () => updateToolCounts());
 $$('[data-tool-preset]').forEach((btn) => {
   btn.addEventListener('click', () => {
     const kind = btn.dataset.toolPreset;
-    const std = toolData?.presets?.standard ?? {};
-    const readonlyOff = new Set(toolData?.presets?.readonlyOff ?? []);
+    const presets = toolData?.presets ?? {};
+    const std = presets.standard ?? {};
+    const readonlyOff = new Set(presets.readonlyOff ?? []);
     for (const el of toolBoxes()) {
       const flag = el.dataset.flag;
       if (kind === 'all') el.checked = true;
       else if (kind === 'readonly') el.checked = !readonlyOff.has(flag);
+      else if (kind === 'chat') el.checked = presets.chat?.[flag] !== false;
+      else if (kind === 'work') el.checked = presets.work?.[flag] !== false;
       else el.checked = std[flag] !== false;
     }
     updateToolCounts();
-    setResult('#tools-result', '已按预设改好，点「保存工具开关」才写进去', '');
+    setResult(
+      '#tools-result',
+      kind === 'work'
+        ? '已切到「可以干活」—— 电脑操作全开，点「保存工具开关」生效'
+        : kind === 'chat'
+          ? '已切到「只聊天」—— 电脑操作全关，点「保存工具开关」生效'
+          : '已按预设改好，点「保存工具开关」才写进去',
+      ''
+    );
   });
 });
 
@@ -4059,8 +4069,15 @@ $('#btn-tools-save').addEventListener('click', async (e) => {
     const r = await post('/api/tools', { values });
     if (r.ok === false) return setResult('#tools-result', r.error ?? '保存失败', 'err');
     if (!r.changed) return setResult('#tools-result', '和原来一样，没改', '');
-    setResult('#tools-result', `已保存 ${r.changed} 项 —— 点右边「重启桥接」才真正生效`, 'saved-pending');
-    $('#btn-tools-restart').hidden = false;
+    if (r.regenError) {
+      setResult('#tools-result', `已保存，但生成配置失败：${r.regenError}`, 'err');
+      $('#btn-tools-restart').hidden = false;
+    } else if (r.applied) {
+      setResult('#tools-result', `已保存 ${r.changed} 项 ✓ 在跑的 BOT 已重启，立即生效`, 'saved');
+    } else {
+      setResult('#tools-result', `已保存 ${r.changed} 项 ✓ 下次 BOT 启动生效`, 'saved-pending');
+      $('#btn-tools-restart').hidden = false;
+    }
     await loadTools();
   });
 });

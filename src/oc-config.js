@@ -359,6 +359,21 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   if (Object.keys(mcpServers).length) config.mcp = { servers: mcpServers };
 
   // ── agents ──────────────────────────────────────────────────────────────
+  // ── 电脑操作（「可以干活」模式）────────────────────────────────────────
+  // 由桌面端「对话与人格 → 工具清单 → 电脑操作」一组勾选驱动（config.computerTools）。
+  // 没配置过（键不存在）时保持 0.4.0 前的旧行为：文件/命令工具只属于主人档，聊天档一个没有。
+  // 一旦配置过（哪怕全关），就完全按勾选来：qq-chat 与 qq-work 用同一份清单。
+  // 纯聊天开关（socialV2.chatOnly）是总闸：开着时聊天档依旧零工具。
+  const computerCfg = readJsonSafe(path.join(ROOT, 'config.json'), {})?.computerTools ?? null;
+  // 清单 flag 名（computerRead…）→ opencode 权限动作名（read…）
+  const COMPUTER_FLAG_TO_ACTION = { computerRead: 'read', computerWrite: 'write', computerEdit: 'edit', computerGlob: 'glob', computerGrep: 'grep', computerShell: 'shell' };
+  const computerChecked = Object.keys(COMPUTER_FLAG_TO_ACTION).filter((f) => computerCfg?.[f] === true).map((f) => COMPUTER_FLAG_TO_ACTION[f]);
+  const workComputerActions = computerCfg ? computerChecked : WORK_TOOL_ACTIONS;
+  const chatComputerActions = computerCfg && !chatOnly ? computerChecked : [];
+  if (computerCfg) {
+    notes.push(`「电脑操作」勾了 ${computerChecked.length}/6 项 → 聊天档${chatOnly ? '（纯聊天开关开着，保持零工具）' : computerChecked.length ? '也可以干活' : '保持只聊天'}；工作档同一份清单`);
+  }
+
   config.agents = {};
   for (const preset of PRESETS) {
     const personaText = chatOnly ? chatOnlyPersona() : persona[preset.id];
@@ -371,6 +386,10 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
       mode: 'primary',
       system: personaText
     };
+    // 「可以干活」模式：聊天档 agent 也拿到勾选的电脑工具（agent 级 permissions 压过全局 deny *）。
+    if (chatComputerActions.length) {
+      config.agents[preset.id].permissions = chatComputerActions.map((action) => ({ action, resource: '*', effect: 'allow' }));
+    }
   }
 
   // 主人档：closed-agent 模式专用（只有 ownerQQ 私聊能进这个模式）。
@@ -379,16 +398,17 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
       description: '主人档：可以读写文件、跑命令（仅 owner 私聊）',
       mode: 'primary',
       system: workPersona,
-      permissions: WORK_TOOL_ACTIONS.map((action) => ({ action, resource: '*', effect: 'allow' }))
+      permissions: workComputerActions.map((action) => ({ action, resource: '*', effect: 'allow' }))
     };
   }
 
-  // ── 两档模型落到 agent 上 ──────────────────────────────────────────────
-  // 「普通聊天」管聊天档（qq-chat / qq-chat-v2），「LLMs」管主人档（qq-work）。
-  // 没配的档一个字都不动 —— 保持原来的模型池行为。加这个功能不能把现在能用的链路弄坏。
+  // ── 模型落到 agent 上 ─────────────────────────────────────────────────
+  // 0.4.1 起桌面端只有一份模型配置，同一份模型同时写进 chat / work 两个槽——
+  // chat 管聊天档 agent，work 管主人档；能力差异全在工具清单，不在模型。
+  // 没配的档一个字都不动 —— 保持原来的模型池行为。
   const slotPlan = [
-    { slot: 'chat', ids: PRESETS.map((p) => p.id), label: '普通聊天' },
-    { slot: 'work', ids: ['qq-work'], label: 'LLMs' }
+    { slot: 'chat', ids: PRESETS.map((p) => p.id), label: '模型' },
+    { slot: 'work', ids: ['qq-work'], label: '模型（工作档同款）' }
   ];
   for (const { slot, ids, label } of slotPlan) {
     const s = slots?.[slot];

@@ -202,6 +202,14 @@ function openChildWindow(url, title) {
     if (/^https?:/.test(target)) shell.openExternal(target);
     return { action: 'deny' };
   });
+  // 加载失败（NapCat 半死、端口竞态）就换一张人话兜底页，绝不让人对着白屏猜
+  child.webContents.on('did-fail-load', (_e, code, desc, url, isMain) => {
+    if (isMain === false) return;
+    const html = encodeURIComponent(
+      `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui,'Segoe UI',sans-serif;background:#f4f6f9;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center;color:#5b6675"><h2 style="color:#1a2230">面板没加载出来</h2><p>地址：${url ?? ''}</p><p>原因：${desc ?? ''}（代码 ${code ?? ''}）</p><p>关掉这个窗口，回软件里再点一次「打开面板」就能重试。</p></div></body>`
+    );
+    child.loadURL('data:text/html;charset=utf-8,' + html).catch(() => {});
+  });
   child.loadURL(url);
   return child.id;
 }
