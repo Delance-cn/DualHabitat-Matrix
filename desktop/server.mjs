@@ -963,7 +963,14 @@ const TOOL_PRESET_READONLY = new Set([
  * 模型 API 隔离实例 / 模型池
  * ══════════════════════════════════════════════════════════════════════════ */
 
-const modelsFile = () => path.join(getRoot(), 'models.json');
+const modelsFile = () => {
+  // 生效池 = models.local.json（真实池，不入库）优先；不存在才落到 models.json（公开仓的空模板）。
+  // 运行时（桥接 / oc-config）通过 QQ_BRIDGE_MODELS 读的也是 local 这份——
+  // 这里必须指同一个文件，否则状态页 / 模型池页看到的是空模板，把用户谎报成「未配置」。
+  const local = path.join(getRoot(), 'models.local.json');
+  if (fs.existsSync(local)) return local;
+  return path.join(getRoot(), 'models.json');
+};
 
 /**
  * 实例的注册文件：桥接把它起在哪、pid 多少，都写在这儿。只读，不碰它的生死。
@@ -4120,6 +4127,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, {
         backend: config.backend ?? null,
         computerTools: config.computerTools ?? null,
+        pool: (() => { const p = loadPool(); return { enabled: p.enabled !== false, free: (p.free ?? []).length, paid: (p.paid ?? []).length }; })(),
         bridge: bridgeState(),
         wechat: wechatState(),
         napcat: {

@@ -862,23 +862,40 @@ function renderStatus() {
 
   const mode = $('#status-mode');
   if (mode) {
-    mode.textContent = chatOk
-      ? compN > 0 ? '可以干活' : '只聊天'
-      : poolN
-        ? `只聊天 · 池 ${poolN}`
-        : '未配置';
+    // 档位或模型池任一可用就算「接了模型」；只聊天 / 可以干活看电脑操作勾了几项
+    mode.textContent = (chatOk || poolN > 0) ? (compN > 0 ? '可以干活' : '只聊天') : '未配置';
   }
 
   const slotBox = $('#status-slots');
   if (slotBox) {
+    // 点击委托只绑一次：slotBox 本体是静态容器，innerHTML 每次轮询重画
+    if (!slotBox.dataset.bound) {
+      slotBox.dataset.bound = '1';
+      slotBox.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-goto]');
+        if (b) showPage(b.dataset.goto);
+      });
+    }
+    const has = chatOk || poolN > 0;
+    const modelShow = chatOk ? esc(slots.chat.model) : poolN ? `模型池 · ${poolN} 个候选` : '—';
+    const tag = chatOk ? '已配置' : poolN ? '模型池' : '未配置';
+    const note = compN > 0
+      ? `可以干活：电脑操作开了 ${compN} 项（工具清单在「对话与人格」页）`
+      : has
+        ? '只聊天：没开电脑操作（想让它干活去「对话与人格」页勾）'
+        : '还没接入模型';
+    const btn = chatOk
+      ? '<button class="btn btn-sm" data-goto="models">管理模型</button>'
+      : `<button class="btn btn-sm btn-primary" data-goto="models">${poolN ? '管理模型池' : '去配置模型'}</button>`;
     slotBox.innerHTML = `
-      <div class="status-slot${chatOk ? ' is-ok' : ''}">
+      <div class="status-slot${has ? ' is-ok' : ''}">
         <div class="status-slot-head">
           <span class="status-slot-name">模型</span>
-          <span class="status-slot-tag">${chatOk ? '已配置' : '未配置'}</span>
+          <span class="status-slot-tag">${tag}</span>
         </div>
-        <div class="status-slot-model">${chatOk ? esc(slots.chat.model) : poolN ? '模型池' : '—'}</div>
-        <div class="status-slot-note">${compN > 0 ? `可以干活：电脑操作开了 ${compN} 项（工具清单在「对话与人格」页）` : '只聊天：没开电脑操作（想让它干活去「对话与人格」页勾）'}</div>
+        <div class="status-slot-model">${modelShow}</div>
+        <div class="status-slot-note">${note}</div>
+        <div class="status-slot-actions">${btn}</div>
       </div>`;
   }
 

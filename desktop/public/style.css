@@ -1862,3 +1862,6 @@ html[data-view="home"] .app { grid-template-columns: minmax(0, 1fr); }
 .bs-msg-clock { color: var(--text-3); flex: none; }
 .bs-msg-who { flex: none; font-weight: 600; }
 .bs-msg-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 状态页模型卡的一键按钮行 */
+.status-slot-actions { margin-top: 8px; display: flex; gap: 8px; }
