@@ -974,15 +974,18 @@
         </div>
 
         <div class="tool-presets">
-          <button class="btn btn-sm btn-primary" data-tool-preset="chat">只聊天</button>
-          <button class="btn btn-sm btn-primary" data-tool-preset="work">可以干活</button>
+          <span class="tool-presets-label">一键预设</span>
+          <button class="btn btn-sm" data-tool-preset="chat">只聊天</button>
+          <button class="btn btn-sm" data-tool-preset="work">可以干活</button>
           <button class="btn btn-sm" data-tool-preset="readonly">只看不说</button>
           <button class="btn btn-sm" data-tool-preset="standard">出厂默认</button>
           <button class="btn btn-sm" data-tool-preset="all">全部打开</button>
           <span class="hint" id="tools-count">—</span>
         </div>
 
-        <div id="tool-groups" data-adv></div>
+        <p class="tool-tip">点一下预设只会帮你把下面这一批勾好，具体哪个要哪个不要，直接在下面逐个点。</p>
+
+        <div id="tool-groups"></div>
 
         <div class="actions">
           <button class="btn btn-primary" id="btn-tools-save">保存工具开关</button>

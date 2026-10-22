@@ -4082,14 +4082,17 @@ function toolBoxes() {
 }
 
 function updateToolCounts() {
-  const on = toolBoxes().filter((el) => el.checked).length;
-  const total = toolBoxes().length;
-  $('#tools-count').textContent = `开着 ${on} / ${total}`;
+  const boxes = toolBoxes();
+  const on = boxes.filter((el) => el.checked).length;
+  $('#tools-count').textContent = `开着 ${on} / ${boxes.length}`;
   for (const g of toolData?.groups ?? []) {
-    const box = $(`[data-count-for="${g.id}"]`);
-    if (!box) continue;
     const items = g.items.map((it) => $(`#tool-groups input[data-flag="${it.flag}"]`)).filter(Boolean);
-    box.textContent = `${items.filter((el) => el.checked).length}/${items.length}`;
+    const n = items.filter((el) => el.checked).length;
+    const countEl = $(`[data-count-for="${g.id}"]`);
+    if (countEl) countEl.textContent = `${n}/${items.length}`;
+    // 组头的批量按钮：全开着就写「全关」，否则写「全开」
+    const tog = $(`[data-group-toggle="${g.id}"]`);
+    if (tog) tog.textContent = n === items.length ? '全关' : '全开';
   }
 }
 
@@ -4097,25 +4100,28 @@ function renderTools() {
   const { groups, values } = toolData;
   $('#tool-groups').innerHTML = groups
     .map((g) => {
+      const n = g.items.filter((it) => values[it.flag]).length;
       const items = g.items
         .map(
           (it) => `<label class="tool-item">
             <input type="checkbox" data-flag="${esc(it.flag)}" ${values[it.flag] ? 'checked' : ''} />
             <span>
               <span class="tool-label">${esc(it.label)}</span>
-              <span class="tool-tool">${esc(it.tool)}</span>
               ${it.hint ? `<span class="tool-hint">${esc(it.hint)}</span>` : ''}
+              <span class="tool-tool" data-adv>${esc(it.tool ?? '')}</span>
             </span>
           </label>`
         )
         .join('');
-      return `<div class="tool-group">
-        <div class="tool-group-head">
-          <b>${esc(g.title)}</b><span>${esc(g.hint ?? '')}</span>
-          <span class="tool-group-count" data-count-for="${esc(g.id)}"></span>
-        </div>
+      return `<details class="tool-group" open>
+        <summary class="tool-group-head">
+          <b>${esc(g.title)}</b>
+          <span class="tool-group-hint">${esc(g.hint ?? '')}</span>
+          <span class="tool-group-count" data-count-for="${esc(g.id)}">${n}/${g.items.length}</span>
+          <span class="tool-group-toggle" data-group-toggle="${esc(g.id)}" title="这一组全开 / 全关">全开</span>
+        </summary>
         <div class="tool-items">${items}</div>
-      </div>`;
+      </details>`;
     })
     .join('');
 
@@ -4126,6 +4132,20 @@ function renderTools() {
 }
 
 $('#tool-groups').addEventListener('change', () => updateToolCounts());
+
+// 组头那个「全开 / 全关」：点它只改这一组，别顺手把整块折叠了
+$('#tool-groups').addEventListener('click', (e) => {
+  const tog = e.target.closest('[data-group-toggle]');
+  if (!tog) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const g = (toolData?.groups ?? []).find((x) => x.id === tog.dataset.groupToggle);
+  if (!g) return;
+  const boxes = g.items.map((it) => $(`#tool-groups input[data-flag="${it.flag}"]`)).filter(Boolean);
+  const allOn = boxes.length > 0 && boxes.every((el) => el.checked);
+  for (const el of boxes) el.checked = !allOn;
+  updateToolCounts();
+});
 
 $$('[data-tool-preset]').forEach((btn) => {
   btn.addEventListener('click', () => {
