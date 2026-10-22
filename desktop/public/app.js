@@ -1202,6 +1202,7 @@ function bsLoginQqHtml() {
     <div class="bs-row"><span class="hint">NapCat 状态：</span><strong id="bs-napcat-state">—</strong></div>
     <div class="bs-actions"><button class="btn btn-primary" id="bs-napcat-open">打开 NapCat 面板（没在跑会自动启动）</button></div>
     <p class="hint">NapCat 没在跑会自动拉起（十几秒），扫码和快登都在面板里。这里变成「已连接」就自动打勾。</p>
+    <p class="hint">面板若要求登录，粘贴这个 Token：<code class="mono" id="bs-napcat-token">读取中…</code> <button class="btn btn-sm btn-ghost" id="bs-token-copy">复制</button></p>
     <div class="result" id="bs-result-0"></div>`;
 }
 
@@ -1274,6 +1275,20 @@ function bindBotSheet() {
   const step = botSheetStep;
   if (step === 0) {
     $('#bs-napcat-open')?.addEventListener('click', () => openNapcatPanel());
+    api('/api/napcat/panel').then((pp) => {
+      const el = $('#bs-napcat-token');
+      if (!el) return;
+      el.textContent = pp?.ok && pp.token ? pp.token : '（NapCat 启动后自动带出）';
+    });
+    $('#bs-token-copy')?.addEventListener('click', async () => {
+      const t = $('#bs-napcat-token')?.textContent ?? '';
+      try {
+        await navigator.clipboard.writeText(t);
+        toast('Token 已复制');
+      } catch {
+        toast('复制失败，手动选中复制');
+      }
+    });
     $('#bs-wx-start')?.addEventListener('click', async (e) => {
       await busy(e.target.closest('button'), '启动中…', async () => {
         const r = await post('/api/bots/start', { platform: 'wechat' });
@@ -1381,7 +1396,8 @@ async function bsSaveModel() {
   if (!modelProfiles[pf]) modelProfiles[pf] = {};
   modelProfiles[pf].chat = data;
   modelProfiles[pf].work = { ...data, allowTools: true };
-  const r = await post('/api/model-profiles', { profiles: modelProfiles });
+  const poolEntry = data.provider && data.model ? `${data.provider}/${data.model}` : '';
+  const r = await post('/api/model-profiles', { profiles: modelProfiles, poolEntry });
   $('#bs-apiKey').value = '';
   if (r.ok === false) return setResult('#bs-result-2', r.error ?? '保存失败', 'err');
   if (r.regenerated === false) return setResult('#bs-result-2', `已保存，但生成配置失败：${r.regenError ?? '看日志'}`, 'err');
@@ -1833,7 +1849,7 @@ function fillSource(s, ma) {
 const SLOT_DEFS = [
   // 0.4.1 起只有一份模型配置：机器人的大脑就一个。「只聊天 / 可以干活」的差异
   // 全在工具清单里配（对话与人格页），不再让人配两遍模型。
-  { key: 'chat', title: '模型', hint: '机器人的大脑，一份就够。只聊天 / 可以干活的差别在「对话与人格」页的工具清单。', tools: false }
+  { key: 'chat', title: '模型', hint: '机器人的大脑，一份就够。保存后自动加进下面模型池首位。只聊天/可以干活在「对话与人格」页勾。', tools: false }
 ];
 
 async function loadModelProfiles() {
@@ -1996,7 +2012,9 @@ function bindSlotEvents() {
       modelProfiles[pf][s] = data;
       // 工作档同款模型：能力差异全在工具清单（对话与人格页），不在这份配置里
       modelProfiles[pf].work = { ...data, allowTools: true };
-      const r = await post('/api/model-profiles', { profiles: modelProfiles });
+      // 用户预期：填的模型直接进模型池首位。自定义中转站（无 provider 名）不进池
+      const poolEntry = data.provider && data.model ? `${data.provider}/${data.model}` : '';
+      const r = await post('/api/model-profiles', { profiles: modelProfiles, poolEntry });
       el('apiKey').value = '';
       if (r.ok === false) return setResult(res, r.error ?? '保存失败', 'err');
       if (r.regenerated === false) return setResult(res, `已自动保存，但生成配置失败：${r.regenError ?? '看日志'}`, 'err');

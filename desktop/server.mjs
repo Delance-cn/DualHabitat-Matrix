@@ -4869,7 +4869,30 @@ const server = http.createServer(async (req, res) => {
 
       writeJson(configFile(), cfg);
 
-      // 两档是 opencode.json 的输入：存完必须重新生成一次，否则界面上配好了、
+      // 用户预期：在「模型」面板填的模型直接进模型池首位（以后清掉档位也回落到它）。
+      // 只在有 provider 名时做（自定义中转站构不成链路条目）；池里已有同款（含变体
+      // 后缀）就原样挪到首位，保留 #none / #low 这类思考档位后缀。
+      let poolUpdated = false;
+      if (body.poolEntry) {
+        const entry = String(body.poolEntry).trim();
+        if (entry.includes('/')) {
+          const pool = loadPool();
+          const free = (pool.free ?? []).map(String);
+          const same = free.find((e) => e === entry || e.split('#')[0] === entry);
+          const top = same ?? entry;
+          const at = free.indexOf(top);
+          if (at !== 0) {
+            if (at > 0) free.splice(at, 1);
+            free.unshift(top);
+            pool.free = free;
+            if (pool.enabled === undefined) pool.enabled = true;
+            writeJson(modelsFile(), pool);
+            poolUpdated = true;
+          }
+        }
+      }
+
+      // 这份模型是 opencode.json 的输入：存完必须重新生成一次，否则界面上配好了、
       // 桥接读到的还是老配置。生成失败不回滚保存（配置已经在盘上了），
       // 但要把原因带回前端，别让人以为生效了。
       const regen = await regenerateConfig();
@@ -4893,6 +4916,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         profiles,
         botsRestarted,
+        poolUpdated,
         regenerated: regen.ok,
         regenError: regen.ok ? undefined : (() => {
           const real = (regen.lines ?? []).filter((l) => l.trim() && !l.trim().startsWith('at ') && !l.includes('node:internal'));
@@ -5572,6 +5596,16 @@ const server = http.createServer(async (req, res) => {
         if (!ready || !(await probePort(panel.port))) {
           return sendJson(res, { ok: false, error: 'NapCat 拉起来了，但面板端口 20 秒内没通——看日志页的 NapCat 输出，稍等再点一次' });
         }
+      }
+      // NapCat 启动时会轮换 WebUI token，且落盘晚于端口就绪——立刻开窗可能带着旧
+      // token，面板就会要求手动登录（0.4.2 实测踩到）。等 webui.json 里的 token
+      // 连续两次一致（或满 5 秒）再开窗。
+      for (let i = 0; i < 4; i++) {
+        const prev = napcatPanel();
+        await new Promise((r2) => setTimeout(r2, 1250));
+        const next = napcatPanel();
+        if (next.ok && prev.ok && next.token === prev.token) { panel = next; break; }
+        panel = next;
       }
       const opener = globalThis.dhmOpenChildWindow;
       if (typeof opener === 'function') {
