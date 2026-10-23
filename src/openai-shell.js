@@ -370,6 +370,7 @@ export async function startOpenAIShell({
   stateDir,
   workspaceRoot,
   agentPreset = 'qq-chat',
+  allowLocalTools = false,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   maxConcurrent = 4,
   ensurePort = 4599,
@@ -381,8 +382,16 @@ export async function startOpenAIShell({
   }
   if (!stateDir) return { ok: false, error: '缺少 stateDir（要指向模型实例的 state 目录）' };
 
+  // 带本地工具的主人档（qq-work）必须显式打开 allowLocalTools。
+  // 光把 preset 填成 qq-work 不算数 —— 升级/手滑都不该悄悄把本机交出去。
+  let effectivePreset = agentPreset;
+  if (effectivePreset === 'qq-work' && allowLocalTools !== true) {
+    log('⚠️ OpenAI 兼容壳配了 qq-work 但没开 allowLocalTools，已降级为 qq-chat（无本地工具）');
+    effectivePreset = 'qq-chat';
+  }
+
   const { key, created, source } = loadOrCreateKey(keyFile, apiKey);
-  const runner = new MatrixRunner({ stateDir, workspaceRoot, agentPreset, timeoutMs, maxConcurrent, ensurePort, log });
+  const runner = new MatrixRunner({ stateDir, workspaceRoot, agentPreset: effectivePreset, timeoutMs, maxConcurrent, ensurePort, log });
 
   try {
     await runner.start();
@@ -415,7 +424,7 @@ export async function startOpenAIShell({
         ok: true,
         service: 'dualhabitat-matrix-openai-shell',
         startedAt: runner.startedAt,
-        agentPreset,
+        agentPreset: effectivePreset,
         stats: runner.stats
       });
     }
@@ -512,7 +521,7 @@ export async function startOpenAIShell({
     server.listen(numPort, '127.0.0.1', () => {
       const actual = server.address()?.port ?? numPort;
       log(
-        `OpenAI 兼容壳已就绪：http://127.0.0.1:${actual}/v1（Bearer key ${created ? '已生成' : source === 'config' ? '来自 config' : '读自 state'}；agent=${agentPreset}）`
+        `OpenAI 兼容壳已就绪：http://127.0.0.1:${actual}/v1（Bearer key ${created ? '已生成' : source === 'config' ? '来自 config' : '读自 state'}；agent=${effectivePreset}${effectivePreset === 'qq-work' ? '，含本地工具、仅主人可用' : ''}）`
       );
       resolve({
         ok: true,

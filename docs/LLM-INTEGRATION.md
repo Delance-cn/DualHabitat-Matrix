@@ -116,13 +116,46 @@ Python / JS SDK 只改 `base_url` 和 `api_key` 两行即可。
 |---|---|
 | 非流式 | ✅ 完整支持（`usage` 是按字数估的，不参与计费） |
 | `stream: true` | ⚠️ **假流式**：全文一次性发完再 `[DONE]`，协议合规、内容正确，但没有逐字推送 |
-| `tools` / function calling | ❌ 不转发（带了也不报错，模型看不到工具） |
+| `tools` / function calling | ⚠️ 客户端传的 `tools` 不转发（模型看不到客户端工具）；**本地工具**由 MCP 提供，见 1.4 |
 | 多轮上下文 | 每条请求建一个新会话、结束即归档；历史靠客户端每次带全 `messages` |
 | 后端依赖 | 只在内置实例模式（没配 `backend` 或 `matrix`）下启动；直连模型/CLI 后端时壳不启 |
 
 > 之所以要「常驻一条事件流」而不是每请求开一条：`events.mux()` 的 `for await` 里
 > `break` 不会关掉底层订阅，按请求开会持续泄漏 SSE 连接（`oc-client.js` 5.5 节）。
 > 壳里全局只开一条，按 `sessionId` 分发给各个等待者。
+
+### 1.4 本地 Agent 工具（0.5.1）—— 主人专属
+
+壳和主人档都能用一组「真能干活」的本地工具（`src/mcp-agent-tools.js`，MCP 服务名
+`agent-tools`）。默认关闭，桌面端「扩展 → 本地 Agent 工具」打开后写
+`config.json` → `agentTools.enabled=true`，重新生成 `opencode.json` 并重启桥接才生效。
+
+| 工具 | 作用 |
+|---|---|
+| `list_directory(path)` | 列目录（名称 / 大小 / 类型） |
+| `read_file(path, maxBytes?)` | 读文本；二进制（前 8KB 有 NUL）直接拒绝 |
+| `write_file(path, content)` | 原子写（tmp + rename），父目录自动建 |
+| `execute_command(command, timeoutMs?)` | 沙箱根下跑命令，默认 30s 超时，杀进程树 |
+| `search_files(path?, pattern?, content?)` | 按路径 / 内容正则搜，跳过 node_modules/.git/dist |
+| `workspace_info()` | 看沙箱根、上限、主人是否已配置 |
+
+安全边界（别高估）：
+
+- **权限只给 `qq-work`**：`oc-config.js` 只给主人档加 `agent-tools_*`（agent 级 allow），
+  全局第一条仍是 `* → deny`；`qq-chat` / `qq-chat-v2` 永远没有。
+- **身份在路由侧**：QQ 只有 `ownerQQ` 私聊能进 `qq-work`；微信是
+  `platforms.wechat.ownerId`；兼容壳是 Bearer key。MCP 启动时若一个主人 ID 都没有，
+  六个工具全部拒绝（fail-closed）。
+- **路径是真围栏**：`agentTools.sandboxRoot`（默认 `sessionCwd`）之外、`..`、
+  设备路径、UNC、经 junction/symlink 绕行全部拒绝；写文件前对「最近的已存在祖先」
+  再做一次 realpath 检查。
+- **命令不是沙箱**：cwd 固定在沙箱根，黑名单只挡 `rm -rf` / `del /f /s /q` /
+  `format` / `diskpart` / `shutdown` / `reg delete` / `git clean` / `curl | sh` 这类
+  一句就能造成不可逆破坏的写法。命令仍以当前用户权限运行，能写到围栏外、能联网。
+  要真隔离请用 Windows Sandbox / 容器。
+- **壳的降级**：`openaiShell.agentPreset=qq-work` 必须同时
+  `openaiShell.allowLocalTools=true`，否则壳启动时自动降级为 `qq-chat`；
+  桌面端保存时也会直接拒绝「只选 qq-work 不授权」的组合。
 
 `cf-shim`（4600）仍是另一条路，只服务 Cloudflare Workers AI 的模型，健康与否取决于
 `CLOUDFLARE_API_TOKEN`。两者不冲突：要「同一个人格 + 模型池故障转移」用 4610，

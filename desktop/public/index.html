@@ -1024,7 +1024,41 @@
             <label for="tts-voice">嗓音名（留空 = 引擎默认）</label>
             <input id="tts-voice" placeholder="zh-CN-XiaoxiaoNeural" spellcheck="false" />
           </div>
+          <div class="field" style="max-width:130px">
+            <label for="tts-maxchars">最长字数</label>
+            <input id="tts-maxchars" type="number" min="50" max="2000" step="50" placeholder="2000" />
+          </div>
         </div>
+        <p class="hint" style="margin:-4px 0 8px">Auto 顺序：Edge 在线（默认晓晓）→ 失败自动换 <strong>慧慧</strong>（zh-CN-HuihuiNeural）→ 再失败落 Windows 离线（本机 Huihui）。超过最长字数会按句子边界截断，并在返回里标明。</p>
+        <details class="help" style="margin:0 0 10px">
+          <summary>自定义 TTS 引擎（+ 添加：GPT-SoVITS / Bert-VITS2 / 任意命令）</summary>
+          <div class="help-body">
+            <p>命令模板只认两个占位符：<code>{textFile}</code> = 待合成文本的 UTF-8 临时文件，<code>{out}</code> = 要写出的音频文件。<b>故意不提供 <code>{text}</code></b> —— 文本来自聊天内容，直接拼进 shell 等于开放命令注入。例：<code>edge-tts --file {textFile} --write-media {out} --voice zh-CN-YunxiNeural</code></p>
+            <div class="field-row">
+              <div class="field" style="max-width:120px">
+                <label for="tts-custom-id">id</label>
+                <input id="tts-custom-id" placeholder="gpt-sovits" spellcheck="false" />
+              </div>
+              <div class="field" style="max-width:140px">
+                <label for="tts-custom-label">显示名</label>
+                <input id="tts-custom-label" placeholder="GPT-SoVITS" />
+              </div>
+              <div class="field" style="max-width:90px">
+                <label for="tts-custom-format">格式</label>
+                <select id="tts-custom-format"><option value="mp3">mp3</option><option value="wav">wav</option></select>
+              </div>
+              <div class="field" style="flex:1">
+                <label for="tts-custom-command">命令模板</label>
+                <input id="tts-custom-command" placeholder="python sovits.py --text {textFile} --out {out}" spellcheck="false" />
+              </div>
+            </div>
+            <div class="field-row" style="margin-top:8px;align-items:center">
+              <button class="btn btn-sm" id="btn-tts-custom-add">添加 / 更新</button>
+              <span class="result" id="tts-custom-result"></span>
+            </div>
+            <div id="tts-custom-list"></div>
+          </div>
+        </details>
         <label class="switch-row">
           <input type="checkbox" id="tts-wechat-follow" />
           <span>
@@ -1096,6 +1130,46 @@
             <input id="draw-moment-limit" type="number" min="1" max="500" />
           </div>
         </div>
+
+        <details class="help" style="margin:10px 0">
+          <summary>自定义出图服务（+ 添加：OpenAI 兼容 /images/generations）</summary>
+          <div class="help-body">
+            <p>会向 <code>{baseUrl}/images/generations</code> POST <code>{ model, prompt, size, n:1, response_format:"b64_json" }</code>；返回 <code>url</code> 的也会自动下载。API key 从 <b>secrets.json</b> 里按「Key 环境变量」那列取，不写进 config.json。sizeTemplate 用 <code>{w}</code>/<code>{h}</code>，OpenAI 系写 <code>{w}x{h}</code>，DashScope 系写 <code>{w}*{h}</code>。</p>
+            <div class="field-row">
+              <div class="field" style="max-width:110px">
+                <label for="draw-custom-id">id</label>
+                <input id="draw-custom-id" placeholder="siliconflow" spellcheck="false" />
+              </div>
+              <div class="field" style="max-width:130px">
+                <label for="draw-custom-label">显示名</label>
+                <input id="draw-custom-label" placeholder="硅基流动" />
+              </div>
+              <div class="field" style="flex:1">
+                <label for="draw-custom-baseurl">baseUrl</label>
+                <input id="draw-custom-baseurl" placeholder="https://api.siliconflow.cn/v1" spellcheck="false" />
+              </div>
+            </div>
+            <div class="field-row" style="margin-top:8px">
+              <div class="field" style="flex:1">
+                <label for="draw-custom-model">模型名</label>
+                <input id="draw-custom-model" placeholder="Kwai-Kolors/Kolors" spellcheck="false" />
+              </div>
+              <div class="field" style="max-width:190px">
+                <label for="draw-custom-keyenv">Key 环境变量</label>
+                <input id="draw-custom-keyenv" placeholder="SILICONFLOW_API_KEY" spellcheck="false" />
+              </div>
+              <div class="field" style="max-width:130px">
+                <label for="draw-custom-size">sizeTemplate</label>
+                <input id="draw-custom-size" placeholder="{w}x{h}" spellcheck="false" />
+              </div>
+            </div>
+            <div class="field-row" style="margin-top:8px;align-items:center">
+              <button class="btn btn-sm" id="btn-draw-custom-add">添加 / 更新</button>
+              <span class="result" id="draw-custom-result"></span>
+            </div>
+            <div id="draw-custom-list"></div>
+          </div>
+        </details>
 
         <div class="field-row" style="margin-top:13px">
           <div class="field" style="flex:1">
@@ -1793,6 +1867,10 @@
             </select>
           </div>
         </div>
+        <label class="switch-row">
+          <input type="checkbox" id="ext-shell-localtools" />
+          <span><strong>允许本地工具（仅主人）</strong><em>不勾 = 就算选了 qq-work 也强制降级成 qq-chat；勾了才会真的读写文件/跑命令（还要在下面「本地 Agent 工具」里启用）</em></span>
+        </label>
         <div class="field">
           <label for="ext-shell-key">访问 key（请求头 Authorization: Bearer …）</label>
           <div class="field-row" style="align-items:center">
@@ -1806,6 +1884,42 @@
           <span class="result" id="ext-shell-result"></span>
         </div>
         <p class="hint">壳只绑 127.0.0.1，别拿去给局域网裸开。原生模型 API 仍是 <code>http://127.0.0.1:4599</code>（Basic 鉴权、非 OpenAI 协议，见 docs/LLM-INTEGRATION.md）。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>本地 Agent 工具（函数调用）</h2>
+          <span class="hint" id="at-state"></span>
+        </div>
+        <p class="hint">给主人档和兼容壳一组真能干活的工具：<code>list_directory</code> / <code>read_file</code> / <code>write_file</code> / <code>execute_command</code> / <code>search_files</code>。只对主人（QQ 的 ownerQQ / 微信的 ownerId）生效，群聊档永远没有。</p>
+        <label class="switch-row">
+          <input type="checkbox" id="at-enabled" />
+          <span><strong>启用本地 Agent 工具</strong><em>保存后会重新生成 opencode.json 并重启 QQ BOT；MCP 只注册给 qq-work 主人档</em></span>
+        </label>
+        <div class="field-row">
+          <div class="field" style="flex:1">
+            <label for="at-sandbox">沙箱目录（读写只能在这下面）</label>
+            <input id="at-sandbox" placeholder="留空 = 会话工作目录（sessionCwd）" spellcheck="false" />
+          </div>
+          <div class="field" style="max-width:160px">
+            <label for="at-timeout">命令超时（毫秒）</label>
+            <input id="at-timeout" type="number" min="1000" max="120000" step="1000" placeholder="30000" />
+          </div>
+        </div>
+        <p class="hint" id="at-owner"></p>
+        <div class="field-row" style="margin-top:10px;align-items:center">
+          <button class="btn" id="btn-at-save">保存</button>
+          <span class="result" id="at-result"></span>
+        </div>
+        <details class="help">
+          <summary>安全边界（必读）</summary>
+          <div class="help-body">
+            <p><b>路径围栏</b>：所有读写都解析到沙箱内，<code>..</code>、域外绝对路径、Windows 设备路径、UNC、符号链接/junction 绕行全部拒绝。</p>
+            <p><b>命令黑名单</b>：rm -rf / del /f /s /q / format / diskpart / shutdown / reg delete / git clean / git reset --hard / curl | sh 等直接拒绝。<b>但命令不是文件沙箱</b>：cwd 固定在沙箱根，命令仍以当前用户权限运行，能写到围栏外、能联网。要真隔离请用 Windows Sandbox / 容器。</p>
+            <p><b>超时 / 输出</b>：默认 30 秒，超时杀整棵进程树；stdout+stderr 合计上限 128KB。</p>
+            <p><b>身份</b>：MCP 协议本身不带发送者，所以闸门在路由侧 —— QQ/微信只有 owner 私聊能进 closed-agent（qq-work），兼容壳是 Bearer key。配置里一个主人 ID 都没有时，工具整体拒绝服务。</p>
+          </div>
+        </details>
       </div>
 
       <div class="panel">

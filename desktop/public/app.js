@@ -3224,11 +3224,13 @@ async function loadExtensions() {
       $('#ext-shell-enabled').checked = sh.enabled === true;
       $('#ext-shell-port').value = shPort;
       $('#ext-shell-agent').value = sh.agentPreset ?? 'qq-chat';
+      $('#ext-shell-localtools').checked = sh.allowLocalTools === true;
       $('#ext-shell-key').value = sh.key ?? '';
       $('#ext-shell-base').textContent = `http://127.0.0.1:${shPort}/v1`;
       $('#ext-shell-state').textContent = sh.enabled
         ? '已启用（桥接在跑时才真的监听）'
         : '未启用';
+      await loadAgentTools();
     }
   } catch { /* 服务没起好就静默 */ }
   try {
@@ -3356,7 +3358,8 @@ $('#btn-ext-shell-save')?.addEventListener('click', async (e) => {
     const r = await post('/api/openai-shell', {
       enabled: $('#ext-shell-enabled').checked,
       port: Number($('#ext-shell-port').value) || 4610,
-      agentPreset: $('#ext-shell-agent').value
+      agentPreset: $('#ext-shell-agent').value,
+      allowLocalTools: $('#ext-shell-localtools').checked
     });
     if (r.ok === false) return setResult('#ext-shell-result', r.error ?? '保存失败', 'err');
     setResult('#ext-shell-result', r.botsRestarted ? '已保存 ✓ QQ BOT 已重启' : '已保存 ✓（下次启动桥接生效）', 'saved');
@@ -3373,6 +3376,43 @@ $('#btn-ext-shell-newkey')?.addEventListener('click', async (e) => {
     $('#ext-shell-key').value = r.key ?? '';
     setResult('#ext-shell-result', '新 key 已生成 ✓', 'saved');
     setTimeout(() => refreshShellUi().catch(() => {}), 600);
+  });
+});
+
+/* ── 本地 Agent 工具（MCP agent-tools） ───────────────────────────────── */
+
+async function loadAgentTools() {
+  try {
+    const r = await api('/api/agent-tools');
+    if (!r || r.ok === false) return;
+    $('#at-enabled').checked = r.enabled === true;
+    $('#at-sandbox').value = r.sandboxRoot ?? '';
+    $('#at-sandbox').placeholder = r.usesSessionCwd
+      ? `留空 = 会话工作目录：${r.effectiveSandboxRoot ?? ''}`
+      : '留空 = 会话工作目录（sessionCwd）';
+    $('#at-timeout').value = r.timeoutMs ?? 30000;
+    const owners = [r.ownerQQ ? `QQ ${r.ownerQQ}` : '', r.ownerWechat ? `微信 ${r.ownerWechat}` : ''].filter(Boolean);
+    $('#at-owner').textContent = owners.length
+      ? `当前主人：${owners.join(' / ')} · 生效沙箱：${r.effectiveSandboxRoot}`
+      : '⚠️ 还没配主人 ID（QQ ownerQQ / 微信 ownerId）—— 工具会整体拒绝服务';
+    $('#at-state').textContent = r.enabled
+      ? (r.shellPreset === 'qq-work' && r.shellAllowLocalTools ? '已启用 · 兼容壳已接 qq-work' : '已启用')
+      : '未启用';
+  } catch { /* 服务没起好就静默 */ }
+}
+
+$('#btn-at-save')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/agent-tools', {
+      enabled: $('#at-enabled').checked,
+      sandboxRoot: $('#at-sandbox').value.trim(),
+      timeoutMs: Number($('#at-timeout').value) || 30000
+    });
+    if (r.ok === false) return setResult('#at-result', r.error ?? '保存失败', 'err');
+    const bits = [r.botsRestarted ? 'QQ BOT 已重启' : '下次启动生效'];
+    if (r.regenerated === false) bits.push('opencode.json 重新生成失败，看日志');
+    setResult('#at-result', `已保存 ✓ ${bits.join(' · ')}`, 'saved');
+    setTimeout(() => loadAgentTools().catch(() => {}), 800);
   });
 });
 
@@ -4442,13 +4482,48 @@ $('#btn-tools-restart').addEventListener('click', async (e) => {
 /* ── 9.5 语音库与 TTS（聊天页 QQ） ────────────────────── */
 
 let voiceLibFiles = [];
+let ttsCustomEngines = [];
+
+function renderTtsProviderOptions() {
+  const sel = $('#tts-provider');
+  if (!sel) return;
+  const current = sel.value;
+  for (const opt of [...sel.querySelectorAll('option[data-custom="1"]')]) opt.remove();
+  for (const e of ttsCustomEngines) {
+    const opt = document.createElement('option');
+    opt.value = `custom:${e.id}`;
+    opt.textContent = `自定义 · ${e.label}（${e.format}）`;
+    opt.dataset.custom = '1';
+    sel.appendChild(opt);
+  }
+  if ([...sel.options].some((o) => o.value === current)) sel.value = current;
+}
+
+function renderTtsCustomList() {
+  const box = $('#tts-custom-list');
+  if (!box) return;
+  if (!ttsCustomEngines.length) {
+    box.innerHTML = '<p class="hint" style="margin:6px 0 0">还没加自定义引擎 —— 填好上面一行点「添加」，就会出现在引擎下拉框里。</p>';
+    return;
+  }
+  box.innerHTML = ttsCustomEngines.map((e) => `<div style="display:flex;gap:8px;align-items:baseline;padding:5px 0;border-top:1px dashed rgba(127,127,127,.25)">
+    <code>custom:${esc(e.id)}</code>
+    <strong>${esc(e.label)}</strong>
+    <span class="hint" style="flex:1;word-break:break-all">${esc(e.format)} · ${esc(e.command)}</span>
+    <button class="btn btn-sm" data-tts-custom-del="${esc(e.id)}">删除</button>
+  </div>`).join('');
+}
 
 async function loadVoicePanel() {
   try {
     const s = await api('/api/voice-tts');
     if (s && s.ok !== false) {
+      ttsCustomEngines = Array.isArray(s.custom) ? s.custom : [];
+      renderTtsProviderOptions();
+      renderTtsCustomList();
       $('#tts-provider').value = s.provider ?? 'auto';
       $('#tts-voice').value = s.voice ?? '';
+      $('#tts-maxchars').value = s.maxChars ?? 2000;
       $('#tts-wechat-follow').checked = s.wechatFollow === true;
     }
     const lib = await api('/api/voice-library');
@@ -4488,7 +4563,13 @@ let voiceSaveTimer = null;
 function scheduleVoiceSave(extra = {}) {
   clearTimeout(voiceSaveTimer);
   voiceSaveTimer = setTimeout(async () => {
-    const payload = { provider: $('#tts-provider').value, voice: $('#tts-voice').value.trim(), wechatFollow: $('#tts-wechat-follow').checked, ...extra };
+    const payload = {
+      provider: $('#tts-provider').value,
+      voice: $('#tts-voice').value.trim(),
+      maxChars: Number($('#tts-maxchars').value) || 2000,
+      wechatFollow: $('#tts-wechat-follow').checked,
+      ...extra
+    };
     const r = await post('/api/voice-tts', payload);
     if (r.ok === false) return setResult('#tts-result', r.error ?? '保存失败', 'err');
     setResult('#tts-result', r.botsRestarted ? '已保存 ✓ 在跑的 QQ BOT 已重启，立即生效' : '已保存 ✓ BOT 没在跑，下次启动生效', 'saved');
@@ -4498,7 +4579,41 @@ function scheduleVoiceSave(extra = {}) {
 
 $('#tts-provider').addEventListener('change', () => scheduleVoiceSave());
 $('#tts-voice').addEventListener('change', () => scheduleVoiceSave());
+$('#tts-maxchars').addEventListener('change', () => scheduleVoiceSave());
 $('#tts-wechat-follow').addEventListener('change', () => scheduleVoiceSave());
+
+$('#btn-tts-custom-add')?.addEventListener('click', async (e) => {
+  const id = $('#tts-custom-id').value.trim();
+  const label = $('#tts-custom-label').value.trim();
+  const command = $('#tts-custom-command').value.trim();
+  const format = $('#tts-custom-format').value;
+  if (!/^[a-z0-9][a-z0-9_-]{0,31}$/i.test(id)) return setResult('#tts-custom-result', 'id 只能是英文/数字/-_，且以字母数字开头', 'err');
+  if (!command || !command.includes('{out}')) return setResult('#tts-custom-result', '命令模板必须包含 {out}', 'err');
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const next = ttsCustomEngines.filter((x) => x.id !== id);
+    next.push({ id, label, command, format });
+    const r = await post('/api/voice-tts', { custom: next, provider: `custom:${id}` });
+    if (r.ok === false) return setResult('#tts-custom-result', r.error ?? '保存失败', 'err');
+    $('#tts-custom-id').value = '';
+    $('#tts-custom-label').value = '';
+    $('#tts-custom-command').value = '';
+    setResult('#tts-custom-result', '已保存 ✓ 并切到这个引擎', 'saved');
+    await loadVoicePanel();
+  });
+});
+
+$('#tts-custom-list')?.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-tts-custom-del]');
+  if (!btn) return;
+  const id = btn.getAttribute('data-tts-custom-del');
+  if (!window.confirm(`删除自定义 TTS 引擎「${id}」？`)) return;
+  await busy(btn, '删除中…', async () => {
+    const r = await post('/api/voice-tts', { custom: ttsCustomEngines.filter((x) => x.id !== id) });
+    if (r.ok === false) return setResult('#tts-custom-result', r.error ?? '删除失败', 'err');
+    setResult('#tts-custom-result', '已删除 ✓', 'saved');
+    await loadVoicePanel();
+  });
+});
 
 $('#btn-tts-preview').addEventListener('click', async (e) => {
   const text = $('#tts-preview-text').value.trim();
@@ -4506,8 +4621,12 @@ $('#btn-tts-preview').addEventListener('click', async (e) => {
   await busy(e.target.closest('button'), '合成中…', async () => {
     const r = await post('/api/voice-tts', { text });
     if (r.ok === false) return setResult('#tts-result', r.error ?? '合成失败', 'err');
-    if (r.preview) setResult('#tts-result', `合成成功：${r.preview.provider} / ${r.preview.voice}`, 'ok');
-    else setResult('#tts-result', '已保存', 'ok');
+    if (r.preview) {
+      const p = r.preview;
+      const cut = p.truncated ? ` · 已按句子截断（${p.chars} → ${p.usedChars} 字）` : '';
+      const fb = p.voiceFallback ? ' · 默认嗓音失败，已用慧慧兜底' : '';
+      setResult('#tts-result', `合成成功：${p.provider} / ${p.voice}${fb}${cut}`, 'ok');
+    } else setResult('#tts-result', '已保存', 'ok');
     if (r.preview?.name) playVoiceFile(r.preview.name);
   });
 });
@@ -4550,11 +4669,45 @@ $('#voice-lib-list').addEventListener('click', async (e) => {
 /* ── 9.6 画画与动态（聊天页 QQ） ────────────────────── */
 
 let imageLibFiles = [];
+let drawCustomEngines = [];
+
+function renderDrawProviderOptions() {
+  const sel = $('#draw-provider');
+  if (!sel) return;
+  const current = sel.value;
+  for (const opt of [...sel.querySelectorAll('option[data-custom="1"]')]) opt.remove();
+  for (const e of drawCustomEngines) {
+    const opt = document.createElement('option');
+    opt.value = `custom:${e.id}`;
+    opt.textContent = `自定义 · ${e.label}（${e.model}）`;
+    opt.dataset.custom = '1';
+    sel.appendChild(opt);
+  }
+  if ([...sel.options].some((o) => o.value === current)) sel.value = current;
+}
+
+function renderDrawCustomList() {
+  const box = $('#draw-custom-list');
+  if (!box) return;
+  if (!drawCustomEngines.length) {
+    box.innerHTML = '<p class="hint" style="margin:6px 0 0">还没加自定义出图服务 —— 填好上面一行点「添加」，就会出现在引擎下拉框里。</p>';
+    return;
+  }
+  box.innerHTML = drawCustomEngines.map((e) => `<div style="display:flex;gap:8px;align-items:baseline;padding:5px 0;border-top:1px dashed rgba(127,127,127,.25)">
+    <code>custom:${esc(e.id)}</code>
+    <strong>${esc(e.label)}</strong>
+    <span class="hint" style="flex:1;word-break:break-all">${esc(e.model)} · ${esc(e.baseUrl)} · ${esc(e.apiKeyEnv)} · ${esc(e.sizeTemplate)}</span>
+    <button class="btn btn-sm" data-draw-custom-del="${esc(e.id)}">删除</button>
+  </div>`).join('');
+}
 
 async function loadDrawPanel() {
   try {
     const s = await api('/api/draw');
     if (s && s.ok !== false) {
+      drawCustomEngines = Array.isArray(s.custom) ? s.custom : [];
+      renderDrawProviderOptions();
+      renderDrawCustomList();
       $('#draw-provider').value = s.provider ?? 'auto';
       $('#draw-size').value = s.size ?? '1024x1024';
       $('#draw-daily-limit').value = s.dailyLimit ?? 30;
@@ -4606,6 +4759,42 @@ $('#draw-provider').addEventListener('change', () => scheduleDrawSave());
 $('#draw-size').addEventListener('change', () => scheduleDrawSave());
 $('#draw-daily-limit').addEventListener('change', () => scheduleDrawSave());
 $('#draw-moment-limit').addEventListener('change', () => scheduleDrawSave());
+
+$('#btn-draw-custom-add')?.addEventListener('click', async (e) => {
+  const id = $('#draw-custom-id').value.trim();
+  const label = $('#draw-custom-label').value.trim();
+  const baseUrl = $('#draw-custom-baseurl').value.trim();
+  const model = $('#draw-custom-model').value.trim();
+  const apiKeyEnv = $('#draw-custom-keyenv').value.trim();
+  const sizeTemplate = $('#draw-custom-size').value.trim() || '{w}x{h}';
+  if (!/^[a-z0-9][a-z0-9_-]{0,31}$/i.test(id)) return setResult('#draw-custom-result', 'id 只能是英文/数字/-_，且以字母数字开头', 'err');
+  if (!/^https?:\/\//i.test(baseUrl)) return setResult('#draw-custom-result', 'baseUrl 要以 http:// 或 https:// 开头', 'err');
+  if (!model) return setResult('#draw-custom-result', '模型名不能为空', 'err');
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(apiKeyEnv)) return setResult('#draw-custom-result', 'Key 环境变量只能是字母/数字/下划线', 'err');
+  if (!sizeTemplate.includes('{w}') || !sizeTemplate.includes('{h}')) return setResult('#draw-custom-result', 'sizeTemplate 必须包含 {w} 和 {h}', 'err');
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const next = drawCustomEngines.filter((x) => x.id !== id);
+    next.push({ id, label, baseUrl, model, apiKeyEnv, sizeTemplate });
+    const r = await post('/api/draw', { custom: next, provider: `custom:${id}` });
+    if (r.ok === false) return setResult('#draw-custom-result', r.error ?? '保存失败', 'err');
+    for (const key of ['#draw-custom-id', '#draw-custom-label', '#draw-custom-baseurl', '#draw-custom-model', '#draw-custom-keyenv', '#draw-custom-size']) $(key).value = '';
+    setResult('#draw-custom-result', '已保存 ✓ 并切到这个引擎', 'saved');
+    await loadDrawPanel();
+  });
+});
+
+$('#draw-custom-list')?.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-draw-custom-del]');
+  if (!btn) return;
+  const id = btn.getAttribute('data-draw-custom-del');
+  if (!window.confirm(`删除自定义出图服务「${id}」？`)) return;
+  await busy(btn, '删除中…', async () => {
+    const r = await post('/api/draw', { custom: drawCustomEngines.filter((x) => x.id !== id) });
+    if (r.ok === false) return setResult('#draw-custom-result', r.error ?? '删除失败', 'err');
+    setResult('#draw-custom-result', '已删除 ✓', 'saved');
+    await loadDrawPanel();
+  });
+});
 
 $('#btn-draw-preview').addEventListener('click', async (e) => {
   const text = $('#draw-preview-text').value.trim();

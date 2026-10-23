@@ -26,22 +26,156 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { resolveDataRoot } from './data-root.js';
+
+const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const DATA_ROOT = resolveDataRoot(CODE_ROOT);
 
 export const TTS_PROVIDERS = ['auto', 'edge', 'sapi'];
 export const TTS_DEFAULT_VOICES = {
   edge: 'zh-CN-XiaoxiaoNeural',
   sapi: '' // 空 = 合成时自己挑第一个 zh-* 嗓音
 };
+/** Edge 在线嗓音的兜底：晓晓失败（嗓音不可用/区域问题）时换慧慧再试一次。 */
+export const EDGE_FALLBACK_VOICE = 'zh-CN-HuihuiNeural';
 
-const MAX_CHARS = 2000;
+/* ── 自定义 TTS 引擎（命令模板） ───────────────────────────────────────── */
+// 预设引擎只有 edge / sapi，想接 GPT-SoVITS、Bert-VITS2、火山、自建 HTTP 服务……
+// 都在 config.socialV2.voice.tts.custom 里加一条，不用改代码。
+//
+// 模板只认两个占位符：
+//   {textFile} — 待合成文本的 UTF-8 临时文件路径（推荐，避免把用户文本拼进命令行）
+//   {out}      — 期望写出的音频文件路径
+// 刻意**不提供** {text}：文本来自聊天内容，直接拼进 shell 等于把命令注入面开放给群友。
+export const CUSTOM_ENGINE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
 
-/** 清洗待合成文本：控制字符去掉、过长截断（保留 \t \n \r —— SSML 多行文档需要）。 */
-function sanitizeText(text) {
+/** 归一化一条自定义引擎配置；不合法返回 null（供 UI/接口复用同一套规则）。 */
+export function normalizeCustomEngine(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = String(raw.id ?? '').trim();
+  if (!CUSTOM_ENGINE_ID_RE.test(id)) return null;
+  const command = String(raw.command ?? '').trim();
+  if (!command || !command.includes('{out}')) return null;
+  return {
+    id,
+    label: String(raw.label ?? '').trim().slice(0, 40) || id,
+    command: command.slice(0, 2000),
+    format: ['mp3', 'wav'].includes(String(raw.format ?? '').toLowerCase()) ? String(raw.format).toLowerCase() : 'mp3',
+    timeoutMs: Math.max(1000, Math.min(120_000, Math.floor(Number(raw.timeoutMs) || 60_000)))
+  };
+}
+
+/** 读配置里的自定义引擎（每次都重读：桌面端改完立刻生效）。 */
+export function readCustomTtsEngines() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, 'config.json'), 'utf8'));
+    const list = cfg?.socialV2?.voice?.tts?.custom;
+    if (!Array.isArray(list)) return [];
+    return list.map(normalizeCustomEngine).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function quoteArg(value) {
+  const s = String(value);
+  return process.platform === 'win32'
+    ? `"${s.replace(/"/g, '""')}"`
+    : `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+function killChildTree(child) {
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    } else {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+    }
+  } catch { /* 已退出 */ }
+}
+
+/** 跑一条自定义引擎命令。成功 = 退出码 0 且 {out} 有内容。 */
+async function ttsCustom(text, outPath, engine) {
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dhm-tts-custom-'));
+  const textFile = path.join(workDir, 'text.txt');
+  fs.writeFileSync(textFile, text, 'utf8');
+  try { fs.rmSync(outPath, { force: true }); } catch { /* ignore */ }
+  const command = engine.command
+    .replaceAll('{textFile}', quoteArg(textFile))
+    .replaceAll('{out}', quoteArg(outPath));
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(command, {
+      shell: true,
+      cwd: workDir,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let out = '';
+    let err = '';
+    let timedOut = false;
+    const cap = (into) => (chunk) => {
+      const s = chunk.toString('utf8');
+      if (into === 'out') out = (out + s).slice(-4000);
+      else err = (err + s).slice(-4000);
+    };
+    child.stdout.on('data', cap('out'));
+    child.stderr.on('data', cap('err'));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChildTree(child);
+    }, engine.timeoutMs);
+    child.on('error', (e) => { clearTimeout(timer); reject(new Error(`启动自定义引擎失败：${e?.message ?? e}`)); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (timedOut) return reject(new Error(`自定义引擎超时（${engine.timeoutMs} ms）`));
+      if (code !== 0) {
+        const tail = (err || out).trim().split(/\r?\n/).slice(-3).join(' / ');
+        return reject(new Error(`自定义引擎退出码 ${code}${tail ? `：${tail}` : ''}`));
+      }
+      resolve();
+    });
+  }).finally(() => {
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  if (!fs.existsSync(outPath)) throw new Error(`自定义引擎没有写出音频（检查命令里的 {out}）：${outPath}`);
+  const bytes = fs.statSync(outPath).size;
+  if (bytes < 200) throw new Error(`自定义引擎输出为空音频（${bytes} B）`);
+}
+
+/** 单次合成的字数上限（可被 config 的 voice.tts.maxChars 覆盖，范围 50-2000）。 */
+export const TTS_MAX_CHARS = 2000;
+
+export function clampMaxChars(value) {
+  const n = Math.floor(Number(value) || 0);
+  if (!Number.isFinite(n) || n <= 0) return TTS_MAX_CHARS;
+  return Math.max(50, Math.min(TTS_MAX_CHARS, n));
+}
+
+/**
+ * 清洗待合成文本：控制字符去掉、过长按句子边界截断（保留 \t \n \r —— SSML 多行文档需要）。
+ *
+ * 为什么不直接 slice：截在句子中间，语音会戛然而止。优先在 。！？；\n 处断，
+ * 找不到合适的断点（< 上限的 60%）才硬截。返回 truncated/chars 让调用方如实告知。
+ */
+export function prepareText(text, maxChars = TTS_MAX_CHARS) {
+  const limit = clampMaxChars(maxChars);
   const clean = String(text ?? '')
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
     .trim();
   if (!clean) throw new Error('没有要合成的内容');
-  return clean.length > MAX_CHARS ? clean.slice(0, MAX_CHARS) : clean;
+  if (clean.length <= limit) return { text: clean, truncated: false, chars: clean.length, used: clean.length, maxChars: limit };
+  if (isSsmlDocument(clean)) {
+    throw new Error(`SSML 文档太长（${clean.length} 字，上限 ${limit} 字），先拆成几句再合成`);
+  }
+  const head = clean.slice(0, limit);
+  const marks = ['。', '！', '？', '；', '\n', '，'];
+  let cut = -1;
+  for (const mark of marks) cut = Math.max(cut, head.lastIndexOf(mark));
+  const end = cut > limit * 0.6 ? cut + 1 : limit;
+  return { text: clean.slice(0, end), truncated: true, chars: clean.length, used: end, maxChars: limit };
 }
 
 /** 是不是完整 SSML 文档（<?xml 声明开头，或 <speak> 根元素）。 */
@@ -69,17 +203,47 @@ function ensureEdgeVoice(ssml, voiceName) {
 }
 
 /**
+ * Edge 合成降级：按候选嗓音顺序试，每个遇到 429/掉线再短重试一次。
+ * @param {string[]} voices 候选嗓音（去重由调用方保证）
+ * @param {(voice: string) => Promise<void>} attempt 用指定嗓音合成；失败抛错
+ * @returns {Promise<string>} 实际成功的嗓音
+ */
+export async function withEdgeFallback(voices, attempt, { retryDelayMs = 1500 } = {}) {
+  let lastErr = null;
+  for (const voice of voices) {
+    for (let attemptNo = 1; attemptNo <= 2; attemptNo++) {
+      try {
+        await attempt(voice);
+        return voice;
+      } catch (err) {
+        lastErr = err;
+        const msg = String(err?.message ?? err);
+        if (attemptNo === 1 && retryDelayMs > 0 && /429|Stream closed|before initialization/i.test(msg)) {
+          await new Promise((r) => setTimeout(r, retryDelayMs));
+          continue;
+        }
+        break;
+      }
+    }
+  }
+  throw lastErr ?? new Error('Edge TTS 失败');
+}
+
+/**
  * 合成一段语音。
  * @param {string} text 要说的话：纯文本、内嵌 SSML 片段（…<break time="300ms"/>…）、
  *                      或完整 SSML 文档（<speak version="1.0" …>…</speak>）。
- * @param {{ outDir?: string, provider?: string, voice?: string }} opts
+ * @param {{ outDir?: string, provider?: string, voice?: string, maxChars?: number }} opts
  *   outDir：合成文件落哪个目录（默认系统临时目录）；文件名自动生成。
- *   provider：'auto' | 'edge' | 'sapi'。
+ *   provider：'auto' | 'edge' | 'sapi' | 'custom:<id>'（custom 见 config.socialV2.voice.tts.custom）。
  *   voice：引擎嗓音名，空 = 引擎默认（SSML 文档自带 <voice> 时以文档为准）。
- * @returns {Promise<{path: string, provider: string, voice: string, bytes: number}>}
+ *   maxChars：单次合成最多多少字（50-2000，默认 2000）；超长按句子边界截断。
+ * @returns {Promise<{path: string, provider: string, voice: string, bytes: number,
+ *   chars: number, used: number, truncated: boolean, maxChars: number}>}
  */
 export async function synthesizeText(text, opts = {}) {
-  const clean = sanitizeText(text);
+  const prepared = prepareText(text, opts.maxChars);
+  const clean = prepared.text;
   const want = String(opts.provider || 'auto').toLowerCase();
   const order = want === 'auto' ? ['edge', 'sapi'] : [want];
   const outDir = opts.outDir || os.tmpdir();
@@ -90,33 +254,52 @@ export async function synthesizeText(text, opts = {}) {
   const errors = [];
   for (const provider of order) {
     const voice = opts.voice || TTS_DEFAULT_VOICES[provider] || '';
+    const customEngine = provider.startsWith('custom:')
+      ? readCustomTtsEngines().find((e) => e.id === provider.slice('custom:'.length))
+      : null;
+    if (provider.startsWith('custom:') && !customEngine) {
+      const msg = `找不到自定义 TTS 引擎「${provider.slice('custom:'.length)}」`;
+      if (want !== 'auto') throw new Error(`TTS（${provider}）失败：${msg}`);
+      errors.push(`${provider}: ${msg}`);
+      continue;
+    }
+    const ext = provider === 'sapi' ? 'wav' : customEngine ? customEngine.format : 'mp3';
     const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-    const file = path.join(outDir, `tts-${stamp}-${crypto.randomBytes(3).toString('hex')}.${provider === 'sapi' ? 'wav' : 'mp3'}`);
+    const file = path.join(outDir, `tts-${stamp}-${crypto.randomBytes(3).toString('hex')}.${ext}`);
     try {
-      // edge 对 429 / 掉线做一次短重试（实颎限流是窗口性的）；重试仍败就扌4给降级链。
+      let usedVoice = voice;
       if (provider === 'edge') {
-        let lastErr = null;
-        for (let attempt = 1; attempt <= 2; attempt++) {
+        // Edge 两次机会：配置的嗓音 → 慧慧兜底。每次遇到 429/掉线再短重试一次
+        //（实测限流是窗口性的，1.5s 后常常就好了）。抽成 withEdgeFallback 是为了可测：
+        // 真实网络里「嗓音名写错」不一定报错（服务端会拿默认嗓音凑合），注入式测试才稳。
+        const candidates = [voice || TTS_DEFAULT_VOICES.edge];
+        if (!candidates.includes(EDGE_FALLBACK_VOICE)) candidates.push(EDGE_FALLBACK_VOICE);
+        usedVoice = await withEdgeFallback(candidates, async (candidate) => {
           try {
-            await ttsEdge(clean, file, voice, isDoc);
-            lastErr = null;
-            break;
+            await ttsEdge(clean, file, candidate, isDoc);
           } catch (err) {
-            lastErr = err;
-            const msg = String(err?.message ?? err);
-            if (attempt === 1 && /429|Stream closed|before initialization/i.test(msg)) {
-              await new Promise((r) => setTimeout(r, 1500));
-              continue;
-            }
-            break;
+            try { fs.rmSync(file, { force: true }); } catch {}
+            throw err;
           }
-        }
-        if (lastErr) throw lastErr;
+        });
+      } else if (provider.startsWith('custom:')) {
+        await ttsCustom(clean, file, customEngine);
+        usedVoice = customEngine.label;
       } else if (provider === 'sapi') await ttsSapi(clean, file, voice, isDoc, isFragment);
       else throw new Error(`未知 TTS 引擎：${provider}`);
       const bytes = fs.statSync(file).size;
       if (bytes < 200) throw new Error('合成结果为空音频');
-      return { path: file, provider, voice: voice || '(默认)', bytes };
+      return {
+        path: file,
+        provider,
+        voice: usedVoice || '(默认)',
+        voiceFallback: provider === 'edge' && usedVoice === EDGE_FALLBACK_VOICE && voice !== EDGE_FALLBACK_VOICE,
+        bytes,
+        chars: prepared.chars,
+        used: prepared.used,
+        truncated: prepared.truncated,
+        maxChars: prepared.maxChars
+      };
     } catch (err) {
       try { fs.rmSync(file, { force: true }); } catch {}
       errors.push(`${provider}: ${err?.message ?? err}`);

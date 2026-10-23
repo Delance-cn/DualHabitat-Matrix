@@ -236,7 +236,22 @@
       "defaultVolume": 1,
       "loudness": "normal",
       "ffmpegPath": "",
-      "autoReadback": true
+      "autoReadback": true,
+      "tts": {
+        "_comment": "provider: auto（Edge 在线优先 → Edge 慧慧兜底 → Windows 离线）| edge | sapi | custom:<id>；voice 留空 = 引擎默认；maxChars = 单次合成最多多少字（50-2000）；custom 里可加任意命令模板引擎（{textFile} + {out}）",
+        "provider": "auto",
+        "voice": "",
+        "maxChars": 2000,
+        "custom": []
+      }
+    },
+    "draw": {
+      "_comment": "出图：provider 为 auto / cloudflare / bailian / zhipu / custom:<id>；custom 每项 { id, label, baseUrl, model, apiKeyEnv, sizeTemplate, format }，走 OpenAI 兼容 POST {baseUrl}/images/generations，key 从 secrets.json 的同名键读。",
+      "provider": "auto",
+      "size": "1024x1024",
+      "dailyLimit": 30,
+      "momentDailyLimit": 10,
+      "custom": []
     },
     "proactive": {
       "enabled": true,
@@ -276,12 +291,23 @@
     }
   },
   "openaiShell": {
-    "_comment": "OpenAI 兼容壳：POST /v1/chat/completions 转发到本机 4599 实例，市面工具改 baseURL 即可接入。apiKey 留空则首次启动自动生成到 state/openai-shell.key；agentPreset 用 qq-chat 只聊天，改 qq-work 会连带开放读写文件/跑命令。",
+    "_comment": "OpenAI 兼容壳：POST /v1/chat/completions 转发到本机 4599 实例，市面工具改 baseURL 即可接入。apiKey 留空则首次启动自动生成到 state/openai-shell.key；agentPreset 用 qq-chat 只聊天。填 qq-work 必须同时 allowLocalTools=true 才会真的带本地工具（否则自动降级）。",
     "enabled": false,
     "port": 4610,
     "apiKey": "",
     "agentPreset": "qq-chat",
+    "allowLocalTools": false,
     "timeoutMs": 180000,
     "maxConcurrent": 4
+  },
+  "agentTools": {
+    "_comment": "本地 Agent 工具（MCP agent-tools）：给主人档 / 兼容壳读写文件、跑命令。默认关闭。只对 owner（ownerQQ / platforms.wechat.ownerId）生效，聊天档永远没有。命令有黑名单和 30s 超时，但**不是**文件沙箱（cwd 固定在 sandboxRoot）。",
+    "enabled": false,
+    "sandboxRoot": "",
+    "timeoutMs": 30000,
+    "maxReadBytes": 1048576,
+    "maxWriteBytes": 1048576,
+    "maxOutputBytes": 131072,
+    "requireOwner": true
   }
 }

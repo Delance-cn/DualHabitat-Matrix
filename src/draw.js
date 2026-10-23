@@ -42,8 +42,11 @@ function readJson(file) {
 export function drawConfig() {
   const cfg = readJson(path.join(DATA_ROOT, 'config.json'));
   const d = cfg?.socialV2?.draw && typeof cfg.socialV2.draw === 'object' ? cfg.socialV2.draw : {};
+  const provider = String(d.provider ?? '');
   return {
-    provider: DRAW_PROVIDERS.includes(d.provider) ? d.provider : 'auto',
+    provider: DRAW_PROVIDERS.includes(provider) || (provider.startsWith('custom:') && CUSTOM_DRAW_ID_RE.test(provider.slice(7)))
+      ? provider
+      : 'auto',
     size: /^\d{3,4}x\d{3,4}$/.test(String(d.size ?? '')) ? d.size : DRAW_DEFAULTS.size,
     dailyLimit: Number.isFinite(+d.dailyLimit) && +d.dailyLimit > 0 ? +d.dailyLimit : DRAW_DEFAULTS.dailyLimit,
     dir: typeof d.dir === 'string' && d.dir.trim() ? d.dir.trim() : DRAW_DEFAULTS.dir
@@ -176,6 +179,78 @@ const ENGINES = {
   zhipu: { ext: 'jpeg', run: drawZhipu }
 };
 
+/* ── 自定义出图服务（OpenAI 兼容 /images/generations） ─────────────────── */
+// 预设只有 cloudflare / bailian / zhipu，想接硅基流动、Together、自建网关……
+// 在 config.socialV2.draw.custom 里加一条：{ id, label, baseUrl, model, apiKeyEnv, sizeTemplate }
+// key 只从 secrets.json / 进程环境读，不写进 config.json。
+export const CUSTOM_DRAW_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
+
+export function normalizeCustomDraw(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = String(raw.id ?? '').trim();
+  if (!CUSTOM_DRAW_ID_RE.test(id)) return null;
+  const baseUrl = String(raw.baseUrl ?? '').trim().replace(/\/+$/, '');
+  if (!/^https?:\/\/[^\s]+$/i.test(baseUrl)) return null;
+  const model = String(raw.model ?? '').trim();
+  if (!model || model.length > 120) return null;
+  const apiKeyEnv = String(raw.apiKeyEnv ?? '').trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(apiKeyEnv)) return null;
+  const sizeTemplate = String(raw.sizeTemplate ?? '{w}x{h}').trim();
+  if (!sizeTemplate.includes('{w}') || !sizeTemplate.includes('{h}') || sizeTemplate.length > 40) return null;
+  return {
+    id,
+    label: String(raw.label ?? '').trim().slice(0, 40) || id,
+    baseUrl,
+    model,
+    apiKeyEnv,
+    sizeTemplate,
+    format: ['png', 'jpg', 'jpeg', 'webp'].includes(String(raw.format ?? '').toLowerCase())
+      ? String(raw.format).toLowerCase()
+      : 'png'
+  };
+}
+
+export function readCustomDrawEngines() {
+  const cfg = readJson(path.join(DATA_ROOT, 'config.json'));
+  const list = cfg?.socialV2?.draw?.custom;
+  return Array.isArray(list) ? list.map(normalizeCustomDraw).filter(Boolean) : [];
+}
+
+async function drawCustom(prompt, outPath, { w, h }, engine) {
+  const secrets = readJson(path.join(DATA_ROOT, 'secrets.json'));
+  const key = String(secrets[engine.apiKeyEnv] ?? process.env[engine.apiKeyEnv] ?? '').trim();
+  if (!key) throw new Error(`secrets.json 缺 ${engine.apiKeyEnv}（自定义出图服务用这个环境变量名取 key）`);
+  const size = engine.sizeTemplate.replaceAll('{w}', String(w)).replaceAll('{h}', String(h));
+  const res = await fetch(`${engine.baseUrl}/images/generations`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model: engine.model,
+      prompt,
+      size,
+      n: 1,
+      response_format: 'b64_json'
+    }),
+    signal: AbortSignal.timeout(120_000)
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${body?.error?.message ?? body?.message ?? ''}`.trim());
+  }
+  const item = body?.data?.[0];
+  let buf = null;
+  if (item?.b64_json) {
+    buf = Buffer.from(String(item.b64_json), 'base64');
+  } else if (item?.url) {
+    // 有些服务只回 URL：下载下来再存（QQ 发送要本地文件）。
+    const img = await fetch(String(item.url), { signal: AbortSignal.timeout(120_000) });
+    if (!img.ok) throw new Error(`图片下载失败：HTTP ${img.status}`);
+    buf = Buffer.from(await img.arrayBuffer());
+  }
+  if (!buf || buf.length < 5000) throw new Error('返回空图片（检查模型名 / 额度）');
+  fs.writeFileSync(outPath, buf);
+}
+
 /**
  * 生成一张图片。
  * @param {string} prompt 画面描述
@@ -186,18 +261,23 @@ export async function generateImage(prompt, opts = {}) {
   const clean = cleanPrompt(prompt);
   const cfg = drawConfig();
   const want = String(opts.provider || cfg.provider || 'auto').toLowerCase();
+  const engines = { ...ENGINES };
+  for (const c of readCustomDrawEngines()) {
+    engines[`custom:${c.id}`] = { ext: c.format, run: (p, o, size) => drawCustom(p, o, size, c) };
+  }
   const order = want === 'auto' ? ['cloudflare', 'bailian', 'zhipu'] : [want];
-  if (!order.every((p) => ENGINES[p])) throw new Error(`未知出图引擎：${want}`);
+  if (!order.every((p) => engines[p])) throw new Error(`未知出图引擎：${want}`);
   const outDir = opts.outDir || imageLibraryDir();
   fs.mkdirSync(outDir, { recursive: true });
   const { w, h } = parseSize(opts.size || cfg.size);
 
   const errors = [];
   for (const provider of order) {
+    const spec = engines[provider];
     const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-    const outPath = path.join(outDir, `draw-${stamp}-${crypto.randomBytes(3).toString('hex')}.${ENGINES[provider].ext}`);
+    const outPath = path.join(outDir, `draw-${stamp}-${crypto.randomBytes(3).toString('hex')}.${spec.ext}`);
     try {
-      await ENGINES[provider].run(clean, outPath, { w, h });
+      await spec.run(clean, outPath, { w, h });
       const bytes = fs.statSync(outPath).size;
       if (bytes < 5000) throw new Error('合成结果为空图片');
       return { path: outPath, provider, bytes };

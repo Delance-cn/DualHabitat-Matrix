@@ -61,7 +61,16 @@ export default {
    **漏 permissions = MCP 连上了但工具全被 deny 隐藏**（web-search 老坑）。
 3. 生效：`node src/oc-config.js` 重新生成 opencode.json → 重启桥接。
    **opencode.json 里键名是 `mcp.servers`**（不是 mcpServers）。
-4. 已有五个：snowluma（网关）、web-search-safe、memory-safe、video-safe、create-safe（画画+动态）。
+4. 已有六个：snowluma（网关）、web-search-safe、memory-safe、video-safe、create-safe（画画+动态）、
+   agent-tools（0.5.1，本地读写/命令，**只注册给 qq-work**）。
+
+**agent-tools 是特例**（`src/mcp-agent-tools.js` + `src/agent-tools-core.js`）：
+- 默认关；`oc-config.js` 只在 `agentTools.enabled=true` 时注册，并且**只给 `qq-work`** 加
+  `agent-tools_*` 权限 —— 聊天档永远没有。
+- 路径围栏 / 命令黑名单 / 超时 / 输出上限都在 `agent-tools-core.js`（纯函数，单测友好）；
+  MCP 层每次调用重读 config，`enabled=false` 立即拒绝。
+- 想加第 7 个工具：在 `mcp-agent-tools.js` 用 `server.tool(...)` 注册，权限前缀自动是
+  `agent-tools_<名字>`；破坏性操作必须先过 `gate()`，并尽量复用 core 里的围栏函数。
 
 ### C. 桥接 HTTP API（3100）——外部程序调机器人
 
@@ -83,7 +92,7 @@ key 格式正则 → `modeAllowed(key, kind, id, cfg, currentMode)` → `shouldB
   index.html 加 panel → app.js 加 `loadXxx()` + 挂进 `loadPage()` 的 switch + 改动即存（scheduleXxxSave 防抖 700ms 模式）。
 - 导航加页：`app.js` 的 `NAV.qq` / `NAV.wechat` 两个数组各加一行 + `index.html` 加 `<section class="page" id="page-xxx">` + `loadPage()` 加分支。
   参考实现：`page-extensions`（0.4.9）。
-- 数据端点：`/api/extensions`（扩展聚合）、`/api/endpoints`（手册）、`/api/draw`、`/api/voice-tts`、`/api/image-library`、`/api/plugins(/add|/template)`。
+- 数据端点：`/api/extensions`（扩展聚合）、`/api/endpoints`（手册）、`/api/agent-tools`（0.5.1 本地工具开关/沙箱）、`/api/draw`、`/api/voice-tts`、`/api/image-library`、`/api/plugins(/add|/template)`。
 
 ### E. 电脑操作工具（零开发，纯开关）
 
@@ -98,6 +107,22 @@ key 格式正则 → `modeAllowed(key, kind, id, cfg, currentMode)` → `shouldB
 - 配置 UI：扩展页「出站 · 事件推送」；`POST /api/events {test:true}` 可发测试事件。
 - 加新事件类型：在 `events-out.js` 加类型守卫 → 在 bridge/wechat-bot 的对应挂点旁加 `emitEvent(cfg, type, data)`（现有挂点：QQ 收发、微信收发，紧跟 appendMemory）。
 - 纪律：fire-and-forget，3s 超时，**绝不 await 进收发主链路**。
+
+### G. 自定义 TTS / 出图引擎（0.5.1，纯配置）
+
+> 预设不够用时不用改代码：桌面端「对话与人格」页的 TTS / 画画面板里都能直接添加。
+
+- **TTS**：`config.socialV2.voice.tts.custom = [{ id, label, command, format, timeoutMs }]`。
+  `command` 只认 `{textFile}`（待合成文本的 UTF-8 临时文件）和 `{out}`（输出音频路径）；
+  **刻意不支持 `{text}`** —— 文本来自聊天内容，拼进 shell 就是命令注入面。
+  provider 填 `custom:<id>`。示例：
+  `edge-tts --file {textFile} --write-media {out} --voice zh-CN-YunxiNeural`。
+- **出图**：`config.socialV2.draw.custom = [{ id, label, baseUrl, model, apiKeyEnv, sizeTemplate, format }]`。
+  走 OpenAI 兼容 `POST {baseUrl}/images/generations`
+  （`{model, prompt, size, n:1, response_format:'b64_json'}`，返回 `url` 也会下载）。
+  key 从 `secrets.json` 的同名键 / 进程环境读，**不写进 config.json**。
+  provider 填 `custom:<id>`；`auto` 链仍只走内置三家，不会擅自产生未知费用。
+- 两个 `id` 都限 `[a-z0-9][a-z0-9_-]{0,31}`；删掉引擎时服务端会把失效的 provider 自动复位成 `auto`。
 
 ## 3. 改代码的硬纪律（每条都是踩过的坑）
 

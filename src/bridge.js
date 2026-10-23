@@ -973,8 +973,23 @@ function loadConfig() {
       // 默认用聊天档（无本地工具）。想让它干活改成 qq-work，
       // 但那等于把「读写文件 / 跑命令」交给持有 key 的任何程序，自己权衡。
       agentPreset: String(file.openaiShell?.agentPreset ?? 'qq-chat').trim() || 'qq-chat',
+      // 允许壳使用「本地 Agent 工具」（读写文件 / 跑命令）。默认 false：
+      // 选了 qq-work 也只在显式打开时才真的放行，避免升级后突然有了本机权限。
+      allowLocalTools: file.openaiShell?.allowLocalTools === true,
       timeoutMs: Number(file.openaiShell?.timeoutMs) || 180000,
       maxConcurrent: Number(file.openaiShell?.maxConcurrent) || 4
+    },
+    // 本地 Agent 工具（src/mcp-agent-tools.js）：给主人档 / 兼容壳用的读、写、跑命令。
+    // 白名单式归一化 —— 不加这一段，桌面端写进去的 agentTools.* 会被静默剥掉
+    //（commands.* / events.* 的老坑）。安全参数由 MCP 自己再读一次 config.json，
+    // 这里收编主要是为了桥接侧的日志与启动校验。
+    agentTools: {
+      enabled: file.agentTools?.enabled === true,
+      sandboxRoot: String(file.agentTools?.sandboxRoot ?? '').trim(),
+      timeoutMs: Number(file.agentTools?.timeoutMs) || 30000,
+      maxReadBytes: Number(file.agentTools?.maxReadBytes) || 1048576,
+      maxWriteBytes: Number(file.agentTools?.maxWriteBytes) || 1048576,
+      maxOutputBytes: Number(file.agentTools?.maxOutputBytes) || 131072
     }
   };
 
@@ -2553,6 +2568,7 @@ async function main() {
           stateDir,
           workspaceRoot: ROOT,
           agentPreset: cfg.openaiShell.agentPreset,
+          allowLocalTools: cfg.openaiShell.allowLocalTools === true,
           timeoutMs: cfg.openaiShell.timeoutMs,
           maxConcurrent: cfg.openaiShell.maxConcurrent,
           log
@@ -2563,6 +2579,10 @@ async function main() {
         log(`⚠️ OpenAI 兼容壳没起来：${error?.message ?? error}`);
       }
     }
+  }
+
+  if (cfg.agentTools?.enabled) {
+    log(`本地 Agent 工具：已启用（沙箱 ${cfg.agentTools.sandboxRoot || '会话目录'}；只对 qq-work 主人档生效，命令超时 ${cfg.agentTools.timeoutMs}ms）`);
   }
 
   // 模型目录 RPC：模型 API 没有 DSH 的 `session/modelCatalog`，由门面的 callUnary
@@ -5952,14 +5972,20 @@ async function main() {
             const synth = await synthesizeText(text, {
               outDir: path.join(voice.dir, 'tts'),
               provider: voice.tts?.provider || 'auto',
-              voice: voice.tts?.voice || ''
+              voice: voice.tts?.voice || '',
+              maxChars: voice.tts?.maxChars
             });
             const libName = path.relative(voice.dir, synth.path).split(path.sep).join('/');
             voiceBudgetCheck(key, voice);
             if (body.dryRun === true) {
               const probe = await inspectAudio(synth.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
               if (!probe.ok) { sendJson({ ok: false, error: errorToText(probe.error, '音频检查未通过') }, 400); return; }
-              sendJson({ ok: true, dryRun: true, key, file: libName, provider: synth.provider, voice: synth.voice, detail: describeAudio(probe) });
+              sendJson({
+                ok: true, dryRun: true, key, file: libName,
+                provider: synth.provider, voice: synth.voice,
+                chars: synth.chars, usedChars: synth.used, truncated: synth.truncated, maxChars: synth.maxChars,
+                detail: describeAudio(probe)
+              });
               return;
             }
             const sent = await sendVoiceForV2(key, libName, {
@@ -5977,6 +6003,10 @@ async function main() {
               file: libName,
               provider: synth.provider,
               voice: synth.voice,
+              chars: synth.chars,
+              usedChars: synth.used,
+              truncated: synth.truncated,
+              maxChars: synth.maxChars,
               detail: sent.detail,
               audioProcessing: sent.audioProcessing,
               // verified=true 表示已用 get_msg 回读到这条消息的 record 段（语音确实落地了）

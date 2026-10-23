@@ -61,7 +61,20 @@ npm start
 `http://127.0.0.1:4610/v1` 就是标准 OpenAI 接口（`Authorization: Bearer <state/openai-shell.key>`）。
 Chatbox / LobeChat / Continue / 任意 OpenAI SDK 只改 `baseURL` + `apiKey` 即可，
 背后走的是机器人同款模型池与故障转移。一期是「假流式」（全文一次发完，协议合规），
-`tools` 暂不转发；细节见 [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md)。
+客户端传来的 `tools` 暂不转发；细节见 [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md)。
+
+**本地 Agent 工具（0.5.1 起，默认关）**：桌面端「扩展 → 本地 Agent 工具」打开后，
+主人档 `qq-work` 与兼容壳会多出一组函数调用工具：`list_directory` / `read_file` /
+`write_file` / `execute_command` / `search_files` / `workspace_info`。
+只对主人生效（QQ `ownerQQ` / 微信 `platforms.wechat.ownerId`），群聊档永远没有；
+文件读写被围栏在沙箱目录内（`..`、域外绝对路径、设备/UNC、junction 绕行全部拒绝）。
+命令执行有黑名单 + 默认 30 秒超时，但**不是**文件沙箱 —— 细节与边界见 1.4 节。
+兼容壳选 `qq-work` 时必须同时勾「允许本地工具」，否则自动降级 `qq-chat`。
+
+**TTS 与自定义引擎（0.5.1 起）**：语音合成默认 Edge 晓晓，失败自动换慧慧
+（`zh-CN-HuihuiNeural`），再失败落 Windows 离线；单次字数可配（50–2000），超长按句子边界截断。
+桌面端可以自行添加 **自定义 TTS 引擎**（命令模板只认 `{textFile}` / `{out}`，不把聊天文本拼进 shell）
+和 **自定义出图服务**（OpenAI 兼容 `/images/generations`，key 放 `secrets.json`），不用改代码。
 
 ### 接入新的模型 provider（以阿里云百炼为例）
 

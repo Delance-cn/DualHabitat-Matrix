@@ -5835,6 +5835,7 @@ const server = http.createServer(async (req, res) => {
           enabled: sh.enabled === true,
           port: Number.isFinite(port) && port >= 1024 && port <= 65535 ? port : 4610,
           agentPreset: String(sh.agentPreset ?? 'qq-chat'),
+          allowLocalTools: sh.allowLocalTools === true,
           timeoutMs: Number(sh.timeoutMs) || 180000
         };
       };
@@ -5873,6 +5874,14 @@ const server = http.createServer(async (req, res) => {
           if (!/^[a-z0-9][a-z0-9-]{0,31}$/i.test(ap)) return sendJson(res, { ok: false, error: 'agent 名字不合法' });
           if (cfgS.openaiShell.agentPreset !== ap) { cfgS.openaiShell.agentPreset = ap; changed = true; }
         }
+        if (body?.allowLocalTools !== undefined) {
+          const v = body.allowLocalTools === true;
+          if (cfgS.openaiShell.allowLocalTools !== v) { cfgS.openaiShell.allowLocalTools = v; changed = true; }
+        }
+        // qq-work = 带本地工具的主人档。必须显式 allowLocalTools，光选 preset 不算数。
+        if (String(cfgS.openaiShell.agentPreset) === 'qq-work' && cfgS.openaiShell.allowLocalTools !== true) {
+          return sendJson(res, { ok: false, error: '选 qq-work 会开放读写文件和执行命令，请同时勾选「允许本地工具（仅主人）」' });
+        }
         if (body?.regenerateKey === true) {
           // 生成在**桌面端**做，桥接只读文件 —— 这样界面能立刻显示新 key，
           // 又不依赖桥接是否在跑（桥接那边 loadOrCreateKey 认这个文件）。
@@ -5893,6 +5902,85 @@ const server = http.createServer(async (req, res) => {
           ...sh,
           key: readShellKey(),
           running: await probePort(sh.port)
+        });
+      }
+      return sendJson(res, { ok: false, error: '只支持 GET / POST' }, 405);
+    }
+
+    if (p === '/api/agent-tools') {
+      /* 本地 Agent 工具（MCP agent-tools）：开关 / 沙箱根 / 超时。
+       * 只写 config.agentTools，改完重新生成 opencode.json 并重启桥接。
+       * 权限边界不在这里判 —— MCP 只注册给 qq-work，聊天档永远没有。 */
+      const cfgA = loadConfig();
+      const at = cfgA.agentTools && typeof cfgA.agentTools === 'object' ? cfgA.agentTools : {};
+      const shape = () => {
+        const c = loadConfig();
+        const a = c.agentTools && typeof c.agentTools === 'object' ? c.agentTools : {};
+        const sessionCwd = String(c.sessionCwd ?? '').trim();
+        const configuredRoot = String(a.sandboxRoot ?? '').trim();
+        return {
+          enabled: a.enabled === true,
+          sandboxRoot: configuredRoot,
+          effectiveSandboxRoot: configuredRoot || sessionCwd || dataRoot(),
+          usesSessionCwd: !configuredRoot,
+          timeoutMs: Number(a.timeoutMs) || 30000,
+          maxReadBytes: Number(a.maxReadBytes) || 1048576,
+          maxWriteBytes: Number(a.maxWriteBytes) || 1048576,
+          maxOutputBytes: Number(a.maxOutputBytes) || 131072,
+          ownerQQ: c.ownerQQ ?? null,
+          ownerWechat: c.platforms?.wechat?.ownerId ?? null,
+          shellPreset: String(c.openaiShell?.agentPreset ?? 'qq-chat'),
+          shellAllowLocalTools: c.openaiShell?.allowLocalTools === true,
+          hasOwner: Boolean(c.ownerQQ || c.platforms?.wechat?.ownerId)
+        };
+      };
+
+      if (req.method === 'GET') return sendJson(res, { ok: true, ...shape() });
+
+      if (req.method === 'POST') {
+        const body = await readBody(req);
+        const next = { ...at };
+        let changed = false;
+        if (body?.enabled !== undefined) {
+          const v = body.enabled === true;
+          if (next.enabled !== v) { next.enabled = v; changed = true; }
+        }
+        if (body?.sandboxRoot !== undefined) {
+          const raw = String(body.sandboxRoot ?? '').trim();
+          if (raw) {
+            const abs = path.resolve(raw);
+            if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
+              return sendJson(res, { ok: false, error: `沙箱目录不存在或不是目录：${abs}` });
+            }
+            if (next.sandboxRoot !== abs) { next.sandboxRoot = abs; changed = true; }
+          } else if (next.sandboxRoot) {
+            next.sandboxRoot = '';
+            changed = true;
+          }
+        }
+        if (body?.timeoutMs !== undefined) {
+          const n = Math.floor(Number(body.timeoutMs) || 0);
+          if (n < 1000 || n > 120000) return sendJson(res, { ok: false, error: '命令超时要在 1000-120000 毫秒之间' });
+          if (next.timeoutMs !== n) { next.timeoutMs = n; changed = true; }
+        }
+        if (changed) {
+          cfgA.agentTools = next;
+          writeJson(configFile(), cfgA);
+        }
+        let regenerated = null;
+        let botsRestarted = false;
+        if (changed) {
+          try { regenerated = await regenerateConfig(); } catch { regenerated = { ok: false }; }
+          try { botsRestarted = await restartBotsFor('qq'); } catch { botsRestarted = false; }
+        }
+        const at2 = loadConfig().agentTools ?? {};
+        return sendJson(res, {
+          ok: true,
+          changed,
+          regenerated: regenerated ? regenerated.ok : null,
+          botsRestarted,
+          ...shape(),
+          agentTools: at2
         });
       }
       return sendJson(res, { ok: false, error: '只支持 GET / POST' }, 405);
@@ -6145,33 +6233,67 @@ const server = http.createServer(async (req, res) => {
       // 语音配置是桥接启动时读的：改了就自动把在跑的 QQ BOT 就地重启（没跑 = 下次启动生效）。
       const cfg = loadConfig();
       if (req.method === 'GET') {
+        const { normalizeCustomEngine } = await import(pathToFileURL(path.join(codeRoot(), 'src', 'tts.js')).href);
         return sendJson(res, {
           ok: true,
           provider: cfg.socialV2?.voice?.tts?.provider || 'auto',
           voice: cfg.socialV2?.voice?.tts?.voice || '',
-          wechatFollow: cfg.platforms?.wechat?.ttsFollow === true
+          maxChars: Number(cfg.socialV2?.voice?.tts?.maxChars) || 2000,
+          wechatFollow: cfg.platforms?.wechat?.ttsFollow === true,
+          custom: Array.isArray(cfg.socialV2?.voice?.tts?.custom) ? cfg.socialV2.voice.tts.custom.map(normalizeCustomEngine).filter(Boolean) : []
         });
       }
       if (req.method === 'POST') {
+        const { normalizeCustomEngine } = await import(pathToFileURL(path.join(codeRoot(), 'src', 'tts.js')).href);
         const body = await readBody(req);
-        // 试听文字上限要和 tts.js 的 MAX_CHARS(2000) 对齐。那边超长是**静默截断**，
-        // 用户贴 3000 字进来会听到半截，界面却显示合成成功 —— 宁可这里直接说清楚。
+        const limit = Math.max(50, Math.min(2000, Math.floor(Number(body?.maxChars) || Number(cfg.socialV2?.voice?.tts?.maxChars) || 2000)));
+        // 试听文字上限和 tts.js 的 maxChars 对齐。那边超长会按句子截断，
+        // 用户贴 3000 字进来只听到一部分却显示「合成成功」—— 试听这里直接说清楚。
         const spoken = String(body?.text ?? '');
-        if (spoken.trim() && spoken.length > 2000) {
-          return sendJson(res, { ok: false, error: `试听文字最多 2000 字（现在是 ${spoken.length} 字），分句试听吧` });
+        if (spoken.trim() && spoken.length > limit) {
+          return sendJson(res, { ok: false, error: `试听文字最多 ${limit} 字（现在是 ${spoken.length} 字），分句试听吧；上限可在下面改` });
         }
         if (!cfg.socialV2 || typeof cfg.socialV2 !== 'object') cfg.socialV2 = {};
         if (!cfg.socialV2.voice || typeof cfg.socialV2.voice !== 'object') cfg.socialV2.voice = {};
         if (!cfg.socialV2.voice.tts || typeof cfg.socialV2.voice.tts !== 'object') cfg.socialV2.voice.tts = {};
         let changed = false;
+        if (body?.custom !== undefined) {
+          if (!Array.isArray(body.custom)) return sendJson(res, { ok: false, error: 'custom 必须是数组' });
+          const normalized = [];
+          for (const raw of body.custom) {
+            const n = normalizeCustomEngine(raw);
+            if (!n) return sendJson(res, { ok: false, error: '自定义引擎要有合法 id（英文/数字/-_）、包含 {out} 的命令模板' });
+            if (normalized.some((x) => x.id === n.id)) return sendJson(res, { ok: false, error: `自定义引擎 id 重复：${n.id}` });
+            normalized.push(n);
+          }
+          const prev = Array.isArray(cfg.socialV2.voice.tts.custom) ? cfg.socialV2.voice.tts.custom.map(normalizeCustomEngine).filter(Boolean) : [];
+          if (JSON.stringify(prev) !== JSON.stringify(normalized)) {
+            cfg.socialV2.voice.tts.custom = normalized;
+            changed = true;
+          }
+        }
+        const customs = Array.isArray(cfg.socialV2.voice.tts.custom)
+          ? cfg.socialV2.voice.tts.custom.map(normalizeCustomEngine).filter(Boolean)
+          : [];
+        const allowedProviders = ['auto', 'edge', 'sapi', ...customs.map((c) => `custom:${c.id}`)];
+        // 引擎被删掉后，旧选择不能留成死指针 —— 自动回 auto。
+        if (cfg.socialV2.voice.tts.provider && !allowedProviders.includes(String(cfg.socialV2.voice.tts.provider))) {
+          cfg.socialV2.voice.tts.provider = 'auto';
+          changed = true;
+        }
         if (body?.provider !== undefined) {
           const prov = String(body.provider);
-          if (!['auto', 'edge', 'sapi'].includes(prov)) return sendJson(res, { ok: false, error: `未知 TTS 引擎：${prov}` });
+          if (!allowedProviders.includes(prov)) return sendJson(res, { ok: false, error: `未知 TTS 引擎：${prov}` });
           if (cfg.socialV2.voice.tts.provider !== prov) { cfg.socialV2.voice.tts.provider = prov; changed = true; }
         }
         if (body?.voice !== undefined) {
           const nv = String(body.voice).trim();
           if (cfg.socialV2.voice.tts.voice !== nv) { cfg.socialV2.voice.tts.voice = nv; changed = true; }
+        }
+        if (body?.maxChars !== undefined) {
+          const n = Math.floor(Number(body.maxChars) || 0);
+          if (n < 50 || n > 2000) return sendJson(res, { ok: false, error: '字数上限要在 50-2000 之间' });
+          if (cfg.socialV2.voice.tts.maxChars !== n) { cfg.socialV2.voice.tts.maxChars = n; changed = true; }
         }
         if (body?.wechatFollow !== undefined) {
           const nw = body.wechatFollow === true;
@@ -6190,9 +6312,14 @@ const server = http.createServer(async (req, res) => {
             const r = await synthesizeText(String(body.text), {
               outDir: path.join(voiceLibraryDir(), 'tts'),
               provider: cfg.socialV2.voice.tts.provider || 'auto',
-              voice: cfg.socialV2.voice.tts.voice || ''
+              voice: cfg.socialV2.voice.tts.voice || '',
+              maxChars: cfg.socialV2.voice.tts.maxChars
             });
-            preview = { name: `tts/${path.basename(r.path)}`, provider: r.provider, voice: r.voice, bytes: r.bytes };
+            preview = {
+              name: `tts/${path.basename(r.path)}`,
+              provider: r.provider, voice: r.voice, bytes: r.bytes,
+              chars: r.chars, usedChars: r.used, truncated: r.truncated, maxChars: r.maxChars
+            };
           } catch (error) {
             return sendJson(res, { ok: false, error: `合成失败：${error?.message ?? error}`, botsRestarted });
           }
@@ -6201,7 +6328,9 @@ const server = http.createServer(async (req, res) => {
           ok: true,
           provider: cfg.socialV2.voice.tts.provider || 'auto',
           voice: cfg.socialV2.voice.tts.voice || '',
+          maxChars: Number(cfg.socialV2.voice.tts.maxChars) || 2000,
           wechatFollow: cfg.platforms?.wechat?.ttsFollow === true,
+          custom: Array.isArray(cfg.socialV2.voice.tts.custom) ? cfg.socialV2.voice.tts.custom.map(normalizeCustomEngine).filter(Boolean) : [],
           changed,
           botsRestarted,
           preview
@@ -6218,23 +6347,51 @@ const server = http.createServer(async (req, res) => {
       // 出图配置是桥接侧 draw.js 启动时读的：改了自动把在跑的 QQ BOT 就地重启。
       const cfgd = loadConfig();
       if (req.method === 'GET') {
+        const { normalizeCustomDraw } = await import(pathToFileURL(path.join(codeRoot(), 'src', 'draw.js')).href);
         const d = cfgd.socialV2?.draw && typeof cfgd.socialV2.draw === 'object' ? cfgd.socialV2.draw : {};
+        const custom = Array.isArray(d.custom) ? d.custom.map(normalizeCustomDraw).filter(Boolean) : [];
+        const allowed = ['auto', 'cloudflare', 'bailian', 'zhipu', ...custom.map((c) => `custom:${c.id}`)];
         return sendJson(res, {
           ok: true,
-          provider: ['auto', 'cloudflare', 'bailian', 'zhipu'].includes(d.provider) ? d.provider : 'auto',
+          provider: allowed.includes(d.provider) ? d.provider : 'auto',
           size: /^\d{3,4}x\d{3,4}$/.test(String(d.size ?? '')) ? d.size : '1024x1024',
           dailyLimit: Number.isFinite(+d.dailyLimit) && +d.dailyLimit > 0 ? +d.dailyLimit : 30,
-          momentDailyLimit: Number.isFinite(+d.momentDailyLimit) && +d.momentDailyLimit > 0 ? +d.momentDailyLimit : 10
+          momentDailyLimit: Number.isFinite(+d.momentDailyLimit) && +d.momentDailyLimit > 0 ? +d.momentDailyLimit : 10,
+          custom
         });
       }
       if (req.method === 'POST') {
+        const { normalizeCustomDraw } = await import(pathToFileURL(path.join(codeRoot(), 'src', 'draw.js')).href);
         const body = await readBody(req);
         if (!cfgd.socialV2 || typeof cfgd.socialV2 !== 'object') cfgd.socialV2 = {};
         if (!cfgd.socialV2.draw || typeof cfgd.socialV2.draw !== 'object') cfgd.socialV2.draw = {};
         let changed = false;
+        if (body?.custom !== undefined) {
+          if (!Array.isArray(body.custom)) return sendJson(res, { ok: false, error: 'custom 必须是数组' });
+          const normalized = [];
+          for (const raw of body.custom) {
+            const n = normalizeCustomDraw(raw);
+            if (!n) return sendJson(res, { ok: false, error: '自定义出图要有合法 id、http(s) baseUrl、model、apiKeyEnv 和含 {w}{h} 的 sizeTemplate' });
+            if (normalized.some((x) => x.id === n.id)) return sendJson(res, { ok: false, error: `自定义出图 id 重复：${n.id}` });
+            normalized.push(n);
+          }
+          const prev = Array.isArray(cfgd.socialV2.draw.custom) ? cfgd.socialV2.draw.custom.map(normalizeCustomDraw).filter(Boolean) : [];
+          if (JSON.stringify(prev) !== JSON.stringify(normalized)) {
+            cfgd.socialV2.draw.custom = normalized;
+            changed = true;
+          }
+        }
+        const customs = Array.isArray(cfgd.socialV2.draw.custom)
+          ? cfgd.socialV2.draw.custom.map(normalizeCustomDraw).filter(Boolean)
+          : [];
+        const allowedDraw = ['auto', 'cloudflare', 'bailian', 'zhipu', ...customs.map((c) => `custom:${c.id}`)];
+        if (cfgd.socialV2.draw.provider && !allowedDraw.includes(String(cfgd.socialV2.draw.provider))) {
+          cfgd.socialV2.draw.provider = 'auto';
+          changed = true;
+        }
         if (body?.provider !== undefined) {
           const prov = String(body.provider);
-          if (!['auto', 'cloudflare', 'bailian', 'zhipu'].includes(prov)) return sendJson(res, { ok: false, error: `未知出图引擎：${prov}` });
+          if (!allowedDraw.includes(prov)) return sendJson(res, { ok: false, error: `未知出图引擎：${prov}` });
           if (cfgd.socialV2.draw.provider !== prov) { cfgd.socialV2.draw.provider = prov; changed = true; }
         }
         if (body?.size !== undefined) {
@@ -6261,7 +6418,14 @@ const server = http.createServer(async (req, res) => {
             return sendJson(res, { ok: false, error: `出图失败：${error?.message ?? error}`, botsRestarted });
           }
         }
-        return sendJson(res, { ok: true, changed, botsRestarted, preview });
+        const outCustom = Array.isArray(cfgd.socialV2.draw.custom)
+          ? cfgd.socialV2.draw.custom.map(normalizeCustomDraw).filter(Boolean)
+          : [];
+        return sendJson(res, {
+          ok: true, changed, botsRestarted, preview,
+          provider: cfgd.socialV2.draw.provider,
+          custom: outCustom
+        });
       }
     }
     if (p === '/api/image-library') {

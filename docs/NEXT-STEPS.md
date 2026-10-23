@@ -1,17 +1,18 @@
 # DualHabitat Matrix · 下一步计划（2026-10-23 整理）
 
 > 配套文档：[AGENT-EXTENSIONS.md](./AGENT-EXTENSIONS.md)（给 AI agent 读的扩展开发指南）。
-> 现状基线：v0.5.0 已发布（**OpenAI 兼容壳 4610** + 0.4.9 的扩展中心 / 出站事件 / 插件添加引导 / 画画动态 / TTS / 数据根分离）。
-> 详细史志见工作区「DualHabitat-桌面端重做-交接记录-2026-10-19.md」（二十九节止）。
+> 现状基线：v0.5.1 已发布（**本地 Agent 工具** + **TTS 慧慧兜底/字数上限/自定义引擎** + **自定义出图服务** + 0.5.0 的 OpenAI 兼容壳 4610）。
+> 详细史志见工作区「DualHabitat-桌面端重做-交接记录-2026-10-19.md」（三十一节止）。
 
 ## 一、近期（下次开工就做）
 
 1. **动态在线 E2E**：NapCat 上线后跑 `spike/test-mcp-create.mjs` 里的发→读→删链路
    （`qq_post_moment` 用 `ugc_right=64` 仅自己可见 → `qq_list_moments` 核对 tid → `qq_delete_moment` 删除，安全无痕）。
-2. **0.5.0 真机回归**：装桌面包后核对——扩展页「OpenAI 兼容壳」卡片能开/关、换 key 后旧 key 立刻失效、
-   Chatbox（或任意 OpenAI SDK）改 baseURL 能聊、旧版（0.4.9）升级弹更新提示、数据根迁移不丢模型池。
+2. **0.5.1 真机回归**：装桌面包后核对——扩展页「本地 Agent 工具」能开/关、qq-work 未勾「允许本地工具」被拒、
+   主人私聊能读写沙箱内文件、群聊调不到工具；TTS 试听超字数被拒、自定义引擎能加能删；
+   画图自定义服务能加能删、provider 删掉后自动回 auto。
 3. **打包清单巡检**：`prepare-bridge.mjs` 拷贝清单核对一次全目录（upstream 曾漏过，新目录必须显式加；
-   0.5.0 已把 `src/openai-shell.js` 加进 `must` 自检）。
+   0.5.0 已把 `src/openai-shell.js` 加进 `must` 自检，0.5.1 需确认 `src/agent-tools-core.js` / `src/mcp-agent-tools.js` 也在）。
 
 ## 二、中期大件（已规划，按价值排序）
 

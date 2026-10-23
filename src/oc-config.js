@@ -79,6 +79,25 @@ export function isVideoEnabled() {
 }
 
 /**
+ * 本地 Agent 工具（`config.json` → `agentTools`）。
+ *
+ * 只有显式 `enabled: true` 才注册 MCP，并且只把权限给 **qq-work**（主人档）——
+ * 聊天档（qq-chat / qq-chat-v2）永远拿不到，这是「群友不能操作本机」的硬边界。
+ *
+ * 纯聊天模式（socialV2.chatOnly）下即使 enabled 也不注册：总闸优先。
+ */
+export function readAgentTools() {
+  const bridgeCfg = readJsonSafe(path.join(ROOT, 'config.json'), {}) ?? {};
+  const raw = bridgeCfg.agentTools && typeof bridgeCfg.agentTools === 'object' ? bridgeCfg.agentTools : {};
+  const sandbox = String(raw.sandboxRoot ?? '').trim();
+  return {
+    enabled: raw.enabled === true,
+    sandboxRoot: sandbox,
+    timeoutMs: Number(raw.timeoutMs) || 30_000
+  };
+}
+
+/**
  * 当前 QQ 角色名（`state/current-role.json`）。
  * 只用于主人档人设里的自称；聊天档的身份完全交给角色卡，不在这里硬写。
  */
@@ -135,14 +154,21 @@ function chatOnlyPersona() {
  * 权限"这些硬规则，改掉第一句也压不住 —— 实测模型会照着它拒绝干活（spike/probe-perms
  * 第 3 组：给了 read 权限，模型照样回"我不能读取本地文件"）。所以这里整份重写。
  */
-export function buildWorkPersona({ model, cwd, roleName }) {
+export function buildWorkPersona({ model, cwd, roleName, agentTools = false, sandboxRoot = '' }) {
   const who = roleName
     ? `你是「${roleName}」，一个**能真正干活**的编码 / 运维助理`
     : '你是一个**能真正干活**的编码 / 运维助理';
+  const sandboxLine = agentTools
+    ? `
+- 另有一组受控工具（agent-tools）：list_directory / read_file / write_file / execute_command / search_files。
+  它们比内置工具更严格：路径必须落在沙箱 \`${sandboxRoot || cwd}\` 内（..、绝对路径越界、
+  符号链接绕行都会被拒）；execute_command 默认 30 秒超时，rm -rf / del /f /s /q / format /
+  shutdown / git clean 等危险命令直接拒绝。优先用这组工具干活。`
+    : '';
   return `${who}，通过 QQ 私聊为管理员（owner）服务。
 
 【你的能力】
-- 你能读写文件、搜索代码、执行命令。可用工具：read / write / edit / grep / glob / shell。
+- 你能读写文件、搜索代码、执行命令。可用工具：read / write / edit / grep / glob / shell。${sandboxLine}
 - 文件操作被限制在会话工作目录：${cwd}
 - 你也能用 snowluma_qq_* 工具查/发 QQ 消息，但**只在管理员明确要求时**才发。
 
@@ -270,8 +296,9 @@ function poolUsesProvider(pool, provider) {
  * 生成配置对象（纯函数，便于测试）。
  * @returns {{config: object, notes: string[]}}
  */
-export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = false, slots = {} }) {
+export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = false, slots = {}, agentTools = null }) {
   const notes = [];
+  const at = agentTools ?? readAgentTools();
   const head = poolHeadModel(pool);
   const config = {
     $schema: base.$schema ?? 'https://opencode.ai/config.json',
@@ -404,6 +431,25 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     notes.push(`⚠️ 找不到 ${videoServer}，跳过视频 MCP`);
   }
 
+  // 本地 Agent 工具（读/写/跑命令）：默认关，开了也只进主人档。
+  // 沙箱/黑名单/超时在 MCP 内部强制，跟权限表无关 —— 双保险。
+  const agentToolsServer = path.join(CODE_ROOT, 'src', 'mcp-agent-tools.js');
+  if (at.enabled && fs.existsSync(agentToolsServer)) {
+    mcpServers['agent-tools'] = {
+      type: 'local',
+      command: [process.execPath, agentToolsServer],
+      cwd: SESSION_WORKDIR,
+      codemode: false,
+      // 工具内部 30s 超时（可配到 120s），MCP 这边留 15s 余量，别先被外层掐掉。
+      timeout: { startup: 20_000, catalog: 20_000, execution: Math.max(45_000, at.timeoutMs + 15_000) }
+    };
+    notes.push('本地 Agent 工具：已注册 MCP（仅 qq-work 主人档可用；沙箱 + 命令黑名单 + 30s 超时）');
+  } else if (at.enabled) {
+    notes.push(`⚠️ agentTools.enabled=true 但找不到 ${agentToolsServer}，跳过本地 Agent 工具`);
+  } else {
+    notes.push('本地 Agent 工具：未启用（agentTools.enabled=false）');
+  }
+
   } // ← chatOnly 结束
 
   if (Object.keys(mcpServers).length) config.mcp = { servers: mcpServers };
@@ -444,11 +490,15 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
 
   // 主人档：closed-agent 模式专用（只有 ownerQQ 私聊能进这个模式）。
   if (workPersona) {
+    const workPerms = workComputerActions.map((action) => ({ action, resource: '*', effect: 'allow' }));
+    // 本地 Agent 工具只给主人档。聊天档（qq-chat*）**绝不**加这条 ——
+    // 群聊里任何人都不该摸到读写/命令工具。
+    if (at.enabled && !chatOnly) workPerms.push({ action: 'agent-tools_*', resource: '*', effect: 'allow' });
     config.agents['qq-work'] = {
       description: '主人档：可以读写文件、跑命令（仅 owner 私聊）',
       mode: 'primary',
       system: workPersona,
-      permissions: workComputerActions.map((action) => ({ action, resource: '*', effect: 'allow' }))
+      permissions: workPerms
     };
   }
 
@@ -530,6 +580,7 @@ async function main() {
   const persona = {};
   const workdir = sessionWorkdir();
   const chatOnly = isChatOnly();
+  const agentToolsCfg = readAgentTools();
   if (!chatOnly) {
     for (const preset of PRESETS) {
       persona[preset.id] = renderPersona(readPresetPersona(preset.id), { model: modelLabel, cwd: workdir });
@@ -538,12 +589,18 @@ async function main() {
   // 主人档的人设：整份独立写，不借 qq-chat 的正文（理由见 buildWorkPersona 的注释）。
   // 纯聊天模式下它照样生成：`qq-work` 的工具是靠 **agent 级 permissions** 放行的，
   // 全局那条 `deny *` 只是兜底，不会把主人档也一起封掉。
-  const workPersona = buildWorkPersona({ model: modelLabel, cwd: workdir, roleName: currentRoleName() });
+  const workPersona = buildWorkPersona({
+    model: modelLabel,
+    cwd: workdir,
+    roleName: currentRoleName(),
+    agentTools: agentToolsCfg.enabled && !chatOnly,
+    sandboxRoot: agentToolsCfg.sandboxRoot || workdir
+  });
 
   const base = readJsonSafe(CONFIG_FILE, {});
   // 两档模型：配了哪档就把对应 agent 的 model 指过去（见 buildConfig 里的说明）
   const slots = readSlotProfiles('qq');
-  const { config, notes } = buildConfig({ base, pool, persona, workPersona, chatOnly, slots });
+  const { config, notes } = buildConfig({ base, pool, persona, workPersona, chatOnly, slots, agentTools: agentToolsCfg });
   for (const note of notes) log(note);
   log(`模型池来自 ${source}；默认模型 ${config.model}`);
   log(`agents: ${Object.keys(config.agents).join(', ')}`);
