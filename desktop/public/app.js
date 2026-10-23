@@ -410,6 +410,7 @@ const NAV = {
     ['models', 'API 与模型'],
     ['phone', '链接手机'],
     ['backend', '后端'],
+    ['extensions', '扩展'],
     ['advanced', '高级']
   ],
   wechat: [
@@ -422,6 +423,7 @@ const NAV = {
     ['phone', '链接手机'],
     ['hook', 'Hook'],
     ['backend', '后端'],
+    ['extensions', '扩展'],
     ['advanced', '高级']
   ]
 };
@@ -593,6 +595,7 @@ function loadPage(name) {
   if (name === 'exchange') return loadExchange();
   if (name === 'phone') return loadPhone();
   if (name === 'advanced') return loadAdvanced();
+  if (name === 'extensions') return loadExtensions();
   return null;
 }
 
@@ -3195,6 +3198,104 @@ $('#btn-plugin-add-save')?.addEventListener('click', async (e) => {
       : '已保存；桥接没在跑，下次启动自动装载';
     setResult('#plugin-add-result', `已保存 plugins/${r.file} —— ${reloadNote}`, 'ok');
     await loadPluginsUi();
+  });
+});
+
+/* ── 扩展中心（扩展页） ────────────────────────────────────────────────── */
+
+async function loadExtensions() {
+  try {
+    const x = await api('/api/extensions');
+    if (x && x.ok !== false) {
+      $('#ext-hub-state').textContent = x.hub?.enabled ? '已启用' : '已停用（通知枢纽设置里开）';
+      $('#ext-hub-path').textContent = x.hub?.path ?? '';
+      $('#ext-phone').textContent = x.phone?.running ? `运行中 · 端口 ${x.phone.port}` : `未运行 · 端口 ${x.phone.port}（状态页可启停）`;
+      $('#ext-plugins').textContent = `${x.plugins?.count ?? 0} 个插件（去「高级」页添加 / 管理）`;
+      $('#ext-mcp').textContent = (x.mcp ?? []).join('、') || '（还没生成 MCP 配置，启动一次桥接就有了）';
+      const ev = x.events ?? {};
+      $('#ext-ev-enabled').checked = ev.enabled === true;
+      $('#ext-ev-url').value = ev.url ?? '';
+      $('#ext-ev-secret').value = '';
+      $('#ext-ev-secret').placeholder = ev.hasSecret ? '已设置（留空 = 不修改）' : '留空 = 不设置';
+      $('#ext-ev-message').checked = ev.onMessage !== false;
+      $('#ext-ev-reply').checked = ev.onReply !== false;
+    }
+  } catch { /* 服务没起好就静默 */ }
+  try {
+    const eps = await api('/api/endpoints');
+    if (eps && eps.ok !== false) renderEndpointDocs(eps.endpoints ?? []);
+  } catch { /* 同上 */ }
+}
+
+function renderEndpointDocs(rows) {
+  const box = $('#ext-endpoints');
+  if (!box) return;
+  window.__extRows = rows;
+  box.innerHTML = rows
+    .map(
+      (r, i) => `<div class="list-row"><div class="row-main">
+        <div class="row-title"><span class="ext-method ext-m-${esc(r.method.toLowerCase())}">${esc(r.method)}</span> <code>${esc(r.path)}</code></div>
+        <div class="row-sub">${esc(r.desc)} · 鉴权：${esc(r.auth)}</div>
+        ${r.body ? `<div class="row-sub">body 示例：<code>${esc(r.body)}</code></div>` : ''}
+      </div><button class="btn btn-sm" data-ext-curl="${i}">复制 curl</button></div>`
+    )
+    .join('');
+}
+
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-ext-curl]');
+  if (!btn) return;
+  const r = (window.__extRows ?? [])[Number(btn.dataset.extCurl)];
+  if (!r) return;
+  const path = r.path.startsWith('http') ? r.path : location.origin + r.path;
+  const authHeaders = r.auth.includes('console') ? ' -H "x-console-token: <控制台令牌>"' : '';
+  const curl = r.method === 'GET'
+    ? `curl "${path}"`
+    : `curl -X ${r.method} "${path}" -H "content-type: application/json"${authHeaders} -d '${r.body ?? '{}'}'`;
+  const ok = await copyText(curl);
+  setResult('#ext-result', ok ? 'curl 已复制' : '复制失败', ok ? 'ok' : 'err');
+});
+
+$('#ext-hub-copy')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '复制中…', async () => {
+    const ok = await copyText(`${location.origin}${$('#ext-hub-path').textContent}`);
+    setResult('#ext-result', ok ? '地址已复制' : '复制失败', ok ? 'ok' : 'err');
+  });
+});
+
+let extEvTimer = null;
+function scheduleExtEvSave(extra = {}) {
+  clearTimeout(extEvTimer);
+  extEvTimer = setTimeout(async () => {
+    const payload = {
+      enabled: $('#ext-ev-enabled').checked,
+      url: $('#ext-ev-url').value.trim(),
+      onMessage: $('#ext-ev-message').checked,
+      onReply: $('#ext-ev-reply').checked,
+      ...extra
+    };
+    if ($('#ext-ev-secret').value.trim()) payload.secret = $('#ext-ev-secret').value.trim();
+    const r = await post('/api/events', payload);
+    if (r.ok === false) return setResult('#ext-ev-result', r.error ?? '保存失败', 'err');
+    setResult('#ext-ev-result', r.botsRestarted ? '已保存 ✓ QQ BOT 已重启，立即生效' : '已保存 ✓（微信侧下条消息起生效）', 'saved');
+  }, 700);
+}
+
+$('#ext-ev-enabled')?.addEventListener('change', () => scheduleExtEvSave());
+$('#ext-ev-url')?.addEventListener('change', () => scheduleExtEvSave());
+$('#ext-ev-secret')?.addEventListener('change', () => scheduleExtEvSave());
+$('#ext-ev-message')?.addEventListener('change', () => scheduleExtEvSave());
+$('#ext-ev-reply')?.addEventListener('change', () => scheduleExtEvSave());
+
+$('#btn-ext-ev-save')?.addEventListener('click', (e) => {
+  e.target.closest('button').blur();
+  scheduleExtEvSave();
+});
+
+$('#btn-ext-ev-test')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '发送中…', async () => {
+    const r = await post('/api/events', { test: true, url: $('#ext-ev-url').value.trim(), secret: $('#ext-ev-secret').value.trim() });
+    setResult('#ext-ev-result', r.ok === false ? (r.error ?? '测试失败') : (r.note ?? `对端 HTTP ${r.status}`), r.ok ? 'ok' : 'err');
   });
 });
 

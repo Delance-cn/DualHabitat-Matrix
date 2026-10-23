@@ -1696,6 +1696,97 @@
     </section>
 
     <!-- ══════════════════ 高级 ══════════════════ -->
+    <section class="page" id="page-extensions" hidden>
+      <header class="page-head">
+        <h1 data-i18n="扩展">扩展</h1>
+        <p data-i18n="所有对外接口和插口聚合在这：入站 Webhook、出站事件推送、发送 API、插件与 MCP、模型接入。">所有对外接口和插口聚合在这：入站 Webhook、出站事件推送、发送 API、插件与 MCP、模型接入。</p>
+      </header>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>入站 · 通知枢纽</h2>
+          <span class="hint" id="ext-hub-state"></span>
+        </div>
+        <p class="hint">POST / GET 这个地址，机器人就把文字转发到 QQ / 微信 / 推送渠道 —— 手表、脚本、自动化工具、快捷指令都能接：</p>
+        <div class="field-row" style="align-items:center">
+          <code id="ext-hub-path" style="flex:1;word-break:break-all;font-size:12px"></code>
+          <button class="btn btn-sm" id="ext-hub-copy">复制地址</button>
+        </div>
+        <p class="hint">口令就是路径最后一段；换口令在「消息与任务」页的通知枢纽卡。发送 API 端口就是本软件的端口。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>入站 · 手机页</h2>
+          <span class="hint" id="ext-phone"></span>
+        </div>
+        <p class="hint">安卓装 SmsForwarder 或 message-mirror，把手机通知 POST 到 <code>http://&lt;电脑局域网IP&gt;:&lt;端口&gt;/hook/&lt;口令&gt;</code>；扫码配置在「链接手机」页。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>出站 · 事件推送</h2>
+          <span class="hint">机器人把收到的消息、发出的回复主动 POST 给你配的 URL</span>
+        </div>
+        <label class="switch-row">
+          <input type="checkbox" id="ext-ev-enabled" />
+          <span><strong>启用事件推送</strong><em>每条收发都会 POST 一次（高频群会很吵，按需开）</em></span>
+        </label>
+        <div class="field">
+          <label for="ext-ev-url">推送地址（接收端的 URL）</label>
+          <input id="ext-ev-url" placeholder="https://your-server.example/dhm-events" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label for="ext-ev-secret">校验口令（选填，接收端核对 x-dhm-secret 请求头）</label>
+          <input id="ext-ev-secret" type="password" placeholder="留空 = 不修改已存的口令" spellcheck="false" />
+        </div>
+        <div class="field-row">
+          <label class="switch-row" style="margin:0"><input type="checkbox" id="ext-ev-message" /><span>收到消息时推</span></label>
+          <label class="switch-row" style="margin:0"><input type="checkbox" id="ext-ev-reply" /><span>发出回复时推</span></label>
+        </div>
+        <div class="field-row" style="margin-top:10px;align-items:center">
+          <button class="btn" id="btn-ext-ev-save">保存</button>
+          <button class="btn btn-ghost" id="btn-ext-ev-test">发一条测试事件</button>
+          <span class="result" id="ext-ev-result"></span>
+        </div>
+        <p class="hint">推送体：{ event: 'message'|'reply', time, data: { platform, chatId, text, … } }，鉴权头 x-dhm-secret。QQ 侧保存后自动重启生效；微信侧下条消息起生效。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>发送 API</h2>
+          <span class="hint">外部程序让机器人发内容（端点详情在下方接口手册）</span>
+        </div>
+        <p class="hint">sendMessage（文字）/ send-image（图库图片）/ say（现场合成语音条）/ send-sticker（表情）—— 全部走白名单、静默与限频闸门，和聊天里的机器人一个纪律。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>插件 &amp; MCP</h2>
+          <span class="hint" id="ext-plugins"></span>
+        </div>
+        <p class="hint">MCP 服务：<span id="ext-mcp"></span></p>
+        <p class="hint">插件的「+ 添加」引导在「高级」页；加新 MCP 服务在 oc-config 里注册一行（进阶用法，见 docs/LLM-INTEGRATION.md）。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>模型接入</h2>
+          <span class="hint">别的程序想用机器人同款模型？</span>
+        </div>
+        <p class="hint">本机模型 API：<code>http://127.0.0.1:4599</code>（Basic 鉴权；协议不是 OpenAI 格式，接入说明在 docs/LLM-INTEGRATION.md，OpenAI 兼容壳在规划中）。</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>接口手册</h2>
+          <span class="hint">常用对外端点与鉴权方式，一键复制 curl</span>
+        </div>
+        <div id="ext-endpoints"></div>
+        <span class="result" id="ext-result"></span>
+      </div>
+    </section>
+
     <section class="page" id="page-advanced" hidden>
       <header class="page-head">
         <h1 data-i18n="高级">高级</h1>

@@ -63,6 +63,7 @@ import { runLocalCommand, loadPlugins } from './chat-commands.js';
 import { appendMemory } from './memory-daily.js';
 import { resolveDataRoot } from './data-root.js';
 import { resolveLibraryFile } from './draw.js';
+import { emitEvent } from './events-out.js';
 
 /** 代码根：src / public / assets 随包分发；数据根：config / state / roles / plugins / audio。 */
 const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -948,6 +949,15 @@ function loadConfig() {
       enabled: file.commands?.enabled !== false,
       shutdownDelaySec: Number(file.commands?.shutdownDelaySec) || 60,
       roots: Array.isArray(file.commands?.roots) ? file.commands.roots.map(String).filter(Boolean) : []
+    },
+    // 出站事件推送（src/events-out.js）：机器人把收到/发出的消息 POST 给用户配的 URL。
+    // 白名单式归一化 —— 不加这段，events.* 会被静默剥掉（commands.* 的老坑）。
+    events: {
+      enabled: file.events?.enabled === true,
+      url: String(file.events?.url ?? '').trim(),
+      secret: String(file.events?.secret ?? '').trim(),
+      onMessage: file.events?.onMessage !== false,
+      onReply: file.events?.onReply !== false
     }
   };
 
@@ -7484,6 +7494,7 @@ async function main() {
     // 插件事件：onBotReply（进发送队列后触发一次；分条细节不暴露）
     sendChain = sendChain.then(() => {
       firePluginHook('onBotReply', { platform: 'qq', chatId: key, text: safeMsg });
+      emitEvent(cfg, 'reply', { platform: 'qq', chatId: key, text: safeMsg });
       // 每日记忆日志：机器人发出去的也记（按当前角色）
       try {
         appendMemory({
@@ -10872,6 +10883,8 @@ async function main() {
         conv: key, who: event.user_id ?? '', text: plainContent
       });
     } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }
+    // 出站事件：收到消息（扩展页配置的推送地址）
+    emitEvent(cfg, 'message', { platform: 'qq', chatId: key, from: String(event.user_id ?? ''), fromName: kind === 'group' ? (event.sender?.card || event.sender?.nickname || '') : '', text: plainContent });
 
     // 控制类话语：仅管理员（ownerQQ）可下达；群友触发直接拦截
     if (!isOwner && /进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(plainContent)) {

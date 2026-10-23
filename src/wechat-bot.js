@@ -36,6 +36,7 @@ import { ensureServer } from './oc-server.js';
 import { runLocalCommand, loadPlugins } from './chat-commands.js';
 import { appendMemory } from './memory-daily.js';
 import { resolveDataRoot } from './data-root.js';
+import { emitEvent } from './events-out.js';
 
 /** 代码根 / 数据根：登录态与配置跟着数据走（打包态由桌面端注入 QQ_BRIDGE_DATA）。 */
 const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -764,6 +765,8 @@ async function handleMessage(msg) {
   try {
     appendMemory({ root: ROOT, channel: 'wechat', role: '微信', conv: from, who: from, text });
   } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }
+  // 出站事件：收到消息（扩展页配置的推送地址）
+  emitEvent(readConfig(), 'message', { platform: 'wechat', chatId: from, from, text });
 
   if (!text) {
     await sendText(from, ctx, `收到你的${kinds}消息，我现在只能看文字。`).catch(() => {});
@@ -807,6 +810,7 @@ async function handleMessage(msg) {
         log(`回复 ${from}：${reply.slice(0, 60)}`);
         appendActivity(from, 'agent 回复', reply);
         firePluginHook('onBotReply', { platform: 'wechat', chatId: from, text: reply });
+        emitEvent(readConfig(), 'reply', { platform: 'wechat', chatId: from, text: reply });
         try {
           appendMemory({ root: ROOT, channel: 'wechat', role: '微信', conv: from, who: 'bridge', self: true, text: reply });
         } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }

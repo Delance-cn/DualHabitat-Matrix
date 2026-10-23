@@ -5597,6 +5597,102 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, { ok: true, name, code });
       }
     }
+    if (p === '/api/events') {
+      // 出站事件推送设置（扩展页「出站 · 事件推送」卡）。桥接启动时读一次 → 改完自动重启 QQ BOT；
+      // 微信侧每条消息现读 config，下条消息起生效。
+      const cfgE = loadConfig();
+      if (req.method === 'GET') {
+        const e = cfgE.events && typeof cfgE.events === 'object' ? cfgE.events : {};
+        return sendJson(res, {
+          ok: true,
+          enabled: e.enabled === true,
+          url: String(e.url ?? ''),
+          secret: String(e.secret ?? ''),
+          onMessage: e.onMessage !== false,
+          onReply: e.onReply !== false
+        });
+      }
+      if (req.method === 'POST') {
+        const body = await readBody(req);
+        if (body?.test === true) {
+          const url = String(body.url ?? cfgE.events?.url ?? '').trim();
+          if (!url) return sendJson(res, { ok: false, error: '先填推送地址' });
+          const secret = String(body.secret ?? cfgE.events?.secret ?? '').trim();
+          try {
+            const r = await fetch(url, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(secret ? { 'x-dhm-secret': secret } : {}) },
+              body: JSON.stringify({ event: 'test', time: new Date().toISOString(), data: { note: 'DualHabitat 扩展中心测试事件' } }),
+              signal: AbortSignal.timeout(8000)
+            });
+            return sendJson(res, { ok: r.ok, status: r.status, note: r.ok ? `对端收到了（HTTP ${r.status}）` : `对端返回 HTTP ${r.status}，检查一下接收端` });
+          } catch (error) {
+            return sendJson(res, { ok: false, error: `发不出去：${error?.message ?? error}` });
+          }
+        }
+        if (!cfgE.events || typeof cfgE.events !== 'object') cfgE.events = {};
+        let changed = false;
+        if (body?.enabled !== undefined) { const v = body.enabled === true; if (cfgE.events.enabled !== v) { cfgE.events.enabled = v; changed = true; } }
+        if (body?.url !== undefined) { const v = String(body.url).trim(); if (cfgE.events.url !== v) { cfgE.events.url = v; changed = true; } }
+        if (body?.secret !== undefined && String(body.secret).trim() !== '') { const v = String(body.secret).trim(); if (cfgE.events.secret !== v) { cfgE.events.secret = v; changed = true; } }
+        for (const k of ['onMessage', 'onReply']) {
+          if (body?.[k] !== undefined) { const v = body[k] === true; if (cfgE.events[k] !== v) { cfgE.events[k] = v; changed = true; } }
+        }
+        if (changed) writeJson(configFile(), cfgE);
+        let botsRestarted = false;
+        if (changed) { try { botsRestarted = await restartBotsFor('qq'); } catch { botsRestarted = false; } }
+        return sendJson(res, { ok: true, changed, botsRestarted });
+      }
+    }
+    if (p === '/api/extensions') {
+      // 扩展中心聚合状态：一页看清所有对外接口和插口。
+      if (req.method === 'GET') {
+        const cfgX = loadConfig();
+        const hub = loadNotify();
+        let pluginCount = 0;
+        try {
+          pluginCount = fs.readdirSync(path.join(dataRoot(), 'plugins')).filter((f) => f.endsWith('.js') || f.endsWith('.mjs')).length;
+        } catch {
+          /* 还没装插件 */
+        }
+        let mcp = [];
+        try {
+          const oc = JSON.parse(fs.readFileSync(path.join(dataRoot(), 'opencode.json'), 'utf8'));
+          mcp = Object.keys(oc.mcp?.servers ?? oc.mcp ?? oc.mcpServers ?? {});
+        } catch {
+          /* 配置还没生成就空着 */
+        }
+        const e = cfgX.events && typeof cfgX.events === 'object' ? cfgX.events : {};
+        return sendJson(res, {
+          ok: true,
+          hub: { enabled: hub.enabled !== false, path: `/hook/notify/${hub.token}`, default: hub.default ?? {} },
+          phone: { running: phoneListening > 0, port: phoneSettings().port },
+          plugins: { count: pluginCount },
+          mcp,
+          events: { enabled: e.enabled === true, url: String(e.url ?? ''), hasSecret: Boolean(e.secret), onMessage: e.onMessage !== false, onReply: e.onReply !== false },
+          llm: { url: 'http://127.0.0.1:4599', auth: 'Basic 鉴权（见 docs/LLM-INTEGRATION.md）' }
+        });
+      }
+    }
+    if (p === '/api/endpoints') {
+      // 内置接口手册：常用对外端点 + 鉴权方式 + 请求体示例（前端渲染成一键复制 curl）。
+      if (req.method === 'GET') {
+        const docs = [
+          { group: '入站', method: 'POST', path: '/hook/notify/<口令>', auth: '口令（路径里）', desc: '推送文字到 QQ / 微信 / 推送渠道（ntfy、Server酱、Bark、PushPlus）', body: '{"text":"你好","platform":"qq","to":"123456"}' },
+          { group: '入站', method: 'GET', path: '/hook/notify/<口令>?text=你好', auth: '口令（路径里）', desc: '一行调用版，浏览器地址栏就能发' },
+          { group: '入站', method: 'POST', path: 'http://<局域网IP>:3210/hook/<口令>', auth: '口令（路径里）', desc: '手机页入口：SmsForwarder / message-mirror 把手机通知转发进来' },
+          { group: '出站', method: 'POST', path: '<你在扩展页配的推送地址>', auth: 'x-dhm-secret 头（选填）', desc: '机器人事件推送：收到消息 / 发出回复时主动 POST 给你', body: '{"event":"message","time":"…","data":{"platform":"qq","chatId":"group:123","text":"…"}}' },
+          { group: '发送', method: 'POST', path: '/api/socialV2/sendMessage', auth: 'x-console-token 头', desc: '让机器人发一条文字到指定会话（走白名单/静默/限频闸门）', body: '{"key":"group:123456","text":"你好"}' },
+          { group: '发送', method: 'POST', path: '/api/socialV2/send-image', auth: 'x-console-token 头', desc: '把图库里的图片发到指定会话', body: '{"key":"private:123456","file":"draw-xxx.jpg","caption":"看图"}' },
+          { group: '发送', method: 'POST', path: '/api/socialV2/say', auth: 'agent token（reserved2 模式）', desc: '现场把一句话合成语音条发出（模型的 qq_say 通道）', body: '{"key":"group:123456","text":"这句话会变成语音","dryRun":true}' },
+          { group: '查询', method: 'GET', path: '/api/state', auth: 'x-console-token 头', desc: '机器人全量运行状态（服务、模型、更新、统计）' },
+          { group: '查询', method: 'GET', path: '/api/messages?platform=qq', auth: 'x-console-token 头', desc: '消息流（platform=qq / wechat / phone）' },
+          { group: '查询', method: 'GET', path: '/api/plugins', auth: 'x-console-token 头', desc: '已装载插件列表' },
+          { group: '模型', method: 'POST', path: 'http://127.0.0.1:4599（协议见 docs/LLM-INTEGRATION.md）', auth: 'Basic 鉴权', desc: '模型 API：别的程序复用机器人同款模型（非 OpenAI 协议，兼容壳规划中）' }
+        ];
+        return sendJson(res, { ok: true, endpoints: docs });
+      }
+    }
     if (p.startsWith('/hook/notify/')) {
       const hub = loadNotify();
       const token = p.slice('/hook/notify/'.length);

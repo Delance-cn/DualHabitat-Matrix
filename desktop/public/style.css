@@ -1906,3 +1906,9 @@ html[data-view="home"] .app { grid-template-columns: minmax(0, 1fr); }
 
 /* ── 插件添加引导：代码编辑框 ── */
 .code-editor { width: 100%; font-family: Consolas, 'Courier New', monospace; font-size: 12.5px; line-height: 1.5; padding: 10px; border-radius: 10px; border: 1px solid rgba(127, 127, 127, .25); background: rgba(127, 127, 127, .06); color: inherit; resize: vertical; }
+
+/* ── 扩展中心 ── */
+.ext-method { display: inline-block; padding: 1px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; background: rgba(127, 127, 127, .14); }
+.ext-m-post { background: rgba(59, 130, 246, .18); }
+.ext-m-get { background: rgba(34, 197, 94, .18); }
+#ext-hub-path { word-break: break-all; }
