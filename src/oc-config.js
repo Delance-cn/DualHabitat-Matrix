@@ -284,6 +284,78 @@ const BUILTIN_PROVIDERS = new Set([
   'siliconflow'
 ]);
 
+/**
+ * 本地 OpenAI 兼容服务商：opencode 的模型目录里**没有**它们，必须由生成器
+ * 写一段 provider 定义，否则 4599 实例的目录里根本不存在这些模型。
+ *
+ * 实机事故（0.5.1）：models.json 只有 `lmstudio/local-model`、profile 也选的
+ * lmstudio，但生成的 opencode.json 只有 `"model": "lmstudio/local-model"`，
+ * provider 段是空的 → 启动校验把唯一候选剔掉 → 每条消息都秒回「API 连不上」，
+ * 一次网络请求都没发（见 oc-client 的「目录里没有这些候选」日志）。
+ *
+ * 所以这里不只是「加进白名单」，还要把 baseURL / 模型清单写进 opencode.json。
+ */
+const LOCAL_PROVIDERS = {
+  lmstudio: {
+    label: '本地 LM Studio',
+    baseUrl: 'http://127.0.0.1:1234/v1',
+    // LM Studio 不校验 key，但 openai-compatible provider 要一个非空值
+    apiKey: 'lm-studio'
+  },
+  ollama: {
+    label: '本地 Ollama',
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    apiKey: 'ollama'
+  }
+};
+
+/** `provider/model[#variant]` 或 `{provider, model, variant}` → 拆开的 provider / model（去掉变体）。 */
+function candidateParts(entry) {
+  if (!entry) return { provider: '', model: '' };
+  if (typeof entry === 'string') {
+    const slash = entry.indexOf('/');
+    if (slash < 0) return { provider: '', model: '' };
+    return {
+      provider: entry.slice(0, slash).trim(),
+      model: entry.slice(slash + 1).split('#')[0].trim()
+    };
+  }
+  return {
+    provider: String(entry.provider ?? '').trim(),
+    model: String(entry.model ?? '').split('#')[0].trim()
+  };
+}
+
+/**
+ * 需要生成 provider 定义的本地服务商：模型池里出现的 + 两档 profile 里选的。
+ * baseUrl 优先用界面里填的（LM Studio 换端口也能跑）。
+ */
+function localProviderPlan({ pool, slots }) {
+  const plan = new Map();
+  const touch = (id) => {
+    if (!plan.has(id)) plan.set(id, { models: new Set(), baseUrl: '' });
+    return plan.get(id);
+  };
+
+  for (const entry of [...(pool?.free ?? []), ...(pool?.paid ?? [])]) {
+    const { provider, model } = candidateParts(entry);
+    if (!LOCAL_PROVIDERS[provider]) continue;
+    const item = touch(provider);
+    if (model) item.models.add(model);
+  }
+
+  for (const slot of ['chat', 'work']) {
+    const s = slots?.[slot];
+    if (!s || !LOCAL_PROVIDERS[s.provider]) continue;
+    const item = touch(s.provider);
+    if (s.model) item.models.add(String(s.model).split('#')[0]);
+    // 两档一般同源；真填了不同地址时以 chat 为准
+    if (s.baseUrl && (!item.baseUrl || slot === 'chat')) item.baseUrl = String(s.baseUrl).trim();
+  }
+
+  return plan;
+}
+
 /** 模型池里有没有某个 provider（决定要不要把 CF 指到 shim 上）。 */
 function poolUsesProvider(pool, provider) {
   return [...(pool.free ?? []), ...(pool.paid ?? [])].some((candidate) => {
@@ -513,7 +585,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   for (const { slot, ids, label } of slotPlan) {
     const s = slots?.[slot];
     if (!s) continue;
-    if (!BUILTIN_PROVIDERS.has(s.provider)) {
+    if (!BUILTIN_PROVIDERS.has(s.provider) && !LOCAL_PROVIDERS[s.provider]) {
       notes.push(`「${label}」是自定义服务商 ${s.provider}，暂不接到 agent（要往配置里写 apiKey，暂不自动做）`);
       continue;
     }
@@ -527,18 +599,65 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     notes.push(`「${label}」→ ${target}${hit ? '' : '（对应的 agent 没生成，没生效）'}`);
   }
 
-  // ── CF 兼容代理 ─────────────────────────────────────────────────────────
+  // ── provider 段 ────────────────────────────────────────────────────────
+  // 1. 用户手写的 provider 定义必须原样保留。以前只有池里有 CF 时才写 provider，
+  //    没 CF 时整段被生成器吃掉 —— 手写的自定义服务商（deepseek-official 之类）
+  //    每重生成一次就丢一次。
+  const provider = { ...(base.provider ?? {}) };
+
+  // 2. 本地服务商：opencode 目录里没有，生成器必须补定义，否则模型目录为空。
+  const localPlan = localProviderPlan({ pool, slots });
+  for (const [id, item] of localPlan) {
+    const preset = LOCAL_PROVIDERS[id];
+    const before = provider[id] ?? {};
+    const models = { ...(before.models ?? {}) };
+    for (const model of item.models) {
+      if (!models[model]) models[model] = { name: model };
+    }
+    provider[id] = {
+      ...before,
+      npm: before.npm ?? '@ai-sdk/openai-compatible',
+      name: before.name ?? preset.label,
+      options: {
+        ...(before.options ?? {}),
+        baseURL: before.options?.baseURL || item.baseUrl || preset.baseUrl,
+        apiKey: before.options?.apiKey || preset.apiKey
+      },
+      models
+    };
+    notes.push(
+      `本地服务商 ${id}（${preset.label}）已写入 provider（${provider[id].options.baseURL}，模型：${
+        [...item.models].join('、') || '未指定'
+      }）`
+    );
+  }
+
+  // 3. CF 兼容代理：池里有 CF 才把 baseURL 指到 cf-shim，别的一律不动。
   if (poolUsesProvider(pool, 'cloudflare-workers-ai')) {
-    config.provider = {
-      ...(base.provider ?? {}),
-      'cloudflare-workers-ai': {
-        ...(base.provider?.['cloudflare-workers-ai'] ?? {}),
-        options: {
-          ...(base.provider?.['cloudflare-workers-ai']?.options ?? {}),
-          baseURL: SHIM_BASE_URL
-        }
+    const cfBefore = provider['cloudflare-workers-ai'] ?? {};
+    provider['cloudflare-workers-ai'] = {
+      ...cfBefore,
+      options: {
+        ...(cfBefore.options ?? {}),
+        baseURL: SHIM_BASE_URL
       }
     };
+  }
+
+  if (Object.keys(provider).length) config.provider = provider;
+
+  // 池里有、但目录里注定没有的 provider —— 说清楚为什么，别让人只看到「API 连不上」。
+  const definedProviders = new Set(Object.keys(provider));
+  const missingProviders = new Set();
+  for (const entry of [...(pool?.free ?? []), ...(pool?.paid ?? [])]) {
+    const { provider: id } = candidateParts(entry);
+    if (id && !definedProviders.has(id) && !BUILTIN_PROVIDERS.has(id)) missingProviders.add(id);
+  }
+  if (missingProviders.size) {
+    notes.push(
+      `⚠️ 模型池里有 ${[...missingProviders].join('、')} 的模型，但 opencode.json 没有对应 provider 定义 —— ` +
+        `4599 的模型目录不会列出它们，启动校验会把候选剔掉。去「模型接入」选内置厂商，或在 provider 段补一条`
+    );
   }
 
   // 保留用户手写的其它字段（shell / default_agent / providers …），生成器只管自己那几块。
