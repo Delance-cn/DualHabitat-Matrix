@@ -68,6 +68,8 @@ import { emitEvent } from './events-out.js';
 /** 代码根：src / public / assets 随包分发；数据根：config / state / roles / plugins / audio。 */
 const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ROOT = resolveDataRoot(CODE_ROOT);
+/** OpenAI 兼容壳的句柄（0.5.0）：退出时要关掉监听，别把端口留给下一个进程。 */
+let openaiShellHandle = null;
 const STATE_DIR = path.join(ROOT, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
@@ -958,6 +960,21 @@ function loadConfig() {
       secret: String(file.events?.secret ?? '').trim(),
       onMessage: file.events?.onMessage !== false,
       onReply: file.events?.onReply !== false
+    },
+    // OpenAI 兼容壳（src/openai-shell.js）：把本实例的会话流程包成
+    // POST /v1/chat/completions，市面工具改个 baseURL 就能接。
+    // 同样必须显式收编 —— 白名单式归一化会把没写进来的段整段剥掉。
+    // 默认关闭：升级不该悄悄多监听一个端口。
+    openaiShell: {
+      enabled: file.openaiShell?.enabled === true,
+      port: Number(file.openaiShell?.port) || 4610,
+      // 留空 = 用 state/openai-shell.key（首次启动自动生成后落盘）
+      apiKey: String(file.openaiShell?.apiKey ?? '').trim(),
+      // 默认用聊天档（无本地工具）。想让它干活改成 qq-work，
+      // 但那等于把「读写文件 / 跑命令」交给持有 key 的任何程序，自己权衡。
+      agentPreset: String(file.openaiShell?.agentPreset ?? 'qq-chat').trim() || 'qq-chat',
+      timeoutMs: Number(file.openaiShell?.timeoutMs) || 180000,
+      maxConcurrent: Number(file.openaiShell?.maxConcurrent) || 4
     }
   };
 
@@ -2519,6 +2536,35 @@ async function main() {
       log
     });
   }
+
+  // ── OpenAI 兼容壳（0.5.0）──────────────────────────────────────────────
+  // 只在内置实例模式下启动：壳的翻译层是围绕「会话 + 事件流」写的，换成直连
+  // 模型 / CLI 后端就没有这套东西了。启动失败只记一行日志，绝不影响桥接本身。
+  if (cfg.openaiShell?.enabled) {
+    if (adapterApi) {
+      log('OpenAI 兼容壳已跳过：当前后端不是「API 实例」，壳只接内置实例');
+    } else {
+      try {
+        const { startOpenAIShell } = await import('./openai-shell.js');
+        const started = await startOpenAIShell({
+          port: cfg.openaiShell.port,
+          keyFile: path.join(ROOT, 'state', 'openai-shell.key'),
+          apiKey: cfg.openaiShell.apiKey,
+          stateDir,
+          workspaceRoot: ROOT,
+          agentPreset: cfg.openaiShell.agentPreset,
+          timeoutMs: cfg.openaiShell.timeoutMs,
+          maxConcurrent: cfg.openaiShell.maxConcurrent,
+          log
+        });
+        if (started.ok) openaiShellHandle = started;
+        else log(`⚠️ ${started.error}`);
+      } catch (error) {
+        log(`⚠️ OpenAI 兼容壳没起来：${error?.message ?? error}`);
+      }
+    }
+  }
+
   // 模型目录 RPC：模型 API 没有 DSH 的 `session/modelCatalog`，由门面的 callUnary
   // 按 provider 分组翻一遍模型列表（variants 的键就是思维链档位），形状仍是 DSH 那套，
   // 所以下面这段取档位的代码一行都不用改。
@@ -12097,11 +12143,13 @@ async function main() {
 
 process.on('SIGINT', () => {
   log('退出中…');
+  try { openaiShellHandle?.close?.(); } catch { /* 端口随进程一起释放 */ }
   saveState();
   releaseLock();
   process.exit(0);
 });
 process.on('SIGTERM', () => {
+  try { openaiShellHandle?.close?.(); } catch { /* 同上 */ }
   saveState();
   releaseLock();
   process.exit(0);

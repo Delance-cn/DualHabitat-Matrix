@@ -1771,10 +1771,41 @@
 
       <div class="panel">
         <div class="panel-head">
-          <h2>模型接入</h2>
-          <span class="hint">别的程序想用机器人同款模型？</span>
+          <h2>模型接入 · OpenAI 兼容壳</h2>
+          <span class="hint" id="ext-shell-state"></span>
         </div>
-        <p class="hint">本机模型 API：<code>http://127.0.0.1:4599</code>（Basic 鉴权；协议不是 OpenAI 格式，接入说明在 docs/LLM-INTEGRATION.md，OpenAI 兼容壳在规划中）。</p>
+        <p class="hint">任何 OpenAI 兼容的工具（Chatbox / LobeChat / Continue / OpenAI SDK…）把 baseURL 填 <code id="ext-shell-base">http://127.0.0.1:4610/v1</code> <button class="btn btn-sm" id="btn-ext-shell-copy-base">复制</button>、API key 填下面这串就能用 —— 走的是机器人同款模型池，带故障转移。</p>
+        <label class="switch-row">
+          <input type="checkbox" id="ext-shell-enabled" />
+          <span><strong>启用兼容壳</strong><em>由桥接进程托管（QQ BOT 没在跑时不会监听）；开启 / 改端口后保存会自动重启 QQ BOT</em></span>
+        </label>
+        <div class="field-row">
+          <div class="field">
+            <label for="ext-shell-port">端口</label>
+            <input id="ext-shell-port" type="number" min="1024" max="65535" placeholder="4610" />
+          </div>
+          <div class="field">
+            <label for="ext-shell-agent">用哪个 agent</label>
+            <select id="ext-shell-agent">
+              <option value="qq-chat">qq-chat · 只聊天，无工具</option>
+              <option value="qq-chat-v2">qq-chat-v2 · 二代仿真（QQ 工具）</option>
+              <option value="qq-work">qq-work · 能读写文件/跑命令（谨慎）</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="ext-shell-key">访问 key（请求头 Authorization: Bearer …）</label>
+          <div class="field-row" style="align-items:center">
+            <input id="ext-shell-key" readonly spellcheck="false" style="flex:1;font-family:ui-monospace,SFMono-Regular,monospace" />
+            <button class="btn btn-sm" id="btn-ext-shell-copy">复制</button>
+            <button class="btn btn-sm btn-ghost" id="btn-ext-shell-newkey">换一个</button>
+          </div>
+        </div>
+        <div class="field-row" style="margin-top:10px;align-items:center">
+          <button class="btn" id="btn-ext-shell-save">保存</button>
+          <span class="result" id="ext-shell-result"></span>
+        </div>
+        <p class="hint">壳只绑 127.0.0.1，别拿去给局域网裸开。原生模型 API 仍是 <code>http://127.0.0.1:4599</code>（Basic 鉴权、非 OpenAI 协议，见 docs/LLM-INTEGRATION.md）。</p>
       </div>
 
       <div class="panel">

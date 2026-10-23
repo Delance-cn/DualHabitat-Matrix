@@ -57,6 +57,12 @@ npm start
 
 控制台：`http://127.0.0.1:3100`（Token 在 `state/console-token`）。
 
+**OpenAI 兼容壳（0.5.0 起）**：桌面端「扩展 → 模型接入」一键开启后，
+`http://127.0.0.1:4610/v1` 就是标准 OpenAI 接口（`Authorization: Bearer <state/openai-shell.key>`）。
+Chatbox / LobeChat / Continue / 任意 OpenAI SDK 只改 `baseURL` + `apiKey` 即可，
+背后走的是机器人同款模型池与故障转移。一期是「假流式」（全文一次发完，协议合规），
+`tools` 暂不转发；细节见 [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md)。
+
 ### 接入新的模型 provider（以阿里云百炼为例）
 
 1. `secrets.json` 加 `"BAILIAN_API_KEY": "sk-..."`；

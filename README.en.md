@@ -27,6 +27,7 @@ QQ messages ──► SnowLuma (OneBot v11 WS) ──► qq-bridge ──► DSH
 ## Features
 
 - Bridges QQ group/private messages to DSH agent sessions.
+- **OpenAI-compatible shell (v0.5.0)**: enable it under Extensions → Model access and point any OpenAI SDK / Chatbox / LobeChat / Continue at `http://127.0.0.1:4610/v1` with `Authorization: Bearer <state/openai-shell.key>`. Requests run through the same model pool with failover. Streaming is currently "fake" (the whole reply arrives in one delta) and `tools` are not forwarded yet — see [docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md).
 - Social simulation mode ("simulated group friend") with idle/active/probing/exiting states.
 - Space-based message splitting for more natural multi-message replies.
 - Whitelist/blacklist access control, fail-closed by default.

@@ -3219,6 +3219,16 @@ async function loadExtensions() {
       $('#ext-ev-secret').placeholder = ev.hasSecret ? '已设置（留空 = 不修改）' : '留空 = 不设置';
       $('#ext-ev-message').checked = ev.onMessage !== false;
       $('#ext-ev-reply').checked = ev.onReply !== false;
+      const sh = x.openaiShell ?? {};
+      const shPort = sh.port ?? 4610;
+      $('#ext-shell-enabled').checked = sh.enabled === true;
+      $('#ext-shell-port').value = shPort;
+      $('#ext-shell-agent').value = sh.agentPreset ?? 'qq-chat';
+      $('#ext-shell-key').value = sh.key ?? '';
+      $('#ext-shell-base').textContent = `http://127.0.0.1:${shPort}/v1`;
+      $('#ext-shell-state').textContent = sh.enabled
+        ? '已启用（桥接在跑时才真的监听）'
+        : '未启用';
     }
   } catch { /* 服务没起好就静默 */ }
   try {
@@ -3296,6 +3306,73 @@ $('#btn-ext-ev-test')?.addEventListener('click', async (e) => {
   await busy(e.target.closest('button'), '发送中…', async () => {
     const r = await post('/api/events', { test: true, url: $('#ext-ev-url').value.trim(), secret: $('#ext-ev-secret').value.trim() });
     setResult('#ext-ev-result', r.ok === false ? (r.error ?? '测试失败') : (r.note ?? `对端 HTTP ${r.status}`), r.ok ? 'ok' : 'err');
+  });
+});
+
+/* ── OpenAI 兼容壳 ─────────────────────────────────────────────────────── */
+
+// 端口改了先把展示的 baseURL 跟着变，别让人复制到一个旧端口
+$('#ext-shell-port')?.addEventListener('input', () => {
+  const port = Number($('#ext-shell-port').value) || 4610;
+  $('#ext-shell-base').textContent = `http://127.0.0.1:${port}/v1`;
+});
+
+$('#btn-ext-shell-copy-base')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '复制中…', async () => {
+    const ok = await copyText($('#ext-shell-base').textContent);
+    setResult('#ext-shell-result', ok ? 'baseURL 已复制' : '复制失败', ok ? 'ok' : 'err');
+  });
+});
+
+$('#btn-ext-shell-copy')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '复制中…', async () => {
+    const key = $('#ext-shell-key').value;
+    if (!key) return setResult('#ext-shell-result', '还没有 key —— 先保存（开启后桥接会生成一个）', 'err');
+    const ok = await copyText(key);
+    setResult('#ext-shell-result', ok ? 'key 已复制' : '复制失败', ok ? 'ok' : 'err');
+  });
+});
+
+/**
+ * 保存后 key 可能在重启之后才生成：桥接启动时才调 loadOrCreateKey。
+ * 所以这里多刷几次，别让界面停在空 key 上让人以为坏了。
+ */
+async function refreshShellUi(retries = 3) {
+  for (let i = 0; i < retries; i += 1) {
+    const r = await api('/api/openai-shell').catch(() => null);
+    if (r && r.ok !== false) {
+      $('#ext-shell-key').value = r.key ?? '';
+      const running = r.running ? `运行中 · 端口 ${r.port}` : (r.enabled ? '已启用，等桥接起来' : '未启用');
+      $('#ext-shell-state').textContent = running;
+      if (!r.enabled || r.key) return r;
+    }
+    await new Promise((res) => setTimeout(res, 1200));
+  }
+  return null;
+}
+
+$('#btn-ext-shell-save')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const r = await post('/api/openai-shell', {
+      enabled: $('#ext-shell-enabled').checked,
+      port: Number($('#ext-shell-port').value) || 4610,
+      agentPreset: $('#ext-shell-agent').value
+    });
+    if (r.ok === false) return setResult('#ext-shell-result', r.error ?? '保存失败', 'err');
+    setResult('#ext-shell-result', r.botsRestarted ? '已保存 ✓ QQ BOT 已重启' : '已保存 ✓（下次启动桥接生效）', 'saved');
+    if (r.key) $('#ext-shell-key').value = r.key;
+    setTimeout(() => refreshShellUi().catch(() => {}), 600);
+  });
+});
+
+$('#btn-ext-shell-newkey')?.addEventListener('click', async (e) => {
+  if (!window.confirm('换 key 后，所有已经填了旧 key 的工具都要重新填一遍。继续？')) return;
+  await busy(e.target.closest('button'), '生成中…', async () => {
+    const r = await post('/api/openai-shell', { regenerateKey: true });
+    if (r.ok === false) return setResult('#ext-shell-result', r.error ?? '生成失败', 'err');
+    $('#ext-shell-key').value = r.key ?? '';
+    setResult('#ext-shell-result', '新 key 已生成 ✓', 'saved');
+    setTimeout(() => refreshShellUi().catch(() => {}), 600);
   });
 });
 

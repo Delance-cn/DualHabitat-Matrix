@@ -274,5 +274,14 @@
       "ffmpegPath": "",
       "browserPath": ""
     }
+  },
+  "openaiShell": {
+    "_comment": "OpenAI 兼容壳：POST /v1/chat/completions 转发到本机 4599 实例，市面工具改 baseURL 即可接入。apiKey 留空则首次启动自动生成到 state/openai-shell.key；agentPreset 用 qq-chat 只聊天，改 qq-work 会连带开放读写文件/跑命令。",
+    "enabled": false,
+    "port": 4610,
+    "apiKey": "",
+    "agentPreset": "qq-chat",
+    "timeoutMs": 180000,
+    "maxConcurrent": 4
   }
 }

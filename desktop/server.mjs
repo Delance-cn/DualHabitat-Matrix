@@ -5800,6 +5800,10 @@ const server = http.createServer(async (req, res) => {
           /* 配置还没生成就空着 */
         }
         const e = cfgX.events && typeof cfgX.events === 'object' ? cfgX.events : {};
+        const shRaw = cfgX.openaiShell && typeof cfgX.openaiShell === 'object' ? cfgX.openaiShell : {};
+        const shPort = Number(shRaw.port);
+        let shellKey = '';
+        try { shellKey = fs.readFileSync(path.join(dataRoot(), 'state', 'openai-shell.key'), 'utf8').trim(); } catch { /* 还没生成 */ }
         return sendJson(res, {
           ok: true,
           hub: { enabled: hub.enabled !== false, path: `/hook/notify/${hub.token}`, default: hub.default ?? {} },
@@ -5807,10 +5811,93 @@ const server = http.createServer(async (req, res) => {
           plugins: { count: pluginCount },
           mcp,
           events: { enabled: e.enabled === true, url: String(e.url ?? ''), hasSecret: Boolean(e.secret), onMessage: e.onMessage !== false, onReply: e.onReply !== false },
+          openaiShell: {
+            enabled: shRaw.enabled === true,
+            port: Number.isFinite(shPort) && shPort >= 1024 && shPort <= 65535 ? shPort : 4610,
+            agentPreset: String(shRaw.agentPreset ?? 'qq-chat'),
+            key: shellKey
+          },
           llm: { url: 'http://127.0.0.1:4599', auth: 'Basic 鉴权（见 docs/LLM-INTEGRATION.md）' }
         });
       }
     }
+    if (p === '/api/openai-shell') {
+      /* OpenAI 兼容壳（0.5.0）。壳由**桥接进程**托管（它才连着模型实例），
+       * 所以这里只负责读写配置 + 重启桥接；状态用探端口判断，不去猜桥接内部。 */
+      const shellKeyFile = path.join(dataRoot(), 'state', 'openai-shell.key');
+      const readShellKey = () => {
+        try { return fs.readFileSync(shellKeyFile, 'utf8').trim(); } catch { return ''; }
+      };
+      const shellShape = (cfgIn) => {
+        const sh = cfgIn?.openaiShell && typeof cfgIn.openaiShell === 'object' ? cfgIn.openaiShell : {};
+        const port = Number(sh.port);
+        return {
+          enabled: sh.enabled === true,
+          port: Number.isFinite(port) && port >= 1024 && port <= 65535 ? port : 4610,
+          agentPreset: String(sh.agentPreset ?? 'qq-chat'),
+          timeoutMs: Number(sh.timeoutMs) || 180000
+        };
+      };
+
+      if (req.method === 'GET') {
+        const sh = shellShape(loadConfig());
+        return sendJson(res, {
+          ok: true,
+          ...sh,
+          key: readShellKey(),
+          running: await probePort(sh.port),
+          bridgeRunning: Boolean(bridge.child)
+        });
+      }
+
+      if (req.method === 'POST') {
+        const body = await readBody(req);
+        const cfgS = loadConfig();
+        if (!cfgS.openaiShell || typeof cfgS.openaiShell !== 'object') cfgS.openaiShell = {};
+        let changed = false;
+
+        if (body?.enabled !== undefined) {
+          const v = body.enabled === true;
+          if (cfgS.openaiShell.enabled !== v) { cfgS.openaiShell.enabled = v; changed = true; }
+        }
+        if (body?.port !== undefined) {
+          const port = Math.floor(Number(body.port) || 0);
+          if (port < 1024 || port > 65535) return sendJson(res, { ok: false, error: '端口要在 1024-65535 之间' });
+          // 这几个是本程序自己在用的，占了会互相打架
+          const reserved = new Set([3000, 3001, 3100, 3200, 3210, 4599, 4600]);
+          if (reserved.has(port)) return sendJson(res, { ok: false, error: `端口 ${port} 已被本程序占用，换一个` });
+          if (cfgS.openaiShell.port !== port) { cfgS.openaiShell.port = port; changed = true; }
+        }
+        if (body?.agentPreset !== undefined) {
+          const ap = String(body.agentPreset).trim() || 'qq-chat';
+          if (!/^[a-z0-9][a-z0-9-]{0,31}$/i.test(ap)) return sendJson(res, { ok: false, error: 'agent 名字不合法' });
+          if (cfgS.openaiShell.agentPreset !== ap) { cfgS.openaiShell.agentPreset = ap; changed = true; }
+        }
+        if (body?.regenerateKey === true) {
+          // 生成在**桌面端**做，桥接只读文件 —— 这样界面能立刻显示新 key，
+          // 又不依赖桥接是否在跑（桥接那边 loadOrCreateKey 认这个文件）。
+          cfgS.openaiShell.apiKey = '';
+          fs.mkdirSync(path.dirname(shellKeyFile), { recursive: true });
+          fs.writeFileSync(shellKeyFile, `dhm-${randomBytes(24).toString('hex')}\n`, { encoding: 'utf8', mode: 0o600 });
+          changed = true;
+        }
+
+        if (changed) writeJson(configFile(), cfgS);
+        let botsRestarted = false;
+        if (changed) { try { botsRestarted = await restartBotsFor('qq'); } catch { botsRestarted = false; } }
+        const sh = shellShape(loadConfig());
+        return sendJson(res, {
+          ok: true,
+          changed,
+          botsRestarted,
+          ...sh,
+          key: readShellKey(),
+          running: await probePort(sh.port)
+        });
+      }
+      return sendJson(res, { ok: false, error: '只支持 GET / POST' }, 405);
+    }
+
     if (p === '/api/endpoints') {
       // 内置接口手册：常用对外端点 + 鉴权方式 + 请求体示例（前端渲染成一键复制 curl）。
       if (req.method === 'GET') {
@@ -5825,7 +5912,9 @@ const server = http.createServer(async (req, res) => {
           { group: '查询', method: 'GET', path: '/api/state', auth: 'x-console-token 头', desc: '机器人全量运行状态（服务、模型、更新、统计）' },
           { group: '查询', method: 'GET', path: '/api/messages?platform=qq', auth: 'x-console-token 头', desc: '消息流（platform=qq / wechat / phone）' },
           { group: '查询', method: 'GET', path: '/api/plugins', auth: 'x-console-token 头', desc: '已装载插件列表' },
-          { group: '模型', method: 'POST', path: 'http://127.0.0.1:4599（协议见 docs/LLM-INTEGRATION.md）', auth: 'Basic 鉴权', desc: '模型 API：别的程序复用机器人同款模型（非 OpenAI 协议，兼容壳规划中）' }
+          { group: '模型', method: 'POST', path: 'http://127.0.0.1:4610/v1/chat/completions', auth: 'Authorization: Bearer <壳的 key>', desc: 'OpenAI 兼容壳：任何 OpenAI SDK / 工具改 baseURL 就能用（走机器人同款模型池）', body: '{"model":"dh-matrix","messages":[{"role":"user","content":"你好"}]}' },
+          { group: '模型', method: 'GET', path: 'http://127.0.0.1:4610/v1/models', auth: 'Authorization: Bearer <壳的 key>', desc: '壳支持的模型清单（来自本机实例的模型目录）' },
+          { group: '模型', method: 'POST', path: 'http://127.0.0.1:4599（协议见 docs/LLM-INTEGRATION.md）', auth: 'Basic 鉴权', desc: '模型 API 原生接口：会话制协议，非 OpenAI 格式（要 OpenAI 格式用上面的兼容壳）' }
         ];
         return sendJson(res, { ok: true, endpoints: docs });
       }

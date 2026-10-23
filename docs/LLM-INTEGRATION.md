@@ -8,6 +8,7 @@
 | 接入点 | 地址 | 协议 | 鉴权 | 适合谁 |
 |---|---|---|---|---|
 | 内置模型 API 实例 | `http://127.0.0.1:4599` | OpenCode REST（会话制，SSE 事件流） | HTTP Basic，密码在 `.oc/state/opencode/service.json` | 想复用「带工具、带模型池故障转移」的完整 Agent 能力 |
+| OpenAI 兼容壳 | `http://127.0.0.1:4610/v1` | **OpenAI 兼容** | `Authorization: Bearer <key>`（`state/openai-shell.key`，扩展页可看/可换） | Chatbox / LobeChat / Continue / 任何 OpenAI SDK，零改造 |
 | cf-shim | `http://127.0.0.1:4600/v1` | **OpenAI 兼容** | 无 | 只要 Cloudflare Workers AI 模型、手头只有 OpenAI SDK |
 | 桌面端服务 | `http://127.0.0.1:3200` | 自有 REST | 无（仅本机） | 本机脚本：发通知、做总结、读消息 |
 | 桥接控制台 | `http://127.0.0.1:3100` | 自有 REST | `x-console-token`（`state/console-token`） | 本机运维脚本：状态、插件、白名单 |
@@ -86,19 +87,57 @@ await api.workspace.archiveSession({ sessionId }); // 一次性会话记得归�
 2. **先 `events.follow()` 再 `prompt`**：全局事件流不补发，反了就错过回合事件。
 3. **`agentPreset` 直接映射 agent**：`qq-chat` 这类名字来自 `opencode.json`，用之前确认存在。
 
-### 1.3 OpenAI 兼容现状（如实）
+### 1.3 OpenAI 兼容壳（4610）—— 0.5.0 起可用
 
-- **实例本身不是 OpenAI 协议**：`POST /v1/chat/completions` 实测 405。想用 OpenAI SDK 的见 cf-shim。
-- **cf-shim（4600）是 OpenAI 兼容端点**，但只服务 Cloudflare Workers AI 的模型，且健康与否
-  取决于 `CLOUDFLARE_API_TOKEN` 是否有效（2026-10-21 实测上游 502，本机这把 key 已失效）。
-- Roadmap：给实例配一个真正的 `/v1` OpenAI 兼容壳（把 session 流程包成 chat/completions）。
-  在那之前，OpenAI SDK 用户建议直连厂商（key 自己管）或走 §2 的桌面端接口。
+实例本身仍不是 OpenAI 协议（`POST /v1/chat/completions` 直连 4599 还是 405）。
+0.5.0 起桥接会在旁边起一个小服务，把 OpenAI 请求**翻译成上面这套会话流程**
+（`src/openai-shell.js`）。
+
+- **开启**：桌面端「扩展 → 模型接入 · OpenAI 兼容壳」勾选启用；或 `config.json` 里
+  `"openaiShell": { "enabled": true }`。默认关闭（升级不悄悄多监听端口）。
+- **baseURL**：`http://127.0.0.1:4610/v1`（端口可改，避开 3000/3001/3100/3200/3210/4599/4600）。
+- **鉴权**：`Authorization: Bearer <key>`。key 首次启动自动生成到
+  `state/openai-shell.key`（扩展页可见、可一键换）；`config.json` 的
+  `openaiShell.apiKey` 优先于这个文件。
+- **模型**：`GET /v1/models` 返回实例的真实模型目录；请求里的 `model` 目前只回显，
+  实际用哪个模型由模型池 + 故障转移决定（要固定模型请改模型池）。
+
+```bash
+curl http://127.0.0.1:4610/v1/chat/completions \
+  -H "authorization: Bearer <key>" -H "content-type: application/json" \
+  -d '{"model":"dh-matrix","messages":[{"role":"user","content":"你好"}]}'
+```
+
+Python / JS SDK 只改 `base_url` 和 `api_key` 两行即可。
+
+一期已知边界（`NEXT-STEPS` 里写的「非流式先行」）：
+
+| 项 | 现状 |
+|---|---|
+| 非流式 | ✅ 完整支持（`usage` 是按字数估的，不参与计费） |
+| `stream: true` | ⚠️ **假流式**：全文一次性发完再 `[DONE]`，协议合规、内容正确，但没有逐字推送 |
+| `tools` / function calling | ❌ 不转发（带了也不报错，模型看不到工具） |
+| 多轮上下文 | 每条请求建一个新会话、结束即归档；历史靠客户端每次带全 `messages` |
+| 后端依赖 | 只在内置实例模式（没配 `backend` 或 `matrix`）下启动；直连模型/CLI 后端时壳不启 |
+
+> 之所以要「常驻一条事件流」而不是每请求开一条：`events.mux()` 的 `for await` 里
+> `break` 不会关掉底层订阅，按请求开会持续泄漏 SSE 连接（`oc-client.js` 5.5 节）。
+> 壳里全局只开一条，按 `sessionId` 分发给各个等待者。
+
+`cf-shim`（4600）仍是另一条路，只服务 Cloudflare Workers AI 的模型，健康与否取决于
+`CLOUDFLARE_API_TOKEN`。两者不冲突：要「同一个人格 + 模型池故障转移」用 4610，
+只要 CF 模型用 4600。
 
 ---
 
 ## 2. 桌面端服务（3200）—— 本机脚本最省事的一条路
 
 不需要懂 Agent 会话，直接调 REST（全部仅本机）：
+
+> 0.5.0 起**所有会改状态的请求都过了同源闸门**：`Host` 必须是回环地址；
+> 带了 `Origin` 就必须是本服务的源；`Sec-Fetch-Site: cross-site|same-site` 直接 403。
+> curl / 脚本 / 入站 webhook 不带 `Origin`，照旧放行 —— 这条是为了挡住
+> 「浏览器里的任意网页 POST 过来写插件」那条 RCE 链路。
 
 ### 2.1 让模型帮你干活：`POST /api/summarize`（✅ 实测到降级链）
 
@@ -171,3 +210,7 @@ Host 必须是 127.0.0.1（跨站防护），脚本从本机调没问题。
 - 3200 的 `/api/summarize`（含 11 个直连模型降级 + 实例兜底的报错路径）、
   `/hook/notify`（404/直发/dryRun）：当日实测。
 - cf-shim 502：当日实测（本机 CF token 失效所致，链路代码是既有代码）。
+- **OpenAI 兼容壳（4610）**：2026-10-23 端到端实测 —— 隔离数据根 + 独立实例（4699），
+  `GET /v1/models` 返回 658 个模型；非流式 / `stream:true` / 多轮 messages / 无 key 401 /
+  空 messages 400 / 未实现端点 404 全部通过；同一次请求里真实走了
+  `bailian` 免费额度耗尽 → `zhipu` 401 → `cloudflare-workers-ai` 的降级链。

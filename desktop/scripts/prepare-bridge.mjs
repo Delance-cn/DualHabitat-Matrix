@@ -138,7 +138,7 @@ const size = (dir) => {
   return total;
 };
 
-const must = ['src/bridge.js', 'src/wechat-bot.js', 'src/oc-server.js', 'config.example.json', 'package.json'];
+const must = ['src/bridge.js', 'src/wechat-bot.js', 'src/oc-server.js', 'src/openai-shell.js', 'config.example.json', 'package.json'];
 const missing = must.filter((f) => !fs.existsSync(path.join(outDir, f)));
 if (missing.length) {
   console.error('自检失败，缺：' + missing.join(', '));
