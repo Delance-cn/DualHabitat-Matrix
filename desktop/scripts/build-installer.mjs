@@ -360,7 +360,7 @@ const config = {
   // asar 关掉：napcat 里是可执行的 .exe/.dll，塞进 asar 里跑不起来；
   // 而且本项目的界面本来就是明文 js，压成 asar 只是碍事。
   asar: false,
-  files: ['main.mjs', 'server.mjs', 'public/**/*', 'vendor/**/*', 'package.json'],
+  files: ['main.mjs', 'shutdown.mjs', 'server.mjs', 'public/**/*', 'vendor/**/*', 'package.json'],
   extraResources,
   compression: 'normal',
   win: {

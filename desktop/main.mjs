@@ -8,12 +8,16 @@
 import { app, BrowserWindow, shell, dialog, session, Tray, Menu, nativeImage } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createShutdownController } from './shutdown.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 let win = null;
 let tray = null;
 let startServer = null;
+let serverModule = null;
+// 本地服务真的起来过才算「这台进程托管了后台服务」。第二实例、端口起不来都别去动别人的进程。
+let serverStarted = false;
 // 点叉只是收进托盘；只有从这里（托盘菜单 / 系统退出）走的才算真退出。
 // 不区分的话 close 里没法判断「该藏还是该退」。
 let quitting = false;
@@ -60,11 +64,15 @@ async function createWindow() {
   process.env.DHM_SETTINGS = path.join(app.getPath('userData'), 'settings.json');
 
   // 动态 import：server.mjs 在模块顶层读这个环境变量，所以必须等它设好再加载
-  if (!startServer) ({ startServer } = await import('./server.mjs'));
+  if (!startServer) {
+    serverModule = await import('./server.mjs');
+    ({ startServer } = serverModule);
+  }
 
   let url;
   try {
     ({ url } = await startServer());
+    serverStarted = true;
   } catch (error) {
     console.error('本地服务起不来：', error?.message ?? error);
     dialog.showErrorBox(
@@ -138,6 +146,12 @@ async function createWindow() {
         /* 系统不支持气泡就算了，托盘 tooltip 也够 */
       }
     }
+  });
+
+  // Windows 关机 / 注销时 Electron 不会发 before-quit（官方文档明确写了），
+  // 只能在这里抢时间收一下子进程。系统不会等我们，所以不 await。
+  win.on('session-end', () => {
+    shutdown.begin();
   });
 }
 
@@ -230,6 +244,16 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     createWindow();
     createTray();
+
+    // 仅开发态：自动化退出测试用（打包版里 app.isPackaged 为 true，永不生效）。
+    // 走的就是托盘「退出」同一条路：quitting = true → app.quit() → before-quit 收进程。
+    const testQuitMs = Number(process.env.DHM_TEST_QUIT_AFTER_MS);
+    if (!app.isPackaged && Number.isFinite(testQuitMs) && testQuitMs > 0) {
+      setTimeout(() => {
+        quitting = true;
+        app.quit();
+      }, testQuitMs);
+    }
   });
 
   app.on('activate', () => {
@@ -241,8 +265,32 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-// 系统关机 / 任务栏退出 / 托盘菜单退出都会走这里 —— 必须把 quitting 置上，
-// 否则 close 拦截会把退出流程拦下来，程序关不掉。
-app.on('before-quit', () => {
+/**
+ * 退出前真正把后台服务收掉。
+ *
+ * 必须等 shutdownServer() resolve：里面会按进程树杀桥接、微信，再按 NapCat
+ * 目录里的可执行文件路径把那份 QQ.exe 也收掉。只是发个信号就退，窗口先没了，
+ * 用户看到的还是「NapCat 没关」。
+ */
+async function stopBackgroundServices() {
+  // 服务没起过（第二实例被单实例锁挡回去 / 端口起不来）就什么都别动：
+  // 这时 NapCat 属于正在跑的那个实例，杀了就是把人家的 QQ 断了。
+  if (!serverStarted) return;
+  try {
+    if (!serverModule) serverModule = await import('./server.mjs');
+    if (typeof serverModule.shutdownServer === 'function') {
+      await serverModule.shutdownServer();
+    }
+  } catch (error) {
+    console.error('退出时停止后台服务失败：', error?.message ?? error);
+  }
+}
+
+const shutdown = createShutdownController({ app, stopServices: stopBackgroundServices });
+
+// 系统关机 / 任务栏退出 / 托盘菜单退出都会走这里。
+// quitting 先置上：窗口的 close 拦截靠它判断「这次是真退出，别再藏进托盘」。
+app.on('before-quit', (event) => {
   quitting = true;
+  shutdown.onBeforeQuit(event);
 });

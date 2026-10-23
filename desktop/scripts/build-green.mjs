@@ -47,7 +47,7 @@ if (fs.existsSync(exe)) {
 console.log('3/5 放代码进 resources/app …');
 fs.mkdirSync(appDir, { recursive: true });
 
-for (const item of ['main.mjs', 'server.mjs']) {
+for (const item of ['main.mjs', 'shutdown.mjs', 'server.mjs']) {
   fs.copyFileSync(path.join(root, item), path.join(appDir, item));
 }
 for (const dir of ['public', 'vendor']) {

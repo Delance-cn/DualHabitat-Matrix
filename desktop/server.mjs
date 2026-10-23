@@ -1289,6 +1289,8 @@ function relayText(stream, into) {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 let napcatLaunch = { startedAt: null, pid: null, child: null };
+// 上次真正拉起 NapCat 的目录。用户中途改了设置也要能收掉旧目录里的进程。
+let lastNapcatDir = '';
 
 function probePort(port, host = '127.0.0.1', timeoutMs = 800) {
   return new Promise((resolve) => {
@@ -1422,6 +1424,7 @@ function startNapcat() {
 
   const exe = path.join(n.dir, n.exe);
   if (!fs.existsSync(exe)) return { ok: false, error: `找不到启动器：${exe}` };
+  lastNapcatDir = n.dir;
 
   // 没开文件日志的话，NapCat 的输出只会进命名管道，日志页永远是空的
   ensureNapcatFileLog();
@@ -1448,30 +1451,180 @@ function startNapcat() {
   return { ok: true, pid: child.pid };
 }
 
+/* ── 收进程树 ────────────────────────────────────────────────────────────
+ * Windows 上 Electron / node 退出**不会**连带杀掉子进程：QQ 桥接、微信 bot、
+ * NapCat 都会变成孤儿。以前 stopNapcat() 只按启动器镜像名杀，启动器自己先退了
+ * 就什么也没杀到，NapCat 里那份 QQ.exe 继续占着端口 —— 表现就是「关了软件，
+ * NapCat 还在」。
+ * 所以退出时必须按 pid 树 + NapCat 目录里的可执行文件路径各收一遍。
+ */
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 给停止结果挂一个「收尾完成」Promise。
+ *
+ * 必须不可枚举：这些结果会直接 sendJson 给界面，Promise 序列化成 `{}` 很难看。
+ * 快捷键 `result.done` 照常能拿到。
+ */
+function withDone(result, done) {
+  Object.defineProperty(result, 'done', { value: done, enumerable: false, configurable: true });
+  return result;
+}
+
+/** 杀一个进程和它的整棵子树；返回 Promise，等 taskkill 真跑完。 */
+function killProcessTree(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return Promise.resolve(false);
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(pid, 'SIGTERM');
+      return Promise.resolve(true);
+    } catch {
+      return Promise.resolve(false);
+    }
+  }
+  return new Promise((resolve) => {
+    let proc;
+    try {
+      proc = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    } catch {
+      resolve(false);
+      return;
+    }
+    proc.once('error', () => resolve(false));
+    proc.once('close', (code) => resolve(code === 0));
+  });
+}
+
+/**
+ * 找出某个 NapCat 目录下正在跑的进程。
+ *
+ * 为什么不能 `taskkill /IM QQ.exe`：用户日常用的 QQ 也叫这个名字，一起杀掉
+ * 是事故。NapCat Shell 版是一份独立的 QQ 副本（`<目录>\QQ.exe`），按可执行
+ * 文件路径过滤既收得干净又不会误伤。
+ */
+function listNapcatPids(dir) {
+  if (process.platform !== 'win32' || !dir || dir.length < 4) return Promise.resolve([]);
+  const script = [
+    '$root = [System.IO.Path]::GetFullPath($env:DHM_NAPCAT_DIR).TrimEnd([char]92) + [char]92',
+    '$list = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {',
+    '  $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) -and',
+    '  ($_.Name -eq "QQ.exe" -or $_.Name -eq "NapCatWinBootMain.exe")',
+    '} | ForEach-Object { $_.ProcessId }',
+    'if ($list) { $list }'
+  ].join('\n');
+
+  return new Promise((resolve) => {
+    let out = '';
+    let settled = false;
+    let timer = null;
+    const finish = (pids) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(pids);
+    };
+    let proc;
+    try {
+      proc = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+        windowsHide: true,
+        env: { ...process.env, DHM_NAPCAT_DIR: dir },
+        stdio: ['ignore', 'pipe', 'ignore']
+      });
+    } catch {
+      resolve([]);
+      return;
+    }
+    timer = setTimeout(() => {
+      try { proc.kill(); } catch { /* 已经退了 */ }
+      finish([]);
+    }, 5000);
+    timer.unref?.();
+    proc.stdout.on('data', (chunk) => { out += chunk.toString(); });
+    proc.once('error', () => finish([]));
+    proc.once('close', () => {
+      const pids = out
+        .split(/\r?\n/)
+        .map((line) => Number(line.trim()))
+        .filter((n) => Number.isInteger(n) && n > 0 && n !== process.pid);
+      finish(pids);
+    });
+  });
+}
+
 /**
  * 停 NapCat。
  *
- * **只杀它自己的进程树**（`/pid <pid> /T`）：启动器下面挂着它自己那个 QQ.exe，
- * 一起收掉才算真停。按镜像名全杀是危险的 —— 同目录的 `napcat.kill.qq.bat`
- * 就是那么干的，会连用户日常在用的 QQ 一起杀。
- * 只有在没有 pid（比如 NapCat 是用户自己起的，我们没托管）时，才退回按启动器镜像名杀，
- * 那时不碰 QQ.exe（QQ.exe 留在那儿用户自己关）。
+ * **只收它自己的进程**：先按启动器 pid 杀整棵树，再按 NapCat 目录里的
+ * 可执行文件路径补一遍（启动器退出后 pid 就没了，真正干活的是那份 QQ.exe）。
+ * 两种情况都不碰用户日常在用的 QQ。
+ *
+ * 返回里的 `done` 是个 Promise —— 退出流程要等它，不能 app 先没了、
+ * taskkill 还在半路。
  */
 function stopNapcat() {
   markManualStop('napcat');
-  const pid = napcatLaunch.pid;
-  try {
-    if (pid) {
-      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
-    } else {
-      spawn('taskkill', ['/IM', 'NapCatWinBootMain.exe', '/F'], { windowsHide: true });
+  const launchedPid = napcatLaunch.pid;
+  const dirs = [...new Set([napcatSettings().dir, lastNapcatDir].filter(Boolean))];
+  napcatLaunch = { startedAt: null, pid: null, child: null };
+  const targets = new Set();
+  if (launchedPid) targets.add(launchedPid);
+
+  const done = (async () => {
+    try {
+      for (const dir of dirs) {
+        for (const pid of await listNapcatPids(dir)) targets.add(pid);
+      }
+
+      // 启动器 pid 已经死了、路径也认不出来时，退回只杀启动器镜像。
+      // 这条兜底不会碰 QQ.exe，所以最多是「没停干净」，不会误伤。
+      let fallbackRan = false;
+      if (!targets.size && process.platform === 'win32') {
+        fallbackRan = true;
+        await new Promise((resolve) => {
+          let proc;
+          try {
+            proc = spawn('taskkill', ['/IM', 'NapCatWinBootMain.exe', '/F'], { windowsHide: true, stdio: 'ignore' });
+          } catch {
+            resolve();
+            return;
+          }
+          proc.once('error', resolve);
+          proc.once('close', resolve);
+        });
+      }
+
+      const killed = await Promise.all([...targets].map((pid) => killProcessTree(pid)));
+      const killedCount = killed.filter(Boolean).length;
+
+      // 本来就没在跑：别再来一轮「等它退出」的轮询，白等一秒。
+      if (!targets.size && !fallbackRan) {
+        pushLog('NapCat 没在运行，跳过', 'sys', 'napcat');
+        return { ok: true, killed: 0, remaining: [] };
+      }
+
+      // 等进程真的退干净（最多 4 秒）。不等的话桌面端先退出了，
+      // 用户下一秒打开任务管理器还能看见 NapCat。
+      for (let i = 0; i < 10; i += 1) {
+        const left = (await Promise.all(dirs.map(listNapcatPids))).flat();
+        if (!left.length) break;
+        await sleep(400);
+      }
+
+      const remaining = [...new Set((await Promise.all(dirs.map(listNapcatPids))).flat())];
+      if (remaining.length) {
+        pushLog(`NapCat 还有 ${remaining.length} 个进程没退（pid ${remaining.join(', ')}）`, 'err', 'napcat');
+      } else if (targets.size) {
+        pushLog(`NapCat 已停止（收掉 ${killedCount} 个进程）`, 'sys', 'napcat');
+      }
+      return { ok: remaining.length === 0, killed: killedCount, remaining };
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) };
     }
-    napcatLaunch = { startedAt: null, pid: null, child: null };
-    pushLog('已请求停止 NapCat', 'sys', 'napcat');
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: String(error?.message ?? error) };
-  }
+  })();
+
+  pushLog('已请求停止 NapCat', 'sys', 'napcat');
+  return withDone({ ok: true, pid: launchedPid }, done);
 }
 
 /**
@@ -2409,6 +2562,9 @@ function bringDown(scope = 'all') {
 
 let bridge = { child: null, startedAt: null, exitCode: null };
 
+// 正在退出：所有「意外退出自动拉起」的看护都必须闭嘴，别在关软件时又把服务拉回来。
+let shuttingDown = false;
+
 /**
  * 日志环形缓冲，新连上的前端能立刻看到最近内容。
  *
@@ -2563,29 +2719,11 @@ function stopBridge() {
     // 外部启动的桥接：界面上是「运行中」，停止按钮就得真的能停，否则用户会以为按钮坏了。
     const externalPid = externalBridgePid();
     if (!externalPid) return { ok: false, error: '桥接没在运行' };
-    try {
-      if (process.platform === 'win32') {
-        spawn('taskkill', ['/pid', String(externalPid), '/T', '/F'], { windowsHide: true });
-      } else {
-        process.kill(externalPid, 'SIGTERM');
-      }
-      pushLog(`正在停止外部启动的桥接（pid ${externalPid}）…`, 'sys', 'bridge');
-      return { ok: true, pid: externalPid };
-    } catch (error) {
-      return { ok: false, error: String(error?.message ?? error) };
-    }
+    pushLog(`正在停止外部启动的桥接（pid ${externalPid}）…`, 'sys', 'bridge');
+    return withDone({ ok: true, pid: externalPid }, killProcessTree(externalPid));
   }
-  try {
-    if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
-    } else {
-      child.kill('SIGTERM');
-    }
-    pushLog('正在停止桥接…', 'sys', 'bridge');
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: String(error?.message ?? error) };
-  }
+  pushLog('正在停止桥接…', 'sys', 'bridge');
+  return withDone({ ok: true, pid: child.pid }, killProcessTree(child.pid));
 }
 
 function bridgeState() {
@@ -2688,19 +2826,8 @@ function stopWechat() {
   const child = wechat.child;
   const pid = child?.pid ?? externalWechatPid();
   if (!pid) return { ok: false, error: '微信接入没在运行' };
-  try {
-    if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
-    } else if (child) {
-      child.kill('SIGTERM');
-    } else {
-      process.kill(pid, 'SIGTERM');
-    }
-    pushLog('正在停止微信接入…', 'sys', 'wechat');
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: String(error?.message ?? error) };
-  }
+  pushLog('正在停止微信接入…', 'sys', 'wechat');
+  return withDone({ ok: true, pid }, killProcessTree(pid));
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -3798,6 +3925,7 @@ function recentlyStopped(kind) {
 }
 
 function onServiceExit(kind) {
+  if (shuttingDown) return;
   if (recentlyStopped(kind)) {
     suppressRestart[kind] = 0;
     return;
@@ -3811,6 +3939,7 @@ function onServiceExit(kind) {
   restartAttempts[kind] += 1;
   pushLog(`看护：「${kind}」意外退出，${RESTART_DELAY_MS / 1000} 秒后自动重启（第 ${restartAttempts[kind]}/${RESTART_MAX} 次）`, 'sys', 'app');
   setTimeout(() => {
+    if (shuttingDown) return;
     try {
       if (kind === 'bridge') startBridge();
       else if (kind === 'wechat') startWechat();
@@ -3832,6 +3961,7 @@ setInterval(() => {
 /** NapCat 看护：看端口不看子进程（启动器本来就会退）。只接管我们自己启动过的。 */
 setInterval(async () => {
   try {
+    if (shuttingDown) return;
     const cfg = loadAutomation();
     if (!cfg.watch.napcat || !napcatLaunch.startedAt || recentlyStopped('napcat')) return;
     const n = napcatSettings();
@@ -3911,6 +4041,7 @@ function runScheduleTask(task) {
 }
 
 function tickSchedules() {
+  if (shuttingDown) return;
   const now = Date.now();
   const cfg = loadAutomation();
   let dirty = false;
@@ -6802,6 +6933,75 @@ export async function startServer(preferred = PORT) {
   throw lastError;
 }
 
+/**
+ * 关掉本窗口拉起来的全部后台服务。
+ *
+ * 这是「关软件」和「后台进程还在」之间的那道闸：Electron 自己退出**不会**带走
+ * 子进程，必须显式收。顺序是先停服务、再关 HTTP —— 这样关停过程中的日志还能
+ * 从日志页看到。返回的 Promise 会等 taskkill 和 NapCat 进程真正退出后才 resolve，
+ * 主进程（desktop/shutdown.mjs）要 await 它，否则窗口先没了照样留孤儿。
+ */
+let shutdownPromise = null;
+
+export function shutdownServer() {
+  if (shutdownPromise) return shutdownPromise;
+  shuttingDown = true;
+  pushLog('正在关闭后台服务（QQ 桥接 / 微信 / NapCat）…', 'sys');
+
+  shutdownPromise = (async () => {
+    stopPhoneListener();
+    stopNapcatTail();
+
+    const bridgeResult = stopBridge();
+    const wechatResult = stopWechat();
+    const napcatResult = stopNapcat();
+
+    // 等每一路真的收完，再把结果并进返回值 —— 界面和测试都按「ok/killed」看，
+    // 不需要知道内部那个 done Promise。
+    const settle = async (result) => {
+      if (!result?.done) return result;
+      try {
+        return { ...result, ...(await result.done) };
+      } catch (error) {
+        return { ...result, ok: false, error: String(error?.message ?? error) };
+      }
+    };
+    const [bridgeDone, wechatDone, napcatDone] = await Promise.all([
+      settle(bridgeResult),
+      settle(wechatResult),
+      settle(napcatResult)
+    ]);
+
+    // HTTP 服务最后关。keep-alive 连接会卡住 close 的回调，所以主动断开 + 兜底超时。
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      try {
+        server.close(finish);
+      } catch {
+        finish();
+      }
+      if (typeof server.closeAllConnections === 'function') {
+        try { server.closeAllConnections(); } catch { /* 没连上就算了 */ }
+      }
+      setTimeout(finish, 1500).unref?.();
+    });
+
+    for (const res of logClients) {
+      try { res.end(); } catch { /* 已经断了 */ }
+    }
+    logClients.clear();
+
+    return { ok: true, bridge: bridgeDone, wechat: wechatDone, napcat: napcatDone };
+  })();
+
+  return shutdownPromise;
+}
+
 /* 直接 `node server.mjs` 时自己起服务。
  *
  * ⚠️ 比 realpath，不能比 `fileURLToPath(import.meta.url) === path.resolve(argv[1])`：
@@ -6821,4 +7021,15 @@ const isDirectRun = (() => {
 if (isDirectRun) {
   const { url } = await startServer();
   console.log(`桌面端已启动：${url}`);
+
+  // 裸跑（node server.mjs）时 Ctrl+C / 关闭终端也要把子进程收掉。
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, async () => {
+      try {
+        await shutdownServer();
+      } finally {
+        process.exit(0);
+      }
+    });
+  }
 }
