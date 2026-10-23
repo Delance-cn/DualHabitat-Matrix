@@ -24,7 +24,11 @@ const desktopDir = path.resolve(here, '..');
 
 // 兼容旧 env 名 QQBRIDGE_SRC：只在本文件这类「不进打包名单」的开发脚本里保留。
 const bridgeRootRaw = process.env.DHM_SRC || process.env.QQBRIDGE_SRC || `${process.env.USERPROFILE}\\DualHabitatMatrix`;
-const bridgeRoot = fs.existsSync(bridgeRootRaw) ? fs.realpathSync(bridgeRootRaw) : bridgeRootRaw;
+// ⚠️ 不要 realpath。这台机器上 DualHabitatMatrix 是 junction，真实路径是
+// C:\Users\Delan\Documents\默认项目\DualHabitat-Matrix（带中文）。fs.cpSync 从
+// 那条路径往 junction 路径下复制会**静默中断**：既不报错也不复制，node 直接以
+// 127 退出（2026-10-23 实测，卡了半小时）。保留 junction 路径（纯 ASCII）就正常。
+const bridgeRoot = bridgeRootRaw;
 const fromBridge = path.join(bridgeRoot, 'src', 'backends');
 const fromLocal = path.resolve(desktopDir, '..', 'src', 'backends');
 

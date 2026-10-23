@@ -116,6 +116,36 @@ export const PROVIDERS = {
     apiKey: 'lm-studio',
     models: ['local-model']
   },
+  // 下面三家是 0.5.3 补的：服务端早就在探测 8000 / 1337（LOCAL_MODEL_SERVERS），
+  // 但厂商表里没有它们 —— 下拉框选不到，用户只能点「本地服务」按钮，而那个按钮
+  // 以前会把 provider 清空，存下来的档被配置生成器当成"没配"。名单必须和探测项对齐。
+  vllm: {
+    label: '本地 vLLM',
+    protocol: 'openai',
+    baseUrl: 'http://127.0.0.1:8000/v1',
+    keyEnv: null,
+    apiKey: 'local',
+    models: [],
+    note: 'vLLM 默认 8000；llama.cpp 也常起在这个端口，换端口改地址即可'
+  },
+  llamacpp: {
+    label: '本地 llama.cpp',
+    protocol: 'openai',
+    baseUrl: 'http://127.0.0.1:8080/v1',
+    keyEnv: null,
+    apiKey: 'local',
+    models: [],
+    note: 'llama-server 默认 8080'
+  },
+  jan: {
+    label: '本地 Jan',
+    protocol: 'openai',
+    baseUrl: 'http://127.0.0.1:1337/v1',
+    keyEnv: null,
+    apiKey: 'local',
+    models: [],
+    note: 'Jan 的本地 API 默认 1337'
+  },
   custom: {
     label: '自定义接入',
     protocol: 'openai',

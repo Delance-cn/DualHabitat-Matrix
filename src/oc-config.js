@@ -288,11 +288,16 @@ export function readSlotProfiles(platform = 'qq') {
     if (!v || typeof v !== 'object') return null;
     const provider = String(v.provider ?? '').trim();
     const model = String(v.model ?? '').trim();
-    if (!provider || !model) return null;
+    const baseUrl = String(v.baseUrl ?? '').trim();
+    // 自定义接入：界面「自定义 / 中转站」存下来的是**空 provider + 手填 baseUrl**。
+    // 以前这里 `!provider` 就 return null，整档被静默丢掉 —— 界面上地址和模型都填好了，
+    // opencode.json 里一个字都没有，用户只看到「配了不生效」。有地址就认，补成 custom。
+    const id = provider || (baseUrl ? CUSTOM_PROVIDER_ID : '');
+    if (!id || !model) return null;
     return {
-      provider,
+      provider: id,
       model,
-      baseUrl: String(v.baseUrl ?? '').trim(),
+      baseUrl,
       apiKeyEnv: String(v.apiKeyEnv ?? '').trim()
     };
   };
@@ -323,6 +328,9 @@ const PROVIDER_ALIASES = {
 
 const COMPATIBLE_PROVIDER_IDS = new Set(['minimax', 'volcengine']);
 
+/** 自定义接入（中转站 / 自建网关）在 opencode.json 里的固定 id。 */
+const CUSTOM_PROVIDER_ID = 'custom';
+
 /**
  * 本地 OpenAI 兼容服务商：opencode 的模型目录里**没有**它们，必须由生成器
  * 写一段 provider 定义，否则 4599 实例的目录里根本不存在这些模型。
@@ -333,6 +341,11 @@ const COMPATIBLE_PROVIDER_IDS = new Set(['minimax', 'volcengine']);
  * 一次网络请求都没发（见 oc-client 的「目录里没有这些候选」日志）。
  *
  * 所以这里不只是「加进白名单」，还要把 baseURL / 模型清单写进 opencode.json。
+ *
+ * 0.5.3 补全：0.5.2 只覆盖了 lmstudio / ollama，vLLM（含 llama.cpp）、Jan
+ * 仍然走「自定义服务商，暂不接到 agent」那条分支 —— 界面能点、配置也存了，
+ * 但生成出来的配置里没有它们，模型链照样被剔空。本地服务商必须一家不漏：
+ * 判断标准是「opencode 自带目录里没有、但用户能在界面上选到」。
  */
 const LOCAL_PROVIDERS = {
   lmstudio: {
@@ -345,8 +358,53 @@ const LOCAL_PROVIDERS = {
     label: '本地 Ollama',
     baseUrl: 'http://127.0.0.1:11434/v1',
     apiKey: 'ollama'
+  },
+  // vLLM 与 llama.cpp 都默认起在 8000，界面也合成一个按钮；换端口时界面填的
+  // baseUrl 优先（见 localProviderPlan 的注释）。
+  vllm: {
+    label: '本地 vLLM / llama.cpp',
+    baseUrl: 'http://127.0.0.1:8000/v1',
+    apiKey: 'local'
+  },
+  // llama.cpp 单机默认 8080，跟 vLLM 分开一个 id，省得两边端口打架时互相覆盖。
+  llamacpp: {
+    label: '本地 llama.cpp',
+    baseUrl: 'http://127.0.0.1:8080/v1',
+    apiKey: 'local'
+  },
+  jan: {
+    label: '本地 Jan',
+    baseUrl: 'http://127.0.0.1:1337/v1',
+    apiKey: 'local'
   }
 };
+
+/**
+ * 自定义接入的 provider 定义。
+ *
+ * key 写成 `{env:CUSTOM_API_KEY}`：opencode 支持这个插值，启动 4599 时
+ * oc-env 会把 secrets.json 整个注入环境变量，所以密钥仍然只存在 secrets.json，
+ * 不会摊到 opencode.json 里。这也是当初「自定义不自动接」的理由 —— 现在有解了。
+ */
+const CUSTOM_PROVIDER = {
+  label: '自定义接入',
+  baseUrl: '',
+  apiKey: '{env:CUSTOM_API_KEY}'
+};
+
+/**
+ * 一档配置最终落到哪个 provider id。
+ *
+ * 空 provider 分两种情况：
+ *   - 有 baseUrl → 自定义接入（界面「自定义 / 中转站」存的就是这个形状）
+ *   - 没 baseUrl → 什么都没填，返回空串
+ */
+function slotProviderId(s) {
+  const raw = String(s?.provider ?? '').trim();
+  if (raw === CUSTOM_PROVIDER_ID) return CUSTOM_PROVIDER_ID;
+  if (!raw && String(s?.baseUrl ?? '').trim()) return CUSTOM_PROVIDER_ID;
+  return raw;
+}
 
 /** `provider/model[#variant]` 或 `{provider, model, variant}` → 拆开的 provider / model（去掉变体）。 */
 function candidateParts(entry) {
@@ -354,20 +412,25 @@ function candidateParts(entry) {
   if (typeof entry === 'string') {
     const slash = entry.indexOf('/');
     if (slash < 0) return { provider: '', model: '' };
+    const provider = entry.slice(0, slash).trim();
     return {
-      provider: entry.slice(0, slash).trim(),
+      provider: PROVIDER_ALIASES[provider] ?? provider,
       model: entry.slice(slash + 1).split('#')[0].trim()
     };
   }
+  const provider = String(entry.provider ?? '').trim();
   return {
-    provider: String(entry.provider ?? '').trim(),
+    provider: PROVIDER_ALIASES[provider] ?? provider,
     model: String(entry.model ?? '').split('#')[0].trim()
   };
 }
 
 /**
- * 需要生成 provider 定义的本地服务商：模型池里出现的 + 两档 profile 里选的。
- * baseUrl 优先用界面里填的（LM Studio 换端口也能跑）。
+ * 需要生成 provider 定义的服务商：模型池里出现的本地服务商 + 两档 profile 里选的
+ * （本地服务商或自定义接入）。
+ *
+ * baseUrl 优先用界面里填的（LM Studio / vLLM 换端口也能跑）；自定义接入没有默认
+ * 地址，只能来自界面。
  */
 function localProviderPlan({ pool, slots }) {
   const plan = new Map();
@@ -378,6 +441,7 @@ function localProviderPlan({ pool, slots }) {
 
   for (const entry of [...(pool?.free ?? []), ...(pool?.paid ?? [])]) {
     const { provider, model } = candidateParts(entry);
+    // custom 的地址只存在于档位里，池条目没有 baseUrl —— 那种情况交给 missingProviders 报
     if (!LOCAL_PROVIDERS[provider]) continue;
     const item = touch(provider);
     if (model) item.models.add(model);
@@ -385,8 +449,13 @@ function localProviderPlan({ pool, slots }) {
 
   for (const slot of ['chat', 'work']) {
     const s = slots?.[slot];
-    if (!s || !LOCAL_PROVIDERS[s.provider]) continue;
-    const item = touch(s.provider);
+    if (!s) continue;
+    const id = slotProviderId(s);
+
+    // 自定义接入 / 中转站不在这里生成：buildConfig 的档位循环会按 slot 写成
+    // dhm-<slot>-relay，这样 QQ / 微信可以各用各的 baseUrl 和密钥。
+    if (!LOCAL_PROVIDERS[id]) continue;
+    const item = touch(id);
     if (s.model) item.models.add(String(s.model).split('#')[0]);
     // 两档一般同源；真填了不同地址时以 chat 为准
     if (s.baseUrl && (!item.baseUrl || slot === 'chat')) item.baseUrl = String(s.baseUrl).trim();
@@ -624,31 +693,40 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   for (const { slot, ids, label } of slotPlan) {
     const s = slots?.[slot];
     if (!s) continue;
-    const providerId = PROVIDER_ALIASES[s.provider] ?? s.provider;
-    const presetId = UI_PROVIDERS[s.provider]
-      ? s.provider
+    const rawProvider = String(s.provider ?? '').trim();
+    const providerId = PROVIDER_ALIASES[rawProvider] ?? rawProvider;
+    const presetId = UI_PROVIDERS[rawProvider]
+      ? rawProvider
       : Object.keys(PROVIDER_ALIASES).find((id) => PROVIDER_ALIASES[id] === providerId);
     const preset = UI_PROVIDERS[presetId];
-    const customEndpoint = !BUILTIN_PROVIDERS.has(providerId) &&
-      !LOCAL_PROVIDERS[providerId] &&
-      !COMPATIBLE_PROVIDER_IDS.has(providerId) ||
-      Boolean(s.baseUrl && preset?.baseUrl && s.baseUrl !== preset.baseUrl);
+    const local = Boolean(LOCAL_PROVIDERS[providerId]);
+    const compatible = COMPATIBLE_PROVIDER_IDS.has(providerId);
+    const builtin = BUILTIN_PROVIDERS.has(providerId);
+    const hasBaseUrl = Boolean(String(s.baseUrl ?? '').trim());
+    // 自定义接入 / 中转站：包括显式 custom、空 provider + 地址、未知 provider、
+    // 以及给内置厂商填了另一套 baseUrl（例如 DeepSeek 走中转）。这类档位用
+    // dhm-<slot>-relay 独立 provider，QQ / 微信可以各用各的地址和密钥。
+    const customEndpoint =
+      providerId === CUSTOM_PROVIDER_ID ||
+      (!local && !compatible && !builtin) ||
+      (!local && !compatible && Boolean(hasBaseUrl && preset?.baseUrl && s.baseUrl !== preset.baseUrl));
     if (customEndpoint) {
-      if (!s.baseUrl || (s.protocol && s.protocol !== 'openai')) {
-        notes.push(`「${label}」是自定义服务商，需提供 OpenAI 兼容协议的 baseUrl 才能接到 agent`);
+      if (!hasBaseUrl || (s.protocol && s.protocol !== 'openai')) {
+        notes.push(`「${label}」是自定义服务商，没填 baseUrl（或协议不是 OpenAI 兼容），需提供 OpenAI 兼容协议的 baseUrl 才能接到 agent`);
         continue;
       }
       const relayId = `dhm-${slot}-relay`;
       const model = String(s.model).split('#')[0];
       const before = provider[relayId] ?? {};
+      const keyEnv = String(s.apiKeyEnv ?? '').trim() || modelProfileKeyEnv('qq', slot);
       provider[relayId] = {
         ...before,
         npm: before.npm ?? '@ai-sdk/openai-compatible',
         name: before.name ?? `自定义中转站（${slot}）`,
         options: {
           ...(before.options ?? {}),
-          baseURL: s.baseUrl,
-          apiKey: `{env:${s.apiKeyEnv || modelProfileKeyEnv('qq', slot)}}`
+          baseURL: String(s.baseUrl).trim(),
+          apiKey: before.options?.apiKey || `{env:${keyEnv}}`
         },
         models: {
           ...(before.models ?? {}),
@@ -661,15 +739,16 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
       notes.push(`「${label}」使用独立中转站 ${s.baseUrl}（${relayId}）`);
       continue;
     }
-    if (
-      !BUILTIN_PROVIDERS.has(providerId) &&
-      !LOCAL_PROVIDERS[providerId] &&
-      !COMPATIBLE_PROVIDER_IDS.has(providerId)
-    ) {
+    if (!local && !compatible && !builtin) {
       notes.push(`「${label}」的服务商 ${s.provider} 不是 OpenCode 内置项，无法接到 agent`);
       continue;
     }
-    const target = `${providerId}/${String(s.model).split('#')[0]}`;
+    // 内置 / 本地 / 兼容厂商保留 #variant（opencode 的变体语法），但 #none
+    // 表示不选变体，不能原样写进 agent.model。provider 的 models 清单仍用
+    // 去掉变体的模型名；自定义中转站没有变体定义，走上面的 relay 分支。
+    const [modelName, variant] = String(s.model).split('#');
+    const targetModel = variant && variant !== 'none' ? `${modelName}#${variant}` : modelName;
+    const target = `${providerId}/${targetModel}`;
     let hit = 0;
     for (const id of ids) {
       if (!config.agents[id]) continue;
@@ -684,9 +763,10 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   //    没 CF 时整段被生成器吃掉 —— 手写的自定义服务商（deepseek-official 之类）
   //    每重生成一次就丢一次。
   // 2. 本地服务商：opencode 目录里没有，生成器必须补定义，否则模型目录为空。
+  //    自定义接入 / 中转站已经在上面的档位循环里写成 dhm-<slot>-relay，不在这里重复。
   const localPlan = localProviderPlan({ pool, slots });
   for (const [id, item] of localPlan) {
-    const preset = LOCAL_PROVIDERS[id];
+    const preset = id === CUSTOM_PROVIDER_ID ? CUSTOM_PROVIDER : LOCAL_PROVIDERS[id];
     const before = provider[id] ?? {};
     const models = { ...(before.models ?? {}) };
     for (const model of item.models) {
@@ -699,14 +779,16 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
       options: {
         ...(before.options ?? {}),
         baseURL: before.options?.baseURL || item.baseUrl || preset.baseUrl,
+        // 自定义接入用 {env:CUSTOM_API_KEY}：opencode 支持这个插值，密钥留在 secrets.json，
+        // 不摊进 opencode.json（这也是当初「自定义不自动接」的理由，现在有解了）
         apiKey: before.options?.apiKey || preset.apiKey
       },
       models
     };
     notes.push(
-      `本地服务商 ${id}（${preset.label}）已写入 provider（${provider[id].options.baseURL}，模型：${
-        [...item.models].join('、') || '未指定'
-      }）`
+      `${id === CUSTOM_PROVIDER_ID ? '自定义接入' : '本地服务商'} ${id}（${preset.label}）已写入 provider（${
+        provider[id].options.baseURL
+      }，模型：${[...item.models].join('、') || '未指定'}）`
     );
   }
 
@@ -759,9 +841,15 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     if (id && !definedProviders.has(id) && !BUILTIN_PROVIDERS.has(id)) missingProviders.add(id);
   }
   if (missingProviders.size) {
+    // custom 是唯一一种"池里有、但地址只能来自界面"的：池条目只记 provider/model，
+    // 不带 baseUrl。所以别笼统地叫人去改 provider 段，直接说清楚该去哪填。
+    const hasCustom = missingProviders.has(CUSTOM_PROVIDER_ID);
     notes.push(
       `⚠️ 模型池里有 ${[...missingProviders].join('、')} 的模型，但 opencode.json 没有对应 provider 定义 —— ` +
-        `4599 的模型目录不会列出它们，启动校验会把候选剔掉。去「模型接入」选内置厂商，或在 provider 段补一条`
+        `4599 的模型目录不会列出它们，启动校验会把候选剔掉。` +
+        (hasCustom
+          ? 'custom 的地址只能来自「API 与模型」页：去那边填一次 baseUrl 保存，就会自动补上。'
+          : '去「模型接入」选内置厂商，或在 provider 段补一条')
     );
   }
 
@@ -876,8 +964,17 @@ async function main() {
   });
 
   const base = readJsonSafe(CONFIG_FILE, {});
-  // 两档模型：配了哪档就把对应 agent 的 model 指过去（见 buildConfig 里的说明）
-  const slots = readSlotProfiles('qq');
+  // 两档模型：配了哪档就把对应 agent 的 model 指过去（见 buildConfig 里的说明）。
+  //
+  // opencode.json 只有一份、QQ 和微信共用同一个 4599 实例，所以两边的档只能取一个：
+  // QQ 配了用 QQ 的，QQ 没配再退到微信那档。以前只读 qq —— 在微信页填完模型，
+  // 生成器压根不看，表现成"微信那边配了不生效"。
+  const qqSlots = readSlotProfiles('qq');
+  const wxSlots = readSlotProfiles('wechat');
+  const slots = {
+    chat: qqSlots.chat ?? wxSlots.chat,
+    work: qqSlots.work ?? wxSlots.work
+  };
   const { config, notes } = buildConfig({ base, pool, persona, workPersona, chatOnly, slots, agentTools: agentToolsCfg });
   for (const note of notes) log(note);
   log(`模型池来自 ${source}；默认模型 ${config.model}`);

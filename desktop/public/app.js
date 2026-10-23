@@ -1447,7 +1447,9 @@ async function bsSaveModel() {
       allowTools: true
     };
   }
-  const poolEntry = data.provider && data.model ? `${data.provider}/${data.model}` : '';
+  const poolEntry = data.provider && data.model && !usesCustomModelEndpoint(data)
+    ? `${data.provider}/${data.model}`
+    : '';
   const r = await post('/api/model-profiles', { profiles: modelProfiles, poolEntry });
   if (r.ok === false) return setResult('#bs-result-2', r.error ?? '保存失败', 'err');
   $('#bs-apiKey').value = '';
@@ -1469,10 +1471,16 @@ function bindBsModelRole() {
     $(id)?.addEventListener('input', kick);
   }
   $('#bs-provider')?.addEventListener('change', () => {
-    const p = providerById($('#bs-provider').value);
+    const id = $('#bs-provider').value;
+    const p = providerById(id);
+    const prev = providerById($('#bs-provider').dataset.prev || '');
+    const current = $('#bs-baseUrl').value.trim();
     $('#bs-provider-note').textContent = p?.note ?? (p ? '' : '自己填地址：要填到 /v1 为止，例如 https://your-relay.com/v1');
-    if (p?.baseUrl) $('#bs-baseUrl').value = p.baseUrl;
+    // 只在地址为空、或还是上一个厂商的默认地址时才填预设值；
+    // 用户手填的中转地址不能被切换厂商这一步悄悄覆盖（缺陷 #3）。
+    if (p?.baseUrl && (!current || current === prev?.baseUrl)) $('#bs-baseUrl').value = p.baseUrl;
     if (p?.models?.length && !$('#bs-model').value.trim()) $('#bs-model').value = p.models[0];
+    $('#bs-provider').dataset.prev = id;
     updateBsKeyHint();
   });
   $('#bs-models')?.addEventListener('click', async (e) => {
@@ -1789,8 +1797,11 @@ function modelProfileKeyEnv(pf, slot) {
 }
 
 function usesCustomModelEndpoint(profile, preset = providerById(profile?.provider)) {
-  return !preset || preset.id === 'custom' ||
-    Boolean(profile?.baseUrl && preset.baseUrl && profile.baseUrl !== preset.baseUrl);
+  if (!preset || preset.id === 'custom') return true;
+  // 本地服务商 / MiniMax / 火山方舟由生成器按自己的 provider id 写定义，
+  // 即使换了端口也不需要再套一层 dhm-<slot>-relay，仍然可以进模型池。
+  if (['lmstudio', 'ollama', 'vllm', 'llamacpp', 'jan', 'minimax', 'volcengine'].includes(preset.id)) return false;
+  return Boolean(profile?.baseUrl && preset.baseUrl && profile.baseUrl !== preset.baseUrl);
 }
 
 function sameModelRoute(left, right) {
@@ -1801,9 +1812,12 @@ function sameModelRoute(left, right) {
 
 function renderProviders(s) {
   const sel = $(`#${s}-provider`);
-  const list = S?.providers ?? [];
+  // 厂商表里也有 custom（直连后端要用），这里首项已经手写了，过滤掉免得出现两个
+  const list = (S?.providers ?? []).filter((p) => p.id !== 'custom');
+  // 第一项用 custom 而不是空串：空 provider 在配置生成器那边等于"没配"（档位会被
+  // 静默丢掉），只有显式 custom 才会把 baseUrl 写进 opencode.json 的 provider 段。
   sel.innerHTML =
-    `<option value="">自定义 / 中转站</option>` +
+    `<option value="custom">自定义 / 中转站</option>` +
     list.map((p) => `<option value="${esc(p.id)}">${esc(p.label)}${p.needsKey ? '' : '（无需 key）'}</option>`).join('');
 }
 
@@ -1854,7 +1868,12 @@ function renderLocalServers(s) {
       if (!x) return;
       $(`#${s}-protocol`).value = 'openai';
       $(`#${s}-baseUrl`).value = x.baseUrl;
-      $(`#${s}-provider`).value = '';
+      // 以前这里把 provider 清成空串。空 provider 在配置生成器那边等于"没配"，
+      // 整档被静默丢掉 —— 界面显示填好了，opencode.json 里一个字都没有。
+      // 本地探测项的 id 和厂商表是同一套（ollama / lmstudio / vllm / jan），直接选上。
+      const sel = $(`#${s}-provider`);
+      const has = Array.from(sel.options).some((o) => o.value === x.id);
+      sel.value = has ? x.id : 'custom';
       if (x.models[0]) $(`#${s}-model`).value = x.models[0];
       if (!$(`#${s}-apiKey`).value) $(`#${s}-apiKey`).value = 'local';
       toast(`已填入 ${x.label} 的地址`);
@@ -1910,7 +1929,19 @@ function fillSource(s, ma) {
   const m = ma ?? {};
   const el = (name) => document.getElementById(`${s}-${name}`);
   renderProviders(s);
-  el('provider').value = m.provider ?? '';
+  // 空 provider 显示成「自定义 / 中转站」（老配置就是这么存的）。
+  // 另外：手写的 provider 名（deepseek-official 之类）不在下拉里，直接赋 value 会被
+  // select 洗成空串，再保存一次这个档就废了 —— 补一个临时 option 接住它。
+  const pv = m.provider || 'custom';
+  el('provider').value = pv;
+  if (el('provider').value !== pv && pv) {
+    const opt = document.createElement('option');
+    opt.value = pv;
+    opt.textContent = `${pv}（手写）`;
+    el('provider').appendChild(opt);
+    el('provider').value = pv;
+  }
+  el('provider').dataset.prev = pv;
   el('protocol').value = m.protocol ?? 'openai';
   el('baseUrl').value = m.baseUrl ?? '';
   el('model').value = m.model ?? '';
@@ -1924,7 +1955,7 @@ function fillSource(s, ma) {
   if (el('maxToolRounds')) el('maxToolRounds').value = m.maxToolRounds ?? '';
   if (el('workspaceDir')) el('workspaceDir').value = m.workspaceDir ?? '';
   if (el('model-tools-warn')) el('model-tools-warn').hidden = m.allowTools !== true;
-  applyProvider(s, m.provider ?? '');
+  applyProvider(s, el('provider').value);
   updateKeyHint(s);
 }
 
@@ -2174,8 +2205,11 @@ function bindSlotEvents() {
         updates.push({ platform: pf, slot: 'work', profile: modelProfiles[pf].work });
       }
       // 用户预期：填的模型直接进模型池首位。自定义中转站（无 provider 名）不进池
-      const poolEntry = data.provider && data.model ? `${data.provider}/${data.model}` : '';
+      const poolEntry = data.provider && data.model && !usesCustomModelEndpoint(data)
+        ? `${data.provider}/${data.model}`
+        : '';
       const r = await post('/api/model-profiles', { profiles: modelProfiles, updates, poolEntry });
+      el('apiKey').value = '';
       if (r.ok === false) return setResult(res, r.error ?? '保存失败', 'err');
       el('apiKey').value = '';
       if (r.regenerated === false) return setResult(res, `已自动保存，但生成配置失败：${r.regenError ?? '看日志'}`, 'err');

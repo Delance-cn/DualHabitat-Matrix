@@ -76,15 +76,20 @@ Chatbox / LobeChat / Continue / 任意 OpenAI SDK 只改 `baseURL` + `apiKey` �
 桌面端可以自行添加 **自定义 TTS 引擎**（命令模板只认 `{textFile}` / `{out}`，不把聊天文本拼进 shell）
 和 **自定义出图服务**（OpenAI 兼容 `/images/generations`，key 放 `secrets.json`），不用改代码。
 
-**本地 LM Studio / Ollama（0.5.2 起）**：在「扩展 → 模型接入」选本地服务商后，
-配置生成器会自动往 `opencode.json` 写 `@ai-sdk/openai-compatible` 的 `provider` 段
-（`baseURL` 用界面里填的端口、`apiKey` 占位、`models` 声明模型池里的模型 id）。
-之前只写 `model` 字符串不写 provider，4599 的模型目录里没有这些模型，启动校验会把候选全剔掉，
-表现为每条消息都秒回「我这会儿 API 连不上了」——现在不会再出现这个空目录。
+**本地推理服务与自定义接入（0.5.3 起覆盖全部）**：在「API 与模型」页选本地服务商
+（Ollama / LM Studio / vLLM / llama.cpp / Jan）或选「自定义 / 中转站」填自己的 `baseUrl`，
+配置生成器都会自动往 `opencode.json` 写 `@ai-sdk/openai-compatible` 的 `provider` 段
+（`baseURL` 用界面里填的端口、`apiKey` 占位、`models` 声明用到的模型 id）。
+自定义接入的 key 走 `secrets.json` 的 `CUSTOM_API_KEY`，配置里只写 `{env:CUSTOM_API_KEY}`，密钥不落盘到 `opencode.json`。
+
+0.5.2 只覆盖了 LM Studio / Ollama：其余本地服务与自定义厂商会被当成「不认识的 provider」
+整档丢掉，模型池里一出现就照样被启动校验剔空，表现为每条消息都秒回「我这会儿 API 连不上了」。
+0.5.3 把判断标准统一成「opencode 自带目录里没有、但界面能选到的一律自动补定义」，
+并且空 provider + 手填 `baseUrl` 也算自定义接入（以前这种档连警告都没有，静默丢弃）。
 
 ### 接入新的模型 provider（以阿里云百炼为例）
 
-本地 LM Studio / Ollama 由生成器自动补 provider（见上）；云端或中转站按下面四步手动加：
+本地服务与「自定义 / 中转站」由生成器自动补 provider（见上）；云端厂商按下面四步手动加：
 
 1. `secrets.json` 加 `"BAILIAN_API_KEY": "sk-..."`；
 2. `opencode.json` 的 `provider` 段加一个 `@ai-sdk/openai-compatible` provider，

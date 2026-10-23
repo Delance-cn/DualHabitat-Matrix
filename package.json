@@ -14,6 +14,7 @@
     "postinstall": "node scripts/patch-snowluma-sdk.mjs",
     "patch:sdk": "node scripts/patch-snowluma-sdk.mjs",
     "gen:config": "node src/oc-config.js",
+    "test:providers": "node spike/test-oc-config-providers.mjs",
     "spike:serve": "node spike/start-server.mjs",
     "spike:stop": "node spike/stop-server.mjs",
     "spike:probe": "node spike/probe.mjs",

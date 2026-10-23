@@ -26,7 +26,9 @@ const outDir = path.join(desktopRoot, `.bridge-dist-${process.pid}-${randomUUID(
 
 // 兼容旧 env 名 QQBRIDGE_SRC：只在本文件这类「不进打包名单」的开发脚本里保留。
 const srcRootRaw = process.env.DHM_SRC || process.env.QQBRIDGE_SRC || `${process.env.USERPROFILE}\\DualHabitatMatrix`;
-const srcRoot = fs.existsSync(srcRootRaw) ? fs.realpathSync(srcRootRaw) : srcRootRaw;
+// ⚠️ 不要 realpath（同 prepare-vendor.mjs 的坑）：junction 的真实路径带中文，
+// fs.cpSync 从那条路径复制会静默中断、node 以 127 退出。
+const srcRoot = srcRootRaw;
 
 if (!fs.existsSync(path.join(srcRoot, 'src', 'bridge.js'))) {
   console.error(`找不到桥接源码：${path.join(srcRoot, 'src', 'bridge.js')}`);
