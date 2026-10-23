@@ -12,9 +12,18 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveDataRoot } from './data-root.js';
 
-/** 项目根：DualHabitat-Matrix/ */
-export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+/** 代码根：DualHabitat-Matrix/（src / vendor / upstream / node_modules 都在这里，随包分发）。 */
+export const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * 数据根：运行时数据（config.json / secrets.json / state/ / .oc/ / opencode.json / audio/ …）的落点。
+ * 开发态 = 代码根（跟仓库同一目录，行为不变）；打包态由桌面端注入 QQ_BRIDGE_DATA
+ * 指到用户主目录 —— 安装目录会随升级被卸载器清掉，数据绝不能放那儿
+ * （0.4.5 及之前每次升级都要重配模型 / 重登微信的根因）。
+ */
+export const ROOT = resolveDataRoot(CODE_ROOT);
 
 /** 固定端口：不跟桌面端的随机端口混，也不会撞 3080/3000/3001/3100。 */
 export const PORT = 4599;
@@ -61,7 +70,7 @@ export function resolveCli() {
   // 1. 安装包自带：bridge 根目录 vendor/opencode-cli/opencode-cli.exe
   //    （prepare-bridge 打包时从本机 OpenCode 桌面端缓存取的，单文件无依赖）
   //    —— 没装 OpenCode 桌面端的新机器靠它起模型 API。
-  const bundled = path.join(ROOT, 'vendor', 'opencode-cli', 'opencode-cli.exe');
+  const bundled = path.join(CODE_ROOT, 'vendor', 'opencode-cli', 'opencode-cli.exe');
   if (fs.existsSync(bundled)) return bundled;
   // 2. 本机装了 OpenCode 桌面端：%APPDATA%\ai.opencode.desktop\cli\<版本>\opencode-cli.exe
   //    APPDATA 在某些非交互环境（沙箱 shell、计划任务、部分终端）里是空的，

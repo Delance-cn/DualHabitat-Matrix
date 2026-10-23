@@ -26,6 +26,7 @@
     "@opencode/client": "^2.0.32",
     "@snowluma/sdk": "^1.14.22",
     "js-yaml": "^4.3.2",
+    "msedge-tts": "^2.1.0",
     "qrcode": "^1.5.4",
     "zod": "^4.4.3"
   }

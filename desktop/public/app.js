@@ -2888,6 +2888,8 @@ async function loadChat() {
 
   // 工具表只有 QQ 这一套；微信那边由 Hook 决定，不显示这块
   if (p === 'qq') await loadTools();
+  // 语音库与 TTS 同样只有 QQ 这一套
+  if (p === 'qq') await loadVoicePanel();
 }
 
 /* 自动保存：对话与人格页所有字段改了就存（停手 1 秒自动落盘并生效，不用点保存） */
@@ -4212,7 +4214,117 @@ $('#btn-tools-restart').addEventListener('click', async (e) => {
   });
 });
 
+
+/* ── 9.5 语音库与 TTS（聊天页 QQ） ────────────────────── */
+
+let voiceLibFiles = [];
+
+async function loadVoicePanel() {
+  try {
+    const s = await api('/api/voice-tts');
+    if (s && s.ok !== false) {
+      $('#tts-provider').value = s.provider ?? 'auto';
+      $('#tts-voice').value = s.voice ?? '';
+      $('#tts-wechat-follow').checked = s.wechatFollow === true;
+    }
+    const lib = await api('/api/voice-library');
+    if (lib && lib.ok !== false) {
+      $('#voice-lib-dir').textContent = lib.dir ?? '';
+      voiceLibFiles = lib.files ?? [];
+      renderVoiceLib();
+    }
+  } catch { /* 服务没起好就静默，下次切平台再试 */ }
+}
+
+function renderVoiceLib() {
+  const box = $('#voice-lib-list');
+  if (!voiceLibFiles.length) {
+    box.innerHTML = '<p class="voice-lib-empty">语音库还是空的 —— 上传几段音频，或直接用上面的 TTS 合成（合成结果也会留在库里可重发）。</p>';
+    return;
+  }
+  box.innerHTML = voiceLibFiles
+    .map((f) => `<div class="voice-lib-row">
+      <span class="voice-lib-name" title="${esc(f.name)}">${esc(f.name)}</span>
+      <span class="voice-lib-size">${f.size ? `${Math.max(1, Math.round(f.size / 1024))} KB` : ''}</span>
+      <button class="btn btn-sm" data-voice-play="${esc(f.name)}">试听</button>
+      <button class="btn btn-sm" data-voice-del="${esc(f.name)}">删除</button>
+    </div>`)
+    .join('');
+}
+
+function playVoiceFile(name) {
+  const audio = $('#tts-preview-audio');
+  audio.src = `/api/voice-library/file?name=${encodeURIComponent(name)}`;
+  audio.hidden = false;
+  audio.play().catch(() => { /* 自动播放被拦就等用户手点 */ });
+}
+
+// 设置改动即存（服务端保存后会自动重启在跑的 QQ BOT）
+let voiceSaveTimer = null;
+function scheduleVoiceSave(extra = {}) {
+  clearTimeout(voiceSaveTimer);
+  voiceSaveTimer = setTimeout(async () => {
+    const payload = { provider: $('#tts-provider').value, voice: $('#tts-voice').value.trim(), wechatFollow: $('#tts-wechat-follow').checked, ...extra };
+    const r = await post('/api/voice-tts', payload);
+    if (r.ok === false) return setResult('#tts-result', r.error ?? '保存失败', 'err');
+    setResult('#tts-result', r.botsRestarted ? '已保存 ✓ 在跑的 QQ BOT 已重启，立即生效' : '已保存 ✓ BOT 没在跑，下次启动生效', 'saved');
+    if (r.preview?.name) playVoiceFile(r.preview.name);
+  }, 700);
+}
+
+$('#tts-provider').addEventListener('change', () => scheduleVoiceSave());
+$('#tts-voice').addEventListener('change', () => scheduleVoiceSave());
+$('#tts-wechat-follow').addEventListener('change', () => scheduleVoiceSave());
+
+$('#btn-tts-preview').addEventListener('click', async (e) => {
+  const text = $('#tts-preview-text').value.trim();
+  if (!text) return setResult('#tts-result', '先写一句要合成的话', 'err');
+  await busy(e.target.closest('button'), '合成中…', async () => {
+    const r = await post('/api/voice-tts', { text });
+    if (r.ok === false) return setResult('#tts-result', r.error ?? '合成失败', 'err');
+    if (r.preview) setResult('#tts-result', `合成成功：${r.preview.provider} / ${r.preview.voice}`, 'ok');
+    else setResult('#tts-result', '已保存', 'ok');
+    if (r.preview?.name) playVoiceFile(r.preview.name);
+  });
+});
+
+$('#btn-voice-refresh').addEventListener('click', () => loadVoicePanel());
+
+$('#btn-voice-upload').addEventListener('click', () => $('#voice-file-input').click());
+
+$('#voice-file-input').addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  e.target.value = '';
+  if (!file) return;
+  if (file.size > 30 * 1024 * 1024) return setResult('#tts-result', '超过 30MB 上限', 'err');
+  const dataB64 = await new Promise((resolve) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result).split(',')[1] ?? '');
+    fr.onerror = () => resolve('');
+    fr.readAsDataURL(file);
+  });
+  if (!dataB64) return setResult('#tts-result', '读文件失败', 'err');
+  const r = await post('/api/voice-library', { name: file.name, dataB64 });
+  if (r.ok === false) return setResult('#tts-result', r.error ?? '上传失败', 'err');
+  setResult('#tts-result', `已上传 ${r.name}`, 'ok');
+  await loadVoicePanel();
+});
+
+$('#voice-lib-list').addEventListener('click', async (e) => {
+  const play = e.target.closest('[data-voice-play]');
+  if (play) return playVoiceFile(play.dataset.voicePlay);
+  const del = e.target.closest('[data-voice-del]');
+  if (!del) return;
+  const ok = await confirmBox({ title: '删除这段音频？', text: del.dataset.voiceDel, okLabel: '删除' });
+  if (!ok) return;
+  const r = await api(`/api/voice-library?name=${encodeURIComponent(del.dataset.voiceDel)}`, { method: 'DELETE' });
+  if (r.ok === false) return setResult('#tts-result', r.error ?? '删除失败', 'err');
+  setResult('#tts-result', '已删除', 'ok');
+  await loadVoicePanel();
+});
+
 /* ── 启动 ───────────────────────────────────────────── */
+
 
 (async function boot() {
   applyI18n();

@@ -24,10 +24,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
-import { CONFIG_FILE, ROOT, SHIM_BASE_URL } from './oc-env.js';
+import { CODE_ROOT, CONFIG_FILE, ROOT, SHIM_BASE_URL } from './oc-env.js';
 import { loadModelPool } from './model-pool.js';
 
-const PRESET_ROOT = path.join(ROOT, 'upstream', 'dsh', 'agent-presets');
+// agent 预置随包分发，属于代码不是数据 —— 必须跟代码根走，
+// 否则打包态数据根指向用户主目录时这里会 ENOENT（0.3.6 那个老坑的变体）。
+const PRESET_ROOT = path.join(CODE_ROOT, 'upstream', 'dsh', 'agent-presets');
 
 /** 桥接给每个 QQ 会话用的工作目录（`state/agents`，见 bridge.js 的 ensureSession）。 */
 export const SESSION_WORKDIR = path.join(ROOT, 'state', 'agents');
@@ -323,7 +325,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     notes.push('纯聊天模式：不注册任何 MCP（QQ 工具与联网搜索都不会出现在工具面里）');
   } else {
 
-  const qqServer = path.join(ROOT, 'src', 'mcp-snowluma-safe.js');
+  const qqServer = path.join(CODE_ROOT, 'src', 'mcp-snowluma-safe.js');
   if (fs.existsSync(qqServer)) {
     mcpServers.snowluma = {
       type: 'local',
@@ -340,7 +342,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     notes.push(`⚠️ 找不到 ${qqServer}，跳过 MCP 注册（QQ 工具会不可用）`);
   }
 
-  const webServer = path.join(ROOT, 'src', 'mcp-web-search-safe.js');
+  const webServer = path.join(CODE_ROOT, 'src', 'mcp-web-search-safe.js');
   if (fs.existsSync(webServer)) {
     mcpServers['web-search-safe'] = {
       type: 'local',
@@ -358,7 +360,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   // 记忆日志（只读）：每日记忆由 memory-daily.js 增量写在 state/memory/<角色>/，
   // 新开对话时模型可以自主决定读取哪天/哪个角色/按关键词过滤。
   // 只读、范围锁死在 state/memory/，没有写接口、没有路径参数。
-  const memoryServer = path.join(ROOT, 'src', 'mcp-memory.js');
+  const memoryServer = path.join(CODE_ROOT, 'src', 'mcp-memory.js');
   if (fs.existsSync(memoryServer)) {
     mcpServers['memory-safe'] = {
       type: 'local',
@@ -373,7 +375,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
 
   // 视频工具：热榜/搜索/看单条。抖音解析要启动 headless Edge/Chrome，下载 + 抽帧
   // 可能跑几十秒，execution 给到 240s；catalog 首次列工具时也要留足。
-  const videoServer = path.join(ROOT, 'src', 'mcp-video-safe.js');
+  const videoServer = path.join(CODE_ROOT, 'src', 'mcp-video-safe.js');
   if (isVideoEnabled() && fs.existsSync(videoServer)) {
     mcpServers['video-safe'] = {
       type: 'local',

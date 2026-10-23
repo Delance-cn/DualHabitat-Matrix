@@ -145,6 +145,27 @@
   Sleep 300
   ; nsDialogs 要 $PLUGINSDIR，先建好；提示文本不再落盘，所以没有 File 了
   InitPluginsDir
+  ; ── 数据抢救（0.4.6 起）：升级时旧卸载器会清空安装目录，而 0.4.5 及之前把数据
+  ;    （config / secrets / 模型池 / 微信登录态 / .oc / 语音库 / 角色）都写在 $INSTDIR\resources\bridge。
+  ;    趁旧卸载器还没跑，先把数据复制进 %APPDATA% 数据根（新版从那里读，QQ_BRIDGE_DATA 注入）。
+  ;    只复制不覆盖（/XC /XN /XO）：新根已有的东西绝不动；robocopy 退出码 0-7 都算成功，
+  ;    这里全部忽略退出码 —— 抢救失败也不能挡安装（server.mjs 启动时还有第二道迁移兜底）。
+  ${If} ${FileExists} "$INSTDIR\resources\bridge\config.json"
+    ${OrIf} ${FileExists} "$INSTDIR\resources\bridge\state"
+    CreateDirectory "$APPDATA\dualhabitat-matrix-desktop\bridge-data"
+    nsExec::Exec 'robocopy "$INSTDIR\resources\bridge" "$APPDATA\dualhabitat-matrix-desktop\bridge-data" config.json secrets.json models.local.json models.json opencode.json proxy.json notify-hub.json /XC /XN /XO /NFL /NDL /NJH /NJS /NP'
+    Pop $0
+    nsExec::Exec 'robocopy "$INSTDIR\resources\bridge\state" "$APPDATA\dualhabitat-matrix-desktop\bridge-data\state" /E /XC /XN /XO /NFL /NDL /NJH /NJS /NP'
+    Pop $0
+    nsExec::Exec 'robocopy "$INSTDIR\resources\bridge\audio" "$APPDATA\dualhabitat-matrix-desktop\bridge-data\audio" /E /XC /XN /XO /NFL /NDL /NJH /NJS /NP'
+    Pop $0
+    nsExec::Exec 'robocopy "$INSTDIR\resources\bridge\roles" "$APPDATA\dualhabitat-matrix-desktop\bridge-data\roles" /E /XC /XN /XO /NFL /NDL /NJH /NJS /NP'
+    Pop $0
+    nsExec::Exec 'robocopy "$INSTDIR\resources\bridge\plugins" "$APPDATA\dualhabitat-matrix-desktop\bridge-data\plugins" /E /XC /XN /XO /NFL /NDL /NJH /NJS /NP'
+    Pop $0
+    nsExec::Exec 'robocopy "$INSTDIR\resources\bridge\.oc" "$APPDATA\dualhabitat-matrix-desktop\bridge-data\.oc" /E /XC /XN /XO /NFL /NDL /NJH /NJS /NP'
+    Pop $0
+  ${EndIf}
 !macroend
 
 !macro customInstall

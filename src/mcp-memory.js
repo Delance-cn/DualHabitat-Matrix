@@ -12,9 +12,11 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveDataRoot } from './data-root.js';
 import { listMemoryDates, readMemory } from './memory-daily.js';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+/** 数据根：记忆日志在 state/memory/，跟着数据走。 */
+const ROOT = resolveDataRoot(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
 
 const server = new McpServer({ name: 'memory-safe', version: '0.1.0' });
 

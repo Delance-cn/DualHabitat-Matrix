@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './oc-client.js';
 import { createBackend, TYPE_LABELS } from './backends/index.js';
@@ -61,9 +61,11 @@ import {
 } from './sticker-lib.js';
 import { runLocalCommand, loadPlugins } from './chat-commands.js';
 import { appendMemory } from './memory-daily.js';
+import { resolveDataRoot } from './data-root.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');
+/** 代码根：src / public / assets 随包分发；数据根：config / state / roles / plugins / audio。 */
+const CODE_ROOT = path.resolve(__dirname, '..');
+const ROOT = resolveDataRoot(CODE_ROOT);
 const STATE_DIR = path.join(ROOT, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
@@ -464,7 +466,7 @@ const PRESET_BACKUP_DIR = path.join(STATE_DIR, 'preset-backups');
 const PRESET_BACKUP_KEEP = 10;
 
 function presetSourceYaml(name) {
-  return path.join(ROOT, 'dsh', 'agent-presets', name, 'agent.cordis.yml');
+  return path.join(CODE_ROOT, 'dsh', 'agent-presets', name, 'agent.cordis.yml');
 }
 
 function dshHomeDir() {
@@ -530,7 +532,7 @@ function presetStatus(name) {
   return {
     preset: name,
     label: name === PRESET_NAMES.v1 ? '一代仿真（reserved）' : '二代仿真（reserved2）',
-    sourceFile: path.relative(ROOT, presetSourceYaml(name)),
+    sourceFile: path.relative(CODE_ROOT, presetSourceYaml(name)),
     installed: fs.existsSync(installedPresetYaml(name)),
     requiresRestart: true,
   };
@@ -855,7 +857,8 @@ function loadConfig() {
         setStickerRemark: false,
         stickerNote: true,
         collectSticker: true,
-        getSelfImage: true
+        getSelfImage: true,
+        tts: true
       },
       wake: {
         defaultMode: 'diving',
@@ -980,6 +983,7 @@ function loadConfig() {
     collectSticker: true,
     getSelfImage: true,
     sendVoice: false,
+    tts: true,
     ...(cfg.socialV2.tools ?? {})
   };
 
@@ -1657,7 +1661,8 @@ async function main() {
       defaultVolume: Number(v.defaultVolume) > 0 ? Number(v.defaultVolume) : 1,
       loudness: v.loudness || 'normal',
       ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || null,
-      autoReadback: v.autoReadback !== false
+      autoReadback: v.autoReadback !== false,
+      tts: v.tts && typeof v.tts === 'object' ? v.tts : {}
     };
   }
 
@@ -3582,7 +3587,7 @@ async function main() {
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
           try {
-            res.end(fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8'));
+            res.end(fs.readFileSync(path.join(CODE_ROOT, 'public', 'console.html'), 'utf8'));
           } catch {
             res.end('控制台页面缺失：DualHabitat-Matrix/public/console.html');
           }
@@ -5626,7 +5631,7 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getSelfImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_self_image' }, 403); return; }
-          const selfPath = path.join(ROOT, 'assets', 'deepseek娘.png');
+          const selfPath = path.join(CODE_ROOT, 'assets', 'deepseek娘.png');
           try {
             if (!fs.existsSync(selfPath)) { sendJson({ ok: false, error: '未找到 AI 形象图片 assets/deepseek娘.png' }, 404); return; }
             const buf = fs.readFileSync(selfPath);
@@ -5855,7 +5860,77 @@ async function main() {
           return;
         }
 
+        // ── TTS 开口说话（AI 通道：reserved2 + agent token） ──────────────────
+        // 流程：text → src/tts.js 现场合成（进语音库 tts/ 子目录）→ 复用语音库发送链路
+        //（同一套白名单 / 限流 / 文件名审计 / 回读校验）。dryRun 只合成不发送。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/say') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? body.target ?? '').trim();
+          const voice = voiceCfg();
+          if (!voice.enabled) { sendJson({ ok: false, error: '语音功能已关闭（socialV2.voice.enabled）' }, 403); return; }
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('tts')) { sendJson({ ok: false, error: '工具未启用：qq_say' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          const text = String(body.text ?? '').trim();
+          if (!text) { sendJson({ ok: false, error: '缺少 text：要把想说的话写进来' }, 400); return; }
+          try {
+            const { synthesizeText } = await import(pathToFileURL(path.join(CODE_ROOT, 'src', 'tts.js')).href);
+            const synth = await synthesizeText(text, {
+              outDir: path.join(voice.dir, 'tts'),
+              provider: voice.tts?.provider || 'auto',
+              voice: voice.tts?.voice || ''
+            });
+            const libName = path.relative(voice.dir, synth.path).split(path.sep).join('/');
+            voiceBudgetCheck(key, voice);
+            if (body.dryRun === true) {
+              const probe = await inspectAudio(synth.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
+              if (!probe.ok) { sendJson({ ok: false, error: errorToText(probe.error, '音频检查未通过') }, 400); return; }
+              sendJson({ ok: true, dryRun: true, key, file: libName, provider: synth.provider, voice: synth.voice, detail: describeAudio(probe) });
+              return;
+            }
+            const sent = await sendVoiceForV2(key, libName, {
+              label: body.label ? String(body.label).slice(0, 100) : '',
+              verify: body.verify,
+              readback: body.readback === true,
+              audio: (body.volume !== undefined || body.normalize === true || body.loudness !== undefined)
+                ? { volume: body.volume, normalize: body.normalize === true, loudness: body.loudness }
+                : null
+            });
+            sendJson({
+              ok: true,
+              key,
+              messageId: sent.messageId,
+              file: libName,
+              provider: synth.provider,
+              voice: synth.voice,
+              detail: sent.detail,
+              audioProcessing: sent.audioProcessing,
+              // verified=true 表示已用 get_msg 回读到这条消息的 record 段（语音确实落地了）
+              verified: sent.verification?.confirmed === true,
+              warnings: sent.warnings
+            });
+          } catch (error) {
+            // 合成失败 / 限额 / 发送失败都在这里报人话
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-sticker') {
+
           if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
           const body = await readBody();
           const key = String(body.key ?? '').trim();

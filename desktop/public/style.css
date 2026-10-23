@@ -1887,3 +1887,13 @@ html[data-view="home"] .app { grid-template-columns: minmax(0, 1fr); }
 
 /* 状态页模型卡的一键按钮行 */
 .status-slot-actions { margin-top: 8px; display: flex; gap: 8px; }
+/* ── 语音库与 TTS（聊天页） ────────────────────────────── */
+.voice-lib { margin-top: 14px; border: 1px solid var(--line, #dfe3ea); border-radius: 10px; padding: 10px 12px; }
+.voice-lib-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.voice-lib-head .hint { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-lib-row { display: flex; align-items: center; gap: 10px; padding: 5px 2px; border-bottom: 1px dashed var(--line, #e7eaf0); }
+.voice-lib-row:last-child { border-bottom: none; }
+.voice-lib-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.voice-lib-size { color: var(--muted, #8a93a3); font-size: 12px; }
+.voice-lib-empty { color: var(--muted, #8a93a3); font-size: 13px; margin: 4px 0; }
+#tts-preview-audio { width: 100%; margin-top: 8px; }

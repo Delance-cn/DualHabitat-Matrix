@@ -35,8 +35,11 @@ import {
 import { ensureServer } from './oc-server.js';
 import { runLocalCommand, loadPlugins } from './chat-commands.js';
 import { appendMemory } from './memory-daily.js';
+import { resolveDataRoot } from './data-root.js';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+/** 代码根 / 数据根：登录态与配置跟着数据走（打包态由桌面端注入 QQ_BRIDGE_DATA）。 */
+const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const ROOT = resolveDataRoot(CODE_ROOT);
 const STATE_DIR = path.join(ROOT, 'state');
 const TOKEN_FILE = path.join(STATE_DIR, 'wechat-token.json');
 const SESS_FILE = path.join(STATE_DIR, 'wechat-sessions.json');

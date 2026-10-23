@@ -14,9 +14,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveDataRoot } from './data-root.js';
 
-/** 项目根：DualHabitat-Matrix/ */
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+/** 代码根：DualHabitat-Matrix/；ROOT = 数据根（模型池文件跟着数据走，不跟代码走）。 */
+const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const ROOT = resolveDataRoot(CODE_ROOT);
 
 /**
  * 默认池。

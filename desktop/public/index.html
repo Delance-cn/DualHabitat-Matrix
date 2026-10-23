@@ -1005,9 +1005,70 @@
         </details>
       </div>
 
+      <div class="panel" data-pf="qq">
+        <div class="panel-head">
+          <h2>语音库与 TTS</h2>
+          <span class="hint">发语音有两条路：库里现成的音频（qq_send_voice），或现场合成（qq_say）</span>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="tts-provider">TTS 引擎（qq_say 用哪个嗓子说话）</label>
+            <select id="tts-provider">
+              <option value="auto">自动（Edge 在线优先，失败落 Windows 离线）</option>
+              <option value="edge">Edge 在线嗓音（自然；免费端点不吃停顿/重读标记）</option>
+              <option value="sapi">Windows 离线（必成，音色机械；SSML 支持最好）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="tts-voice">嗓音名（留空 = 引擎默认）</label>
+            <input id="tts-voice" placeholder="zh-CN-XiaoxiaoNeural" spellcheck="false" />
+          </div>
+        </div>
+        <label class="switch-row">
+          <input type="checkbox" id="tts-wechat-follow" />
+          <span>
+            <strong>微信跟随（预留）</strong>
+            <em>微信通道目前不支持语音条，开关先记住，协议支持后自动生效</em>
+          </span>
+        </label>
+
+        <div class="field-row" style="margin-top:13px">
+          <div class="field" style="flex:1">
+            <label for="tts-preview-text">试听</label>
+            <input id="tts-preview-text" placeholder="写一句话，或一段 SSML（&lt;speak&gt;…&lt;/speak&gt;、&lt;break time=&quot;300ms&quot;/&gt;）" spellcheck="false" />
+          </div>
+          <button class="btn" id="btn-tts-preview">合成试听</button>
+        </div>
+        <audio id="tts-preview-audio" controls hidden></audio>
+        <span class="result" id="tts-result"></span>
+
+        <div class="voice-lib">
+          <div class="voice-lib-head">
+            <strong>语音库</strong>
+            <span class="hint" id="voice-lib-dir"></span>
+            <span style="flex:1"></span>
+            <button class="btn btn-sm" id="btn-voice-refresh">刷新</button>
+            <button class="btn btn-sm" id="btn-voice-upload">上传音频</button>
+            <input type="file" id="voice-file-input" accept=".mp3,.wav,.ogg,.oga,.opus,.m4a,.aac,.flac,.amr,.silk,.slk,.wma,.spx" hidden />
+          </div>
+          <div id="voice-lib-list"></div>
+        </div>
+
+        <details class="help">
+          <summary>这是什么 / 怎么填</summary>
+          <div class="help-body">
+            <p>「语音库」= config.socialV2.voice.dir（默认 audio/）目录。模型用 qq_send_voice 只能从这里取文件发语音；这里可以直接上传、试听、删除。</p>
+            <p>「TTS」= 模型不想找音频时，用 qq_say 把想说的话现场合成语音（工具开关「语音」组里的「开口说话」）。引擎和嗓音在这里配，改完自动保存并重启在跑的 QQ BOT。</p>
+            <p>SSML：文本可以是完整 &lt;speak&gt; 文档，或带 &lt;break time="300ms"/&gt; 这类片段。注意 Edge 免费端点不接受停顿/重读等标记（会被拒），要这些效果选「Windows 离线」最稳。</p>
+          </div>
+        </details>
+      </div>
+
       <div class="panel">
         <div class="panel-head">
           <h2>谁能对话</h2>
+
           <span class="hint" data-pf="qq">黑名单永远优先</span>
           <span class="hint" data-pf="wechat">名单空着就先放行所有人，方便自己试；填了号就只理名单里的</span>
         </div>

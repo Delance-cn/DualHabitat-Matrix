@@ -78,9 +78,90 @@ function getRoot() {
   return DEFAULT_ROOT;
 }
 
-const configFile = () => path.join(getRoot(), 'config.json');
-const secretsFile = () => path.join(getRoot(), 'secrets.json');
-const exampleFile = () => path.join(getRoot(), 'config.example.json');
+/**
+ * 数据根：config.json / secrets.json / models.local.json / state/ / audio/ / roles/ / plugins/ / .oc/
+ * 这些运行时数据的落点。0.4.5 及之前数据和代码都挤在安装目录 resources\bridge 里，
+ * 老版卸载器清安装目录时会把模型池、微信登录态一起带走（用户每升一次级就要重配一遍）。
+ * 现在打包态把数据根挪到 userData\bridge-data（%APPDATA%，不随升级动），
+ * 由 QQ_BRIDGE_DATA 注入给桥接侧（见 nodeRunner）；开发态数据根 = 代码根，行为不变。
+ */
+const DATA_HOME_OVERRIDE = (process.env.DHM_DATA_HOME ?? '').trim();
+let cachedDataRoot = null;
+function dataRoot() {
+  if (DATA_HOME_OVERRIDE) {
+    // 测试/特殊布局：DHM_DATA_HOME 指哪建哪（seedBridgeData / writeJson 不会自己建目录）
+    const resolved = path.resolve(DATA_HOME_OVERRIDE);
+    try { fs.mkdirSync(resolved, { recursive: true }); } catch { /* 建不出来交给写入时报人话 */ }
+    return resolved;
+  }
+  if (electronApp?.isPackaged) {
+    if (!cachedDataRoot) {
+      cachedDataRoot = path.join(electronApp.getPath('userData'), 'bridge-data');
+      // 数据根目录必须先建出来：seedBridgeData / writeJson 都是直接写文件，不会自己建目录
+      try { fs.mkdirSync(cachedDataRoot, { recursive: true }); } catch { /* 建不出来交给写入时报人话 */ }
+    }
+    return cachedDataRoot;
+  }
+  // 开发态（含 node server.mjs 裸跑）：数据和代码同目录（仓库根），与 0.4.5 行为完全一致。
+  return getRoot();
+}
+
+/**
+ * 旧数据迁移（打包态兜底）：安装器 customInit 的抢救是第一道（旧卸载器清目录之前搬），
+ * 这里是第二道 —— 万一数据还留在代码根（比如手动覆盖安装、绿色部署），启动时搬进数据根。
+ * 只搬「新根没有、旧根有」的，绝不覆盖新数据。测试实例（DHM_DATA_HOME）绝不迁移。
+ */
+function migrateLegacyData() {
+  const from = getRoot();
+  const to = dataRoot();
+  if (path.resolve(from) === path.resolve(to)) return;
+  const files = ['config.json', 'secrets.json', 'models.local.json', 'models.json', 'opencode.json', 'proxy.json', 'notify-hub.json'];
+  const dirs = ['state', 'audio', 'roles', 'plugins', '.oc'];
+  let moved = 0;
+  for (const f of files) {
+    const src = path.join(from, f);
+    const dst = path.join(to, f);
+    if (fs.existsSync(src) && !fs.existsSync(dst)) {
+      try { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.renameSync(src, dst); moved++; } catch { /* 搬不动就算了，别挡启动 */ }
+    }
+  }
+  for (const d of dirs) {
+    const src = path.join(from, d);
+    const dst = path.join(to, d);
+    if (fs.existsSync(src) && !fs.existsSync(dst)) {
+      try { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.renameSync(src, dst); moved++; } catch { /* 同上 */ }
+    }
+  }
+  // 随包分发的示例插件：数据根没有 plugins 时从代码根补一份（不然插件页空空如也）。
+  const bundledPlugins = path.join(from, 'plugins');
+  const dataPlugins = path.join(to, 'plugins');
+  if (fs.existsSync(bundledPlugins) && !fs.existsSync(dataPlugins)) {
+    try { fs.cpSync(bundledPlugins, dataPlugins, { recursive: true }); moved++; } catch { /* 同上 */ }
+  }
+  if (moved) console.log(`[data-root] 已从代码根迁移 ${moved} 项数据到 ${to}`);
+}
+
+let electronApp = null;
+try {
+  if (process.versions.electron) electronApp = (await import('electron')).app;
+} catch {
+  electronApp = null;
+}
+
+// 打包态：进程级注入数据根 —— 本进程动态 import 的 oc-* 与 spawn 出去的桥接/微信/oc-config
+// 全部对齐到同一个数据根；随后做一次旧数据迁移（安装器抢救的兜底）。
+if (electronApp?.isPackaged && !DATA_HOME_OVERRIDE && !process.env.QQ_BRIDGE_DATA) {
+  process.env.QQ_BRIDGE_DATA = dataRoot();
+}
+if (electronApp?.isPackaged && !DATA_HOME_OVERRIDE) migrateLegacyData();
+
+/** 代码根：src / vendor / upstream / node_modules / config.example.json（随包分发）。 */
+const codeRoot = () => getRoot();
+
+const configFile = () => path.join(dataRoot(), 'config.json');
+const secretsFile = () => path.join(dataRoot(), 'secrets.json');
+const exampleFile = () => path.join(codeRoot(), 'config.example.json');
+
 
 const PORT = Number(process.env.DHM_DESKTOP_PORT ?? 3200);
 
@@ -222,7 +303,7 @@ function legacyBridgeRoots() {
 }
 
 function seedBridgeData() {
-  const root = getRoot();
+  const root = dataRoot();
   const config = path.join(root, 'config.json');
   if (fs.existsSync(config)) return null;
 
@@ -240,7 +321,7 @@ function seedBridgeData() {
     }
   }
 
-  const example = path.join(root, 'config.example.json');
+  const example = path.join(codeRoot(), 'config.example.json');
   try {
     if (fs.existsSync(example)) {
       fs.copyFileSync(example, config);
@@ -392,7 +473,7 @@ function rolePath(name) {
   if (n.toUpperCase() === 'README') throw new Error('README 是说明文件，不能当人格名');
   if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(n)) throw new Error(`"${n}" 是 Windows 保留名，换一个`);
 
-  const dir = path.join(getRoot(), 'roles');
+  const dir = path.join(dataRoot(), 'roles');
   const file = path.join(dir, `${n}.md`);
   // 双保险：拼出来必须还在 roles/ 里（前面哪条校验漏了，这里兜住）
   if (path.dirname(path.resolve(file)) !== path.resolve(dir)) throw new Error('非法的人格名');
@@ -403,12 +484,12 @@ function rolePath(name) {
 function backupRole(file, name) {
   try {
     if (!fs.existsSync(file)) return null;
-    const dir = path.join(getRoot(), 'state', 'role-backups');
+    const dir = path.join(dataRoot(), 'state', 'role-backups');
     fs.mkdirSync(dir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const dest = path.join(dir, `${name}.${stamp}.md`);
     fs.copyFileSync(file, dest);
-    return path.relative(getRoot(), dest);
+    return path.relative(dataRoot(), dest);
   } catch {
     return null; // 备份失败不该拦住保存本身
   }
@@ -423,7 +504,7 @@ function roleInjectLimit() {
 /** 这张卡现在被哪个平台用着 —— 正在用的不许删。 */
 function roleInUse(name) {
   const used = [];
-  if (readJson(path.join(getRoot(), 'state', 'current-role.json'), {})?.role === name) used.push('QQ');
+  if (readJson(path.join(dataRoot(), 'state', 'current-role.json'), {})?.role === name) used.push('QQ');
   if (loadConfig().platforms?.wechat?.role === name) used.push('微信');
   return used;
 }
@@ -939,7 +1020,8 @@ const TOOL_GROUPS = [
     title: '语音',
     hint: '要本机装了 ffmpeg 才能用',
     items: [
-      { flag: 'sendVoice', tool: 'qq_send_voice / qq_list_voices', label: '发语音', default: false }
+      { flag: 'sendVoice', tool: 'qq_send_voice / qq_list_voices', label: '发语音', default: false },
+      { flag: 'tts', tool: 'qq_say', label: '开口说话（TTS）', default: true, hint: '把想说的话现场合成语音；引擎和嗓音在「语音库与 TTS」面板配' }
     ]
   },
   {
@@ -963,7 +1045,7 @@ const TOOL_GROUPS = [
 /** 只读：看得见，但一个字也发不出去。 */
 const TOOL_PRESET_READONLY = new Set([
   'sendMessage', 'reply', 'sendGroup', 'sendPrivate', 'sendBurst',
-  'markRead', 'sendPoke', 'feedback', 'collectSticker', 'sendVoice', 'setWakeConfig'
+  'markRead', 'sendPoke', 'feedback', 'collectSticker', 'sendVoice', 'setWakeConfig', 'tts'
 ]);
 
 
@@ -975,9 +1057,9 @@ const modelsFile = () => {
   // 生效池 = models.local.json（真实池，不入库）优先；不存在才落到 models.json（公开仓的空模板）。
   // 运行时（桥接 / oc-config）通过 QQ_BRIDGE_MODELS 读的也是 local 这份——
   // 这里必须指同一个文件，否则状态页 / 模型池页看到的是空模板，把用户谎报成「未配置」。
-  const local = path.join(getRoot(), 'models.local.json');
+  const local = path.join(dataRoot(), 'models.local.json');
   if (fs.existsSync(local)) return local;
-  return path.join(getRoot(), 'models.json');
+  return path.join(dataRoot(), 'models.json');
 };
 
 /**
@@ -988,7 +1070,7 @@ const modelsFile = () => {
  */
 function ocInstance() {
   const cfg = loadConfig();
-  const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(getRoot(), '.oc', 'state');
+  const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(dataRoot(), '.oc', 'state');
   const file = path.join(stateDir, 'opencode', 'service.json');
   const info = readJson(file, null);
   if (!info) return { alive: false, pid: null, url: null, port: null, version: null, file };
@@ -1031,7 +1113,7 @@ function loadPool() {
  */
 function chainStateFile() {
   const cfg = loadConfig();
-  const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(getRoot(), '.oc', 'state');
+  const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(dataRoot(), '.oc', 'state');
   return path.join(stateDir, 'model-chain.json');
 }
 
@@ -1066,10 +1148,10 @@ async function readModelUsage() {
     }
     if (!_sqliteCtor) return {};
     const cfg = loadConfig();
-    const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(getRoot(), '.oc', 'state');
+    const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(dataRoot(), '.oc', 'state');
     const candidates = [
       path.join(path.dirname(stateDir), 'data', 'opencode', 'opencode.db'),
-      path.join(getRoot(), '.oc', 'data', 'opencode', 'opencode.db')
+      path.join(dataRoot(), '.oc', 'data', 'opencode', 'opencode.db')
     ];
     const file = candidates.find((f) => fs.existsSync(f));
     if (!file) return {};
@@ -1124,7 +1206,7 @@ function regenerateConfig() {
   return new Promise((resolve) => {
     const { command, env } = nodeRunner();
     const child = spawn(command, [path.join(getRoot(), 'src', 'oc-config.js')], {
-      cwd: getRoot(),
+      cwd: dataRoot(),
       env: { ...process.env, ...env },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe']
@@ -2332,8 +2414,11 @@ function nodeRunner() {
   // 真实模型池在 models.local.json（公开仓只带空模板，个人池不进 git）。
   // 桥接、微信 bot、oc-config 重生成配置都从 QQ_BRIDGE_MODELS 拿池子——
   // 不注入的话，本机就一直在按空池跑，regen 还会报「模型池是空的」。
-  const localPool = path.join(getRoot(), 'models.local.json');
+  const localPool = path.join(dataRoot(), 'models.local.json');
   if (fs.existsSync(localPool)) env.QQ_BRIDGE_MODELS = localPool;
+  // 数据根：桥接侧（bridge.js / wechat-bot.js / oc-config）靠它把 config/state/audio
+  // 落到数据根，绝不写进会被升级清掉的安装目录。
+  env.QQ_BRIDGE_DATA = dataRoot();
   return { command: process.execPath, env };
 }
 
@@ -2367,7 +2452,7 @@ function externalWechatPid() {
  */
 function pidFromLockFile(relativePath) {
   try {
-    const lock = path.join(getRoot(), relativePath);
+    const lock = path.join(dataRoot(), relativePath);
     if (!fs.existsSync(lock)) return null;
     const pid = Number(fs.readFileSync(lock, 'utf8').trim());
     if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return null;
@@ -2388,13 +2473,13 @@ function startBridge() {
 
   const seeded = seedBridgeData();
   if (seeded) pushLog(`桥接配置不存在，已从 ${seeded.from} 生成 config.json`, 'sys', 'bridge');
-  if (!fs.existsSync(path.join(getRoot(), 'config.json'))) {
-    return { ok: false, error: `桥接目录里没有 config.json，也没有可用的模板：${getRoot()}` };
+  if (!fs.existsSync(path.join(dataRoot(), 'config.json'))) {
+    return { ok: false, error: `数据根里没有 config.json，也没有可用的模板：${dataRoot()}` };
   }
 
   const { command, env } = nodeRunner();
   const child = spawn(command, [path.join(getRoot(), 'src', 'bridge.js')], {
-    cwd: getRoot(),
+    cwd: dataRoot(),
     env: { ...process.env, ...env },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe']
@@ -2473,7 +2558,7 @@ function bridgeState() {
 let wechat = { child: null, startedAt: null, exitCode: null };
 
 function wechatFiles() {
-  const base = path.join(getRoot(), 'state');
+  const base = path.join(dataRoot(), 'state');
   return {
     qr: path.join(base, 'wechat-qr.json'),
     token: path.join(base, 'wechat-token.json')
@@ -2520,7 +2605,7 @@ function startWechat() {
   if (!fs.existsSync(script)) return { ok: false, error: '找不到 src/wechat-bot.js（桥接目录对吗）' };
 
   const child = spawn(command, [script], {
-    cwd: getRoot(),
+    cwd: dataRoot(),
     env: { ...process.env, ...env },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe']
@@ -2589,7 +2674,7 @@ function wechatPush({ to, text, dryRun = false } = {}) {
   return new Promise((resolve) => {
     const { command, env } = nodeRunner();
     const child = spawn(command, args, {
-      cwd: getRoot(),
+      cwd: dataRoot(),
       env: { ...process.env, ...env },
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe']
@@ -2644,7 +2729,7 @@ async function qqSend({ qq, text } = {}) {
 
 /** 微信推送可选目标：state/wechat-sessions.json 里聊过天的用户 id。 */
 function wechatTargets() {
-  const saved = readJson(path.join(getRoot(), 'state', 'wechat-sessions.json'), {});
+  const saved = readJson(path.join(dataRoot(), 'state', 'wechat-sessions.json'), {});
   return Object.keys(saved ?? {}).map((id) => ({ id }));
 }
 
@@ -2686,7 +2771,7 @@ const ACTIVITY_RE = /^\[(\d{2}:\d{2}:\d{2})\]\s+(\S+)\s+([^：:]{1,24})[：:]\s*
 function activityFile(platform) {
   const name =
     platform === 'wechat' ? 'wechat-activity.log' : platform === 'phone' ? 'phone-activity.log' : 'qq-activity.log';
-  return path.join(getRoot(), 'state', name);
+  return path.join(dataRoot(), 'state', name);
 }
 
 function readMessages(platform, limit = 300) {
@@ -2930,7 +3015,7 @@ async function summarizeViaMatrix(prompt) {
     sessionDir: PATHS.state,
     log: () => {}
   });
-  const ws = unwrap(await api.workspace.create({ path: getRoot() }), 'workspace.create');
+  const ws = unwrap(await api.workspace.create({ path: dataRoot() }), 'workspace.create');
   const workspaceId = ws.workspace.workspaceId;
   const created = unwrap(
     await api.sessions.create({ workspaceId, agentPreset: 'qq-chat', title: '省流总结（一次性，用完即归档）' }),
@@ -3127,8 +3212,8 @@ function lanAddresses() {
   return out.sort((a, b) => score(a) - score(b));
 }
 
-const phoneLogFile = () => path.join(getRoot(), 'state', 'phone-activity.log');
-const phoneInboxFile = () => path.join(getRoot(), 'state', 'phone-inbox.json');
+const phoneLogFile = () => path.join(dataRoot(), 'state', 'phone-activity.log');
+const phoneInboxFile = () => path.join(dataRoot(), 'state', 'phone-inbox.json');
 
 function readPhoneInbox() {
   const list = readJson(phoneInboxFile(), []);
@@ -3279,7 +3364,7 @@ function bridgeConsole() {
   let token = String(cfg.consoleToken ?? '').trim();
   if (!token) {
     try {
-      token = fs.readFileSync(path.join(getRoot(), 'state', 'console-token'), 'utf8').trim();
+      token = fs.readFileSync(path.join(dataRoot(), 'state', 'console-token'), 'utf8').trim();
     } catch {
       token = '';
     }
@@ -3708,13 +3793,6 @@ setInterval(async () => {
 }, 30_000);
 
 /* ── 开机自启（Electron 打包版才有；开发态和纯 node 调试都报告不支持） ── */
-
-let electronApp = null;
-try {
-  if (process.versions.electron) electronApp = (await import('electron')).app;
-} catch {
-  electronApp = null;
-}
 
 function autostartState() {
   if (!electronApp || !electronApp.isPackaged) return { supported: false, enabled: false };
@@ -4185,7 +4263,7 @@ const server = http.createServer(async (req, res) => {
         configPath: configFile(),
         secretsPath: secretsFile(),
         modelsPath: modelsFile(),
-        projectRoot: getRoot(),
+        projectRoot: dataRoot(),
         settingsPath: SETTINGS_FILE,
         // 后端这块前端要显示「实例在不在」，只读注册文件，不碰它
         matrix: ocInstance(),
@@ -4696,7 +4774,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/roles') {
       // 顺手把每张卡的字数带上：人格卡会随每条消息注入，超上限就被截断，
       // 界面上得能一眼看出哪张超了（roles/README.md 建议 3000~5000）。
-      const dir = path.join(getRoot(), 'roles');
+      const dir = path.join(dataRoot(), 'roles');
       const names = fs.existsSync(dir)
         ? fs
             .readdirSync(dir)
@@ -4800,7 +4878,7 @@ const server = http.createServer(async (req, res) => {
             mode: 'active'
           });
         }
-        const cur = readJson(path.join(getRoot(), 'state', 'current-role.json'), { role: null, mode: 'active' });
+        const cur = readJson(path.join(dataRoot(), 'state', 'current-role.json'), { role: null, mode: 'active' });
         return sendJson(res, { ...cur, platform });
       }
 
@@ -4839,7 +4917,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, { ok: true, platform, role, applied });
       }
 
-      const file = path.join(getRoot(), 'state', 'current-role.json');
+      const file = path.join(dataRoot(), 'state', 'current-role.json');
       fs.mkdirSync(path.dirname(file), { recursive: true });
       writeJson(file, { role: body.role || null, mode: body.mode === 'silent' ? 'silent' : 'active' });
       const applied = await restartBotsFor('qq');
@@ -5319,7 +5397,7 @@ const server = http.createServer(async (req, res) => {
     /* ── 插件：列表（直接读 plugins/ 目录）+ 重载（转发给桥接控制台）───── */
     if (p === '/api/plugins') {
       if (req.method === 'GET') {
-        const dir = path.join(getRoot(), 'plugins');
+        const dir = path.join(dataRoot(), 'plugins');
         let files = [];
         try {
           files = fs
@@ -5353,7 +5431,7 @@ const server = http.createServer(async (req, res) => {
         const port = Number(cfg.consolePort ?? 3100);
         let token = '';
         try {
-          token = fs.readFileSync(path.join(getRoot(), 'state', 'console-token'), 'utf8').trim();
+          token = fs.readFileSync(path.join(dataRoot(), 'state', 'console-token'), 'utf8').trim();
         } catch {
           /* 还没跑过桥接 */
         }
@@ -5520,7 +5598,157 @@ const server = http.createServer(async (req, res) => {
     }
 
     /* ── 模型能用哪些工具 ─────────────────────────────────────────────── */
+
+    /* ── 语音库与 TTS（对话与人格页「语音库与 TTS」面板） ─────────────────── */
+    const voiceLibraryDir = () => path.resolve(dataRoot(), String(loadConfig().socialV2?.voice?.dir ?? 'audio'));
+    const VOICE_AUDIO_EXTS = ['.mp3', '.wav', '.ogg', '.oga', '.opus', '.m4a', '.aac', '.flac', '.amr', '.silk', '.slk', '.wma', '.spx'];
+    if (p === '/api/voice-library') {
+      const listFiles = (dir, base) => {
+        const out = [];
+        let entries = [];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+        for (const e of entries) {
+          if (e.name.startsWith('.')) continue;
+          const rel = base ? `${base}/${e.name}` : e.name;
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) out.push(...listFiles(full, rel));
+          else if (VOICE_AUDIO_EXTS.includes(path.extname(e.name).toLowerCase())) {
+            let size = 0;
+            try { size = fs.statSync(full).size; } catch { /* 读不到就算 0 */ }
+            out.push({ name: rel, size });
+          }
+        }
+        return out;
+      };
+      if (req.method === 'GET') {
+        const files = listFiles(voiceLibraryDir(), '').sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+        return sendJson(res, { ok: true, dir: voiceLibraryDir(), files });
+      }
+      if (req.method === 'POST') {
+        // 上传：{ name, dataB64 }。名字只取 basename、限音频扩展名、限 30MB ——
+        // 这个目录是模型的语音库，不能让它变成任意文件写入点。
+        const body = await readBody(req);
+        const base = path.basename(String(body?.name ?? '')).replace(/[\\/:*?"<>|]/g, '');
+        if (!base || !VOICE_AUDIO_EXTS.includes(path.extname(base).toLowerCase())) {
+          return sendJson(res, { ok: false, error: '文件名要带音频扩展名（mp3/wav/ogg/m4a/flac/amr…）' });
+        }
+        let buf;
+        try {
+          buf = Buffer.from(String(body?.dataB64 ?? ''), 'base64');
+        } catch {
+          return sendJson(res, { ok: false, error: '文件内容不是合法的 base64' });
+        }
+        if (buf.length < 200) return sendJson(res, { ok: false, error: '文件太小，不像有效音频' });
+        if (buf.length > 30 * 1024 * 1024) return sendJson(res, { ok: false, error: '超过 30MB 上限' });
+        try {
+          fs.mkdirSync(voiceLibraryDir(), { recursive: true });
+          fs.writeFileSync(path.join(voiceLibraryDir(), base), buf);
+          return sendJson(res, { ok: true, name: base, bytes: buf.length });
+        } catch (error) {
+          return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+      if (req.method === 'DELETE') {
+        const rel = String(url.searchParams.get('name') ?? '').trim();
+        const libDir = path.resolve(voiceLibraryDir());
+        const full = path.resolve(libDir, rel);
+        if (!full.startsWith(libDir + path.sep) || !path.extname(full)) {
+          return sendJson(res, { ok: false, error: '非法的文件名' });
+        }
+        try {
+          fs.rmSync(full, { force: true });
+          return sendJson(res, { ok: true });
+        } catch (error) {
+          return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+    }
+
+    if (p === '/api/voice-library/file') {
+      // 试听：把库里的音频给浏览器播（只允许库目录内的文件，防目录穿越）。
+      const rel = String(url.searchParams.get('name') ?? '').trim();
+      const libDir = path.resolve(voiceLibraryDir());
+      const full = path.resolve(libDir, rel);
+      let ok = false;
+      try {
+        ok = full.startsWith(libDir + path.sep) && fs.existsSync(full) && fs.statSync(full).isFile();
+      } catch { ok = false; }
+      if (!ok) {
+        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('not found');
+        return;
+      }
+      const types = { '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/ogg', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac', '.amr': 'audio/amr' };
+      res.writeHead(200, { 'content-type': types[path.extname(full).toLowerCase()] ?? 'application/octet-stream', 'cache-control': 'no-store' });
+      res.end(fs.readFileSync(full));
+      return;
+    }
+
+    if (p === '/api/voice-tts') {
+      // GET = 读设置；POST = 存设置（provider / voice / wechatFollow），带 text 就顺手合成一条试听。
+      // 语音配置是桥接启动时读的：改了就自动把在跑的 QQ BOT 就地重启（没跑 = 下次启动生效）。
+      const cfg = loadConfig();
+      if (req.method === 'GET') {
+        return sendJson(res, {
+          ok: true,
+          provider: cfg.socialV2?.voice?.tts?.provider || 'auto',
+          voice: cfg.socialV2?.voice?.tts?.voice || '',
+          wechatFollow: cfg.platforms?.wechat?.ttsFollow === true
+        });
+      }
+      if (req.method === 'POST') {
+        const body = await readBody(req);
+        if (!cfg.socialV2 || typeof cfg.socialV2 !== 'object') cfg.socialV2 = {};
+        if (!cfg.socialV2.voice || typeof cfg.socialV2.voice !== 'object') cfg.socialV2.voice = {};
+        if (!cfg.socialV2.voice.tts || typeof cfg.socialV2.voice.tts !== 'object') cfg.socialV2.voice.tts = {};
+        let changed = false;
+        if (body?.provider !== undefined) {
+          const prov = String(body.provider);
+          if (!['auto', 'edge', 'sapi'].includes(prov)) return sendJson(res, { ok: false, error: `未知 TTS 引擎：${prov}` });
+          if (cfg.socialV2.voice.tts.provider !== prov) { cfg.socialV2.voice.tts.provider = prov; changed = true; }
+        }
+        if (body?.voice !== undefined) {
+          const nv = String(body.voice).trim();
+          if (cfg.socialV2.voice.tts.voice !== nv) { cfg.socialV2.voice.tts.voice = nv; changed = true; }
+        }
+        if (body?.wechatFollow !== undefined) {
+          const nw = body.wechatFollow === true;
+          if (!cfg.platforms || typeof cfg.platforms !== 'object') cfg.platforms = {};
+          if (!cfg.platforms.wechat || typeof cfg.platforms.wechat !== 'object') cfg.platforms.wechat = {};
+          if (cfg.platforms.wechat.ttsFollow !== nw) { cfg.platforms.wechat.ttsFollow = nw; changed = true; }
+        }
+        if (changed) writeJson(configFile(), cfg);
+        // 保存即生效：只重启受影响的平台，BOT 没在跑就是 false（下次启动生效）
+        let botsRestarted = false;
+        if (changed) { try { botsRestarted = await restartBotsFor('qq'); } catch { botsRestarted = false; } }
+        let preview = null;
+        if (String(body?.text ?? '').trim()) {
+          try {
+            const { synthesizeText } = await import(pathToFileURL(path.join(codeRoot(), 'src', 'tts.js')).href);
+            const r = await synthesizeText(String(body.text), {
+              outDir: path.join(voiceLibraryDir(), 'tts'),
+              provider: cfg.socialV2.voice.tts.provider || 'auto',
+              voice: cfg.socialV2.voice.tts.voice || ''
+            });
+            preview = { name: `tts/${path.basename(r.path)}`, provider: r.provider, voice: r.voice, bytes: r.bytes };
+          } catch (error) {
+            return sendJson(res, { ok: false, error: `合成失败：${error?.message ?? error}`, botsRestarted });
+          }
+        }
+        return sendJson(res, {
+          ok: true,
+          provider: cfg.socialV2.voice.tts.provider || 'auto',
+          voice: cfg.socialV2.voice.tts.voice || '',
+          wechatFollow: cfg.platforms?.wechat?.ttsFollow === true,
+          changed,
+          botsRestarted,
+          preview
+        });
+      }
+    }
+
     if (p === '/api/tools') {
+
       if (req.method === 'GET') {
         const cfg = loadConfig();
         const values = {};
@@ -5602,7 +5830,7 @@ const server = http.createServer(async (req, res) => {
       const RAW_FILES = {
         config: configFile(),
         models: modelsFile(),
-        proxy: path.join(getRoot(), 'proxy.json'),
+        proxy: path.join(dataRoot(), 'proxy.json'),
         secrets: secretsFile()
       };
       const which = String(url.searchParams.get('file') ?? 'config');
@@ -5627,7 +5855,7 @@ const server = http.createServer(async (req, res) => {
       // 写之前留一份，改坏了能从 state/config-backups 捞回来
       try {
         if (fs.existsSync(file)) {
-          const dir = path.join(getRoot(), 'state', 'config-backups');
+          const dir = path.join(dataRoot(), 'state', 'config-backups');
           fs.mkdirSync(dir, { recursive: true });
           const stamp = new Date().toISOString().replace(/[:.]/g, '-');
           fs.copyFileSync(file, path.join(dir, `${which}.${stamp}.json`));
