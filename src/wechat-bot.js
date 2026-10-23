@@ -75,8 +75,18 @@ function readJson(file, fallback = null) {
 }
 
 function writeJson(file, data) {
+  const text = JSON.stringify(data, null, 2);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  // 原子替换：直接覆盖写一半会把 state 文件写成半份 JSON，读回来必炸。
+  // 先落临时文件再 rename；Windows 上目标被占用（EPERM/EBUSY）时退回直接覆盖。
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, text);
+    fs.renameSync(tmp, file);
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* 没有临时文件就跳过 */ }
+    fs.writeFileSync(file, text);
+  }
 }
 
 /* ── 活动日志 ──

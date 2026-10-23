@@ -181,8 +181,39 @@ function readJson(file, fallback = {}) {
   }
 }
 
+/**
+ * 整文件写 JSON —— 原子替换，不是直接覆盖。
+ *
+ * 直接 writeFileSync 一旦在写到一半时断电 / 被杀 / 磁盘满，留下的是**截断的
+ * 半份配置**：下次启动 JSON.parse 直接抛，整份 settings / config 读不回来。
+ * 所以先写同目录临时文件再 rename。Windows 上目标可能被 Defender / 编辑器 /
+ * 云同步按住（EPERM/EBUSY），照 src/bridge.js 的 renameWithRetry 退避重试几轮；
+ * 实在过不去才退回直接覆盖，并且清掉临时文件别留在目录里。
+ */
 function writeJson(file, data) {
-  fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  const text = `${JSON.stringify(data, null, 2)}\n`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, text, 'utf8');
+  for (let i = 0; i < 4; i += 1) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (error) {
+      const retryable = error?.code === 'EPERM' || error?.code === 'EBUSY' || error?.code === 'EACCES';
+      if (!retryable) {
+        try { fs.unlinkSync(tmp); } catch { /* 临时文件删不掉不掩盖原错误 */ }
+        throw error;
+      }
+      // 同步忙等：这里都在请求/启动路径上，不值得为它改成异步
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40 * (i + 1)); } catch { /* 老 runtime 没有 Atomics.wait 就纯重试 */ }
+    }
+  }
+  try {
+    fs.writeFileSync(file, text, 'utf8');
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* 同上 */ }
+  }
 }
 
 /**
@@ -4029,6 +4060,11 @@ function importProviders({ text, apply = false, items = [] } = {}) {
   ];
 
   const overrides = new Map(items.map((it) => [Number(it.index), it]));
+  // 手动指定的环境变量只能是目录里已知的那些：以前 `items[].env` 原样收下，
+  // 等于允许往 secrets.json 里塞任意键（AWS_SECRET_ACCESS_KEY、PATH…），
+  // 前端下拉本来就只给这些选项，收紧不会影响正常用法。
+  const envAllowed = new Set(knownEnvs.map((e) => e.env));
+  const ENV_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
   const report = [];
   const lines = String(text ?? '').split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
@@ -4037,11 +4073,16 @@ function importProviders({ text, apply = false, items = [] } = {}) {
     const over = overrides.get(i);
     if (over) {
       if (over.provider) item.provider = String(over.provider);
-      if (over.env) item.env = String(over.env);
+      if (over.env) {
+        const wanted = String(over.env).trim();
+        if (envAllowed.has(wanted)) item.env = wanted;
+        else item.reason = `${item.reason ? `${item.reason}；` : ''}忽略未知环境变量 ${wanted.slice(0, 64)}`;
+      }
       const hit = providers.find((p) => p.id === item.provider);
       if (hit && !over.env) item.env = hit.keyEnv ?? '';
       item.confidence = 'manual';
-      item.reason = '手动指定';
+      // 手动指定会盖掉自动判定的理由，但「环境变量被拒」这条必须留住给用户看
+      item.reason = item.reason.startsWith('忽略未知环境变量') ? item.reason : '手动指定';
     }
     if (item.key && existing.has(item.key)) {
       item.dup = true;
@@ -4054,6 +4095,8 @@ function importProviders({ text, apply = false, items = [] } = {}) {
   if (apply) {
     for (const item of report) {
       if (!item._raw || item.dup || !item.env) continue;
+      // 兜底：即使分类器将来新增了别的来源，也只写合法的环境变量名。
+      if (!ENV_NAME_RE.test(String(item.env))) continue;
       secrets[item.env] = item._raw;
       existing.add(item._raw);
       written += 1;
@@ -4067,6 +4110,35 @@ function importProviders({ text, apply = false, items = [] } = {}) {
     knownEnvs,
     report: report.map(({ _raw, ...rest }) => rest)
   };
+}
+
+/**
+ * `/api/raw` 的结构校验：只拦「写进去必定坏掉」的形状，不做完整 schema。
+ * 目的不是限制手改（多一个键、少一个键都允许），而是挡住 `null`、数组、
+ * 以及把 `secrets` 写成对象数组这类会让读取方直接抛错的输入。
+ * @returns {string} 空串 = 通过；非空 = 人话原因
+ */
+function rawFileShapeError(which, value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return '顶层必须是 JSON 对象（不能是 null / 数组 / 字符串 / 数字）';
+  }
+  const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+  if (which === 'secrets') {
+    for (const [k, v] of Object.entries(value)) {
+      if (typeof v !== 'string') return `secrets 里的 ${k} 必须是字符串（现在是 ${Array.isArray(v) ? 'array' : typeof v}）`;
+    }
+  }
+  if (which === 'models') {
+    for (const k of ['free', 'paid']) {
+      if (k in value && !Array.isArray(value[k])) return `models 里的 ${k} 必须是数组`;
+    }
+  }
+  if (which === 'config') {
+    for (const k of ['socialV2', 'platforms', 'commands', 'events', 'computerTools', 'snowluma']) {
+      if (k in value && !isPlainObject(value[k])) return `config 里的 ${k} 必须是对象`;
+    }
+  }
+  return '';
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -4090,9 +4162,19 @@ function sendJson(res, data, status = 200) {
   res.end(JSON.stringify(data));
 }
 
-async function readBody(req) {
+/** 默认请求体上限。上传大文件走的是 saveRawBody（自己有 512 MB 上限），不经过这里。 */
+const BODY_MAX_BYTES = 8 * 1024 * 1024;
+
+async function readBody(req, maxBytes = BODY_MAX_BYTES) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    // 没有上限时，一个超大 body 会整个拼进内存：本机任意进程（或浏览器里的网页）
+    // 都能把应用撑爆。JSON 端点的正常报文远小于 8 MB。
+    if (size > maxBytes) throw new Error(`请求体太大（上限 ${Math.round(maxBytes / 1024 / 1024)} MB）`);
+    chunks.push(chunk);
+  }
   const raw = Buffer.concat(chunks).toString('utf8');
   if (!raw) return {};
   try {
@@ -4100,6 +4182,56 @@ async function readBody(req) {
   } catch {
     throw new Error('请求体不是合法 JSON');
   }
+}
+
+/**
+ * 同源闸门：只挡住「浏览器里的别的网页」，不挡本机程序。
+ *
+ * 为什么必须有：服务只绑 127.0.0.1，但这不等于安全 —— 浏览器里任意网页都能
+ * 往 127.0.0.1 发 POST，而且 `content-type: text/plain` 属于「简单请求」，
+ * 不触发 CORS 预检，响应读不到也无所谓（副作用已经发生了）。`/api/plugins/add`
+ * 会把 body 里的 JS 写进 plugins/ 并立刻热重载进桥接进程 —— 网页点一下就等于
+ * 在本机执行任意代码。`/api/raw`、`/api/bridge/*` 同理。
+ *
+ * 规则（只对非 GET/HEAD/OPTIONS 生效）：
+ *  1. Host 必须是回环地址（顺带挡掉 DNS rebinding：evil.com 解析到 127.0.0.1 时
+ *     Host 头仍是 evil.com）。
+ *  2. 带了 Origin 就必须是本服务的源（协议 + 回环主机 + 同一端口）。
+ *  3. Sec-Fetch-Site 明确是 cross-site / same-site 一律拒。
+ * 不带 Origin 的请求照旧放行 —— curl、脚本、入站 webhook（/hook/notify/…）
+ * 都属于这一类，它们本来就没有同源概念。
+ *
+ * @returns {string} 空串 = 放行；非空 = 拒绝原因
+ */
+const LOOPBACK_HOST = /^(127\.0\.0\.1|localhost|\[::1\]|::1)(?::(\d{1,5}))?$/i;
+
+function sameOriginBlocked(req) {
+  const method = String(req.method ?? 'GET').toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return '';
+
+  const host = String(req.headers.host ?? '');
+  const hm = LOOPBACK_HOST.exec(host);
+  if (!hm) return '只接受本机回环地址的请求（Host 不是 127.0.0.1 / localhost）';
+  const hostPort = hm[2] ?? '';
+
+  const origin = req.headers.origin;
+  if (origin) {
+    let o;
+    try {
+      o = new URL(String(origin));
+    } catch {
+      // Origin: null（file:// 页面、沙箱 iframe）也走这里
+      return 'Origin 不合法，已拒绝';
+    }
+    const name = o.hostname.toLowerCase();
+    const loop = name === '127.0.0.1' || name === 'localhost' || name === '::1' || name === '[::1]';
+    if (!loop) return '跨站请求已拒绝（Origin 不是本机页面）';
+    if (hostPort && o.port && o.port !== hostPort) return '跨站请求已拒绝（Origin 端口不匹配）';
+  }
+
+  const site = String(req.headers['sec-fetch-site'] ?? '').toLowerCase();
+  if (site === 'cross-site' || site === 'same-site') return `跨站请求已拒绝（Sec-Fetch-Site: ${site}）`;
+  return '';
 }
 
 /**
@@ -4251,6 +4383,11 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
 
   try {
+    // 先过同源闸门：任何会改状态的请求都不能由「浏览器里的别的网页」发起。
+    // 只绑 127.0.0.1 挡不住这种请求（简单请求不预检），详见 sameOriginBlocked。
+    const crossSite = sameOriginBlocked(req);
+    if (crossSite) return sendJson(res, { ok: false, error: crossSite }, 403);
+
     if (p === '/api/state') {
       const config = loadConfig();
       const n = napcatSettings();
@@ -5928,6 +6065,12 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.method === 'POST') {
         const body = await readBody(req);
+        // 试听文字上限要和 tts.js 的 MAX_CHARS(2000) 对齐。那边超长是**静默截断**，
+        // 用户贴 3000 字进来会听到半截，界面却显示合成成功 —— 宁可这里直接说清楚。
+        const spoken = String(body?.text ?? '');
+        if (spoken.trim() && spoken.length > 2000) {
+          return sendJson(res, { ok: false, error: `试听文字最多 2000 字（现在是 ${spoken.length} 字），分句试听吧` });
+        }
         if (!cfg.socialV2 || typeof cfg.socialV2 !== 'object') cfg.socialV2 = {};
         if (!cfg.socialV2.voice || typeof cfg.socialV2.voice !== 'object') cfg.socialV2.voice = {};
         if (!cfg.socialV2.voice.tts || typeof cfg.socialV2.voice.tts !== 'object') cfg.socialV2.voice.tts = {};
@@ -6213,11 +6356,20 @@ const server = http.createServer(async (req, res) => {
       }
       const body = await readBody(req);
       const text = String(body.content ?? '');
+      if (text.length > 4 * 1024 * 1024) {
+        return sendJson(res, { ok: false, error: '内容太大（上限 4 MB）' });
+      }
+      let parsed;
       try {
-        JSON.parse(text);
+        parsed = JSON.parse(text);
       } catch (error) {
         return sendJson(res, { ok: false, error: `不是合法 JSON：${error?.message ?? error}` });
       }
+      // 语法合法 ≠ 结构可用：`null` / `[]` / `{}` 都能通过 JSON.parse，
+      // 但写进 config.json 后下次启动就是「整份配置读不回来」或者被当成空配置。
+      // 只做最低限度、不会挡住正常手改的校验（顶层形状 + 关键段的类型）。
+      const shapeError = rawFileShapeError(which, parsed);
+      if (shapeError) return sendJson(res, { ok: false, error: shapeError });
       // 写之前留一份，改坏了能从 state/config-backups 捞回来
       try {
         if (fs.existsSync(file)) {
@@ -6233,7 +6385,29 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/providers/import') {
+      // 这个端点会往 secrets.json 写东西，所以入口先把形状钉死：
+      // 之前是 `importProviders(body)` 直接透传，body 是数组 / 字符串也会进到
+      // 下游分类器里（那边按 `text` 拆行，`apply` 为真就写盘）。
+      if (req.method !== 'POST') return sendJson(res, { ok: false, error: '只支持 POST' }, 405);
       const body = await readBody(req);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return sendJson(res, { ok: false, error: '请求体必须是 JSON 对象' });
+      }
+      if (body.text !== undefined && typeof body.text !== 'string') {
+        return sendJson(res, { ok: false, error: 'text 必须是字符串' });
+      }
+      if (String(body.text ?? '').length > 200_000) {
+        return sendJson(res, { ok: false, error: 'text 太大（上限 200 KB）' });
+      }
+      if (body.apply !== undefined && typeof body.apply !== 'boolean') {
+        return sendJson(res, { ok: false, error: 'apply 必须是布尔值' });
+      }
+      if (body.items !== undefined && !Array.isArray(body.items)) {
+        return sendJson(res, { ok: false, error: 'items 必须是数组' });
+      }
+      if (Array.isArray(body.items) && body.items.length > 500) {
+        return sendJson(res, { ok: false, error: 'items 最多 500 条' });
+      }
       return sendJson(res, importProviders(body));
     }
 
