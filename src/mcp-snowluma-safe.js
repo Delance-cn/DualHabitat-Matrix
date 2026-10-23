@@ -20,7 +20,11 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');
+import { resolveDataRoot } from './data-root.js';
+
+// 数据根：config / state（控制台令牌等）跟着数据走 —— 0.4.6 起打包态数据在 %APPDATA%，
+// 安装目录里只有代码；不接数据根的话网关工具在打包态会读到空配置（升级后全挂）。
+const ROOT = resolveDataRoot(path.resolve(__dirname, '..'));
 
 function loadConfig() {
   try {

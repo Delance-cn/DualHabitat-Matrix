@@ -953,6 +953,18 @@ const TOOL_GROUPS = [
     ]
   },
   {
+    id: 'create',
+    title: '创作 · 画画与动态',
+    hint: '画画出图、发 QQ 空间说说；默认全关，开了模型才会用',
+    items: [
+      { flag: 'draw', tool: 'qq_draw / qq_send_image', label: '画画（含发图）', default: false, hint: '文生图 + 把图库的图发进聊天；有每日张数上限' },
+      { flag: 'momentPost', tool: 'qq_post_moment', label: '发空间动态', default: false, hint: '发说说（纯文字/图文），有每日条数上限' },
+      { flag: 'momentList', tool: 'qq_list_moments', label: '看空间动态', default: true, hint: '只读自己空间的动态列表' },
+      { flag: 'momentDelete', tool: 'qq_delete_moment', label: '删空间动态', default: false, hint: '按 tid 删自己发的说说，删除不可恢复' }
+    ]
+  },
+
+  {
     id: 'read',
     title: '读消息',
     hint: '关掉这些，模型就看不见上下文，只会瞎回',
@@ -5745,6 +5757,142 @@ const server = http.createServer(async (req, res) => {
           preview
         });
       }
+    }
+
+
+    /* ── 画画与动态（对话与人格页「画画与动态」面板） ─────────────────── */
+    const imageLibraryDir = () => path.resolve(dataRoot(), String(loadConfig().socialV2?.draw?.dir ?? 'images'));
+    const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
+    if (p === '/api/draw') {
+      // GET = 读设置；POST = 存设置（引擎/尺寸/每日上限），带 text 就顺手真画一张试画。
+      // 出图配置是桥接侧 draw.js 启动时读的：改了自动把在跑的 QQ BOT 就地重启。
+      const cfgd = loadConfig();
+      if (req.method === 'GET') {
+        const d = cfgd.socialV2?.draw && typeof cfgd.socialV2.draw === 'object' ? cfgd.socialV2.draw : {};
+        return sendJson(res, {
+          ok: true,
+          provider: ['auto', 'cloudflare', 'bailian', 'zhipu'].includes(d.provider) ? d.provider : 'auto',
+          size: /^\d{3,4}x\d{3,4}$/.test(String(d.size ?? '')) ? d.size : '1024x1024',
+          dailyLimit: Number.isFinite(+d.dailyLimit) && +d.dailyLimit > 0 ? +d.dailyLimit : 30,
+          momentDailyLimit: Number.isFinite(+d.momentDailyLimit) && +d.momentDailyLimit > 0 ? +d.momentDailyLimit : 10
+        });
+      }
+      if (req.method === 'POST') {
+        const body = await readBody(req);
+        if (!cfgd.socialV2 || typeof cfgd.socialV2 !== 'object') cfgd.socialV2 = {};
+        if (!cfgd.socialV2.draw || typeof cfgd.socialV2.draw !== 'object') cfgd.socialV2.draw = {};
+        let changed = false;
+        if (body?.provider !== undefined) {
+          const prov = String(body.provider);
+          if (!['auto', 'cloudflare', 'bailian', 'zhipu'].includes(prov)) return sendJson(res, { ok: false, error: `未知出图引擎：${prov}` });
+          if (cfgd.socialV2.draw.provider !== prov) { cfgd.socialV2.draw.provider = prov; changed = true; }
+        }
+        if (body?.size !== undefined) {
+          const s = String(body.size).trim();
+          if (!/^\d{3,4}x\d{3,4}$/.test(s)) return sendJson(res, { ok: false, error: 'size 格式应为 宽x高，如 1024x1024' });
+          if (cfgd.socialV2.draw.size !== s) { cfgd.socialV2.draw.size = s; changed = true; }
+        }
+        for (const k of ['dailyLimit', 'momentDailyLimit']) {
+          if (body?.[k] !== undefined) {
+            const n = Math.max(1, Math.min(500, Math.floor(Number(body[k]) || 0)));
+            if (cfgd.socialV2.draw[k] !== n) { cfgd.socialV2.draw[k] = n; changed = true; }
+          }
+        }
+        if (changed) writeJson(configFile(), cfgd);
+        let botsRestarted = false;
+        if (changed) { try { botsRestarted = await restartBotsFor('qq'); } catch { botsRestarted = false; } }
+        let preview = null;
+        if (String(body?.text ?? '').trim()) {
+          try {
+            const { generateImage } = await import(pathToFileURL(path.join(codeRoot(), 'src', 'draw.js')).href);
+            const r = await generateImage(String(body.text));
+            preview = { name: path.basename(r.path), provider: r.provider, bytes: r.bytes };
+          } catch (error) {
+            return sendJson(res, { ok: false, error: `出图失败：${error?.message ?? error}`, botsRestarted });
+          }
+        }
+        return sendJson(res, { ok: true, changed, botsRestarted, preview });
+      }
+    }
+    if (p === '/api/image-library') {
+      const listImages = (dir, base) => {
+        const out = [];
+        let entries = [];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+        for (const e of entries) {
+          if (e.name.startsWith('.')) continue;
+          const rel = base ? `${base}/${e.name}` : e.name;
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) out.push(...listImages(full, rel));
+          else if (IMAGE_EXTS.includes(path.extname(e.name).toLowerCase())) {
+            let size = 0;
+            try { size = fs.statSync(full).size; } catch { /* 读不到就算 0 */ }
+            out.push({ name: rel, size });
+          }
+        }
+        return out;
+      };
+      if (req.method === 'GET') {
+        const files = listImages(imageLibraryDir(), '').sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+        return sendJson(res, { ok: true, dir: imageLibraryDir(), files });
+      }
+      if (req.method === 'POST') {
+        // 上传：{ name, dataB64 }。名字只取 basename、限图片扩展名、限 30MB ——
+        // 这个目录是模型的图库，不能让它变成任意文件写入点。
+        const body = await readBody(req);
+        const base = path.basename(String(body?.name ?? '')).replace(/[\\/:*?"<>|]/g, '');
+        if (!base || !IMAGE_EXTS.includes(path.extname(base).toLowerCase())) {
+          return sendJson(res, { ok: false, error: '文件名要带图片扩展名（png/jpg/webp/gif）' });
+        }
+        let buf;
+        try {
+          buf = Buffer.from(String(body?.dataB64 ?? ''), 'base64');
+        } catch {
+          return sendJson(res, { ok: false, error: '文件内容不是合法的 base64' });
+        }
+        if (buf.length < 500) return sendJson(res, { ok: false, error: '文件太小，不像有效图片' });
+        if (buf.length > 30 * 1024 * 1024) return sendJson(res, { ok: false, error: '超过 30MB 上限' });
+        try {
+          fs.mkdirSync(imageLibraryDir(), { recursive: true });
+          fs.writeFileSync(path.join(imageLibraryDir(), base), buf);
+          return sendJson(res, { ok: true, name: base, bytes: buf.length });
+        } catch (error) {
+          return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+      if (req.method === 'DELETE') {
+        const rel = String(url.searchParams.get('name') ?? '').trim();
+        const libDir = path.resolve(imageLibraryDir());
+        const full = path.resolve(libDir, rel);
+        if (!full.startsWith(libDir + path.sep) || !path.extname(full)) {
+          return sendJson(res, { ok: false, error: '非法的文件名' });
+        }
+        try {
+          fs.rmSync(full, { force: true });
+          return sendJson(res, { ok: true });
+        } catch (error) {
+          return sendJson(res, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+    }
+    if (p === '/api/image-library/file') {
+      // 看图：把库里的图片给浏览器展示（只允许库目录内的文件，防目录穿越）。
+      const rel = String(url.searchParams.get('name') ?? '').trim();
+      const libDir = path.resolve(imageLibraryDir());
+      const full = path.resolve(libDir, rel);
+      let ok = false;
+      try {
+        ok = full.startsWith(libDir + path.sep) && fs.existsSync(full) && fs.statSync(full).isFile();
+      } catch { ok = false; }
+      if (!ok) {
+        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('not found');
+        return;
+      }
+      const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
+      res.writeHead(200, { 'content-type': types[path.extname(full).toLowerCase()] ?? 'application/octet-stream', 'cache-control': 'no-store' });
+      res.end(fs.readFileSync(full));
+      return;
     }
 
     if (p === '/api/tools') {

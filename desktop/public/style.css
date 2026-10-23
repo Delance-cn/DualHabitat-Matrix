@@ -1897,3 +1897,9 @@ html[data-view="home"] .app { grid-template-columns: minmax(0, 1fr); }
 .voice-lib-size { color: var(--muted, #8a93a3); font-size: 12px; }
 .voice-lib-empty { color: var(--muted, #8a93a3); font-size: 13px; margin: 4px 0; }
 #tts-preview-audio { width: 100%; margin-top: 8px; }
+
+/* ── 画画与动态：图库缩略图 ── */
+.image-lib-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px dashed rgba(127, 127, 127, .18); }
+.image-lib-thumb { width: 64px; height: 48px; object-fit: cover; border-radius: 8px; background: rgba(127, 127, 127, .12); }
+.image-lib-size { color: var(--muted, #8a8f98); font-size: 12px; white-space: nowrap; }
+#draw-preview-img { max-width: 100%; max-height: 260px; border-radius: 10px; margin-top: 10px; }

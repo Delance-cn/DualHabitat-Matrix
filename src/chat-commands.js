@@ -13,6 +13,7 @@
 
 import fs from 'node:fs';
 import os from 'node:os';
+import { generateImage, resolveLibraryFile } from './draw.js';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -32,6 +33,22 @@ function fmtBytes(n) {
 }
 
 /* ── 截屏：PowerShell + System.Drawing，无第三方依赖 ─────────────── */
+
+/** NapCat OneBot HTTP 直调（QQ 空间扩展动作用；聊天消息一律走既有发送链路）。 */
+async function napcatApi(cfg, action, payload) {
+  const base = String(cfg?.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+  const token = String(cfg?.snowluma?.accessToken ?? '').trim();
+  const res = await fetch(`${base}/${action}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(payload ?? {}),
+    signal: AbortSignal.timeout(60_000)
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const body = await res.json().catch(() => null);
+  if (body?.status !== 'ok' || body?.retcode !== 0) throw new Error(`OneBot ${action} 失败: retcode=${body?.retcode} ${body?.wording ?? ''}`.trim());
+  return body.data;
+}
 
 function captureScreenPng() {
   const script = [
@@ -170,7 +187,11 @@ export function localCommandHelp(ctx = {}) {
     '/shutdown [秒] —— 定时关机，默认 60 秒，最少 5 秒',
     '/cancel-shutdown —— 取消定时关机（也可 /shutdown cancel）',
     '/find <关键词> [目录] —— 在常用目录按文件名搜索，最多 15 条',
-    '/plugins —— 已装载的插件与它们的命令'
+    '/plugins —— 已装载的插件与它们的命令',
+    '/画 <描述> —— 画一张图发回来（消耗出图额度）',
+    '/动态 <文字> [图1 图2…] —— 发 QQ 空间说说（配图可选，用图库文件名）',
+    '/动态列表 —— 看自己空间最近的动态（带 tid）',
+    '/删动态 <tid> —— 删一条自己发的说说'
   ];
   for (const h of ctx.adminHelp ?? []) lines.push(h);
   const pluginLines = [];
@@ -243,6 +264,78 @@ export async function runLocalCommand(text, ctx = {}) {
         spawn('shutdown.exe', ['/a'], { stdio: 'ignore', windowsHide: true }).unref();
         reply('已取消定时关机（如果有的话）。');
         return { handled: true };
+
+      case '/画': {
+        const prompt = args.join(' ').trim();
+        if (!prompt) {
+          reply('用法：/画 <画面描述>');
+          return { handled: true };
+        }
+        reply('开始作画，稍等十几秒…');
+        try {
+          const r = await generateImage(prompt);
+          if (typeof ctx.replyImage === 'function') {
+            await ctx.replyImage(fs.readFileSync(r.path), path.basename(r.path));
+          } else {
+            reply(`图已生成：${r.path}（这个通道发不了图片，回电脑上看）`);
+          }
+        } catch (e) {
+          reply(`作画失败：${e?.message ?? e}`);
+        }
+        return { handled: true };
+      }
+
+      case '/动态': {
+        if (!args.length) {
+          reply('用法：/动态 <文字> [图库文件名…]（配图可选，多张空格分隔；文件名在桌面端图库里看）');
+          return { handled: true };
+        }
+        const content = args[0];
+        const imgs = args.slice(1).map((n) => resolveLibraryFile(n));
+        if (imgs.some((x) => !x)) {
+          reply('配图必须是图库里的文件名（桌面端「画画与动态」面板里能看到）。');
+          return { handled: true };
+        }
+        try {
+          const payload = { content, ugc_right: 1 };
+          if (imgs.length) payload.images = imgs;
+          const data = await napcatApi(ctx.config, 'send_qzone_msg', payload);
+          reply(`说说已发出（tid ${data?.tid ?? '未知'}）。`);
+        } catch (e) {
+          reply(`发说说失败：${e?.message ?? e}`);
+        }
+        return { handled: true };
+      }
+
+      case '/动态列表': {
+        try {
+          const data = await napcatApi(ctx.config, 'get_qzone_msg_list', {});
+          const arr = Array.isArray(data) ? data : (data?.list ?? data?.msglist ?? []);
+          if (!arr.length) {
+            reply('空间最近没有动态（或没读到）。');
+            return { handled: true };
+          }
+          reply(arr.slice(0, 10).map((m, i) => `${i + 1}. [${m?.tid ?? '?'}] ${String(m?.content ?? m?.summary ?? '').slice(0, 60).replace(/\s+/g, ' ')}`).join('\n'));
+        } catch (e) {
+          reply(`读动态失败：${e?.message ?? e}`);
+        }
+        return { handled: true };
+      }
+
+      case '/删动态': {
+        const tid = args[0];
+        if (!tid) {
+          reply('用法：/删动态 <tid>（先用 /动态列表 查到要删的那条）');
+          return { handled: true };
+        }
+        try {
+          await napcatApi(ctx.config, 'delete_qzone_msg', { tid });
+          reply(`已删除说说 ${tid}。`);
+        } catch (e) {
+          reply(`删除失败：${e?.message ?? e}`);
+        }
+        return { handled: true };
+      }
 
       case '/find': {
         if (!args.length) {

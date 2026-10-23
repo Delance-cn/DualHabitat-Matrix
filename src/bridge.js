@@ -62,9 +62,10 @@ import {
 import { runLocalCommand, loadPlugins } from './chat-commands.js';
 import { appendMemory } from './memory-daily.js';
 import { resolveDataRoot } from './data-root.js';
+import { resolveLibraryFile } from './draw.js';
 
 /** 代码根：src / public / assets 随包分发；数据根：config / state / roles / plugins / audio。 */
-const CODE_ROOT = path.resolve(__dirname, '..');
+const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ROOT = resolveDataRoot(CODE_ROOT);
 const STATE_DIR = path.join(ROOT, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
@@ -984,6 +985,10 @@ function loadConfig() {
     getSelfImage: true,
     sendVoice: false,
     tts: true,
+    draw: false,
+    momentPost: false,
+    momentList: true,
+    momentDelete: false,
     ...(cfg.socialV2.tools ?? {})
   };
 
@@ -5924,6 +5929,76 @@ async function main() {
             });
           } catch (error) {
             // 合成失败 / 限额 / 发送失败都在这里报人话
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
+        // ── 发图（图库的图片发进聊天；管理通道，MCP create-safe / 桌面端调用） ──────
+        // 与 send-sticker 同一套策略链（模式白名单 / 静默 / 限频）。图片只认图库
+        // （socialV2.draw.dir，默认 images/）里的文件，不接受 base64/URL ——
+        // 图库是唯一图片来源，桌面端「画画与动态」面板可管可删。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-image') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const file = String(body.file ?? '').trim();
+          const caption = String(body.caption ?? '').trim().slice(0, 500);
+          if (!v2ToolEnabled('draw')) { sendJson({ ok: false, error: '工具未启用：画画/发图（创作组）' }, 403); return; }
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const libPath = resolveLibraryFile(file);
+          if (!libPath) { sendJson({ ok: false, error: `图库里没有「${file}」。图片来源只限图库（画画与动态面板可管理）` }, 400); return; }
+          const sendCfg = cfg.socialV2?.send ?? {};
+          const now = Date.now();
+          const st = getSocialV2State(key);
+          const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
+          const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
+          const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
+          const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
+          if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+            sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
+            return;
+          }
+          st.sendTimes.push(now);
+          if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+          try {
+            const image = fs.readFileSync(libPath);
+            const segments = [{ type: 'image', data: { file: 'base64://' + image.toString('base64') } }];
+            if (caption) segments.push({ type: 'text', data: { text: caption } });
+            const sent = await onebotSend(kind, id, segments);
+            const messageId = sent?.messageId ?? sent?.message_id ?? null;
+            // 记录到二代会话的 recentMessages，让 AI 知道自己发过这张图
+            const text = `[图片:${path.basename(libPath)}]`;
+            st.recentMessages.push({
+              messageId: messageId ? String(messageId) : null,
+              sender: '我',
+              text: truncateText(text, 200),
+              plain: truncateText(text, 200),
+              quoteTargetIsSelf: false,
+              isOwner: true,
+              ownerLabel: '我',
+              isSelf: true,
+              media: [],
+              hasMedia: false,
+              forwardIds: [],
+              hasForward: false,
+              sticker: null,
+              time: Date.now()
+            });
+            const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
+            if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+            st.lastAiReplyAt = now;
+            st.lastActionAt = now;
+            sendJson({ ok: true, key, messageId, file: path.basename(libPath) });
+          } catch (error) {
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
           return;

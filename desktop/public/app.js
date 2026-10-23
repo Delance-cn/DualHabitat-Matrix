@@ -2890,6 +2890,8 @@ async function loadChat() {
   if (p === 'qq') await loadTools();
   // 语音库与 TTS 同样只有 QQ 这一套
   if (p === 'qq') await loadVoicePanel();
+  // 画画与动态同样只有 QQ 这一套
+  if (p === 'qq') await loadDrawPanel();
 }
 
 /* 自动保存：对话与人格页所有字段改了就存（停手 1 秒自动落盘并生效，不用点保存） */
@@ -4321,6 +4323,117 @@ $('#voice-lib-list').addEventListener('click', async (e) => {
   if (r.ok === false) return setResult('#tts-result', r.error ?? '删除失败', 'err');
   setResult('#tts-result', '已删除', 'ok');
   await loadVoicePanel();
+});
+
+/* ── 9.6 画画与动态（聊天页 QQ） ────────────────────── */
+
+let imageLibFiles = [];
+
+async function loadDrawPanel() {
+  try {
+    const s = await api('/api/draw');
+    if (s && s.ok !== false) {
+      $('#draw-provider').value = s.provider ?? 'auto';
+      $('#draw-size').value = s.size ?? '1024x1024';
+      $('#draw-daily-limit').value = s.dailyLimit ?? 30;
+      $('#draw-moment-limit').value = s.momentDailyLimit ?? 10;
+    }
+    const lib = await api('/api/image-library');
+    if (lib && lib.ok !== false) {
+      $('#image-lib-dir').textContent = lib.dir ?? '';
+      imageLibFiles = lib.files ?? [];
+      renderImageLib();
+    }
+  } catch { /* 服务没起好就静默，下次切平台再试 */ }
+}
+
+function renderImageLib() {
+  const box = $('#image-lib-list');
+  if (!imageLibFiles.length) {
+    box.innerHTML = '<p class="voice-lib-empty">图库还是空的 —— 上面试画一张，或直接上传图片，模型就能发图 / 发带图说说了。</p>';
+    return;
+  }
+  box.innerHTML = imageLibFiles
+    .map((f) => `<div class="image-lib-row">
+      <img class="image-lib-thumb" loading="lazy" src="/api/image-library/file?name=${encodeURIComponent(f.name)}" alt="" />
+      <span class="voice-lib-name" title="${esc(f.name)}">${esc(f.name)}</span>
+      <span class="image-lib-size">${f.size ? `${Math.max(1, Math.round(f.size / 1024))} KB` : ''}</span>
+      <button class="btn btn-sm" data-image-del="${esc(f.name)}">删除</button>
+    </div>`)
+    .join('');
+}
+
+// 设置改动即存（服务端保存后会自动重启在跑的 QQ BOT）
+let drawSaveTimer = null;
+function scheduleDrawSave() {
+  clearTimeout(drawSaveTimer);
+  drawSaveTimer = setTimeout(async () => {
+    const payload = {
+      provider: $('#draw-provider').value,
+      size: $('#draw-size').value.trim(),
+      dailyLimit: Number($('#draw-daily-limit').value) || 30,
+      momentDailyLimit: Number($('#draw-moment-limit').value) || 10
+    };
+    const r = await post('/api/draw', payload);
+    if (r.ok === false) return setResult('#draw-result', r.error ?? '保存失败', 'err');
+    setResult('#draw-result', r.botsRestarted ? '已保存 ✓ 在跑的 QQ BOT 已重启，立即生效' : '已保存 ✓ BOT 没在跑，下次启动生效', 'saved');
+  }, 700);
+}
+
+$('#draw-provider').addEventListener('change', () => scheduleDrawSave());
+$('#draw-size').addEventListener('change', () => scheduleDrawSave());
+$('#draw-daily-limit').addEventListener('change', () => scheduleDrawSave());
+$('#draw-moment-limit').addEventListener('change', () => scheduleDrawSave());
+
+$('#btn-draw-preview').addEventListener('click', async (e) => {
+  const text = $('#draw-preview-text').value.trim();
+  if (!text) return setResult('#draw-result', '先写一句画面描述', 'err');
+  await busy(e.target.closest('button'), '作画中…', async () => {
+    const r = await post('/api/draw', { text });
+    if (r.ok === false) return setResult('#draw-result', r.error ?? '出图失败', 'err');
+    if (r.preview) {
+      const img = $('#draw-preview-img');
+      img.src = `/api/image-library/file?name=${encodeURIComponent(r.preview.name)}`;
+      img.hidden = false;
+      setResult('#draw-result', `生成成功：${r.preview.provider}，已存进图库 ${r.preview.name}`, 'ok');
+      await loadDrawPanel();
+    } else {
+      setResult('#draw-result', '已保存', 'ok');
+    }
+  });
+});
+
+$('#btn-image-refresh').addEventListener('click', () => loadDrawPanel());
+
+$('#btn-image-upload').addEventListener('click', () => $('#image-file-input').click());
+
+$('#image-file-input').addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  e.target.value = '';
+  if (!file) return;
+  if (file.size > 30 * 1024 * 1024) return setResult('#draw-result', '超过 30MB 上限', 'err');
+  const dataB64 = await new Promise((resolve) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result).split(',')[1] ?? '');
+    fr.onerror = () => resolve('');
+    fr.readAsDataURL(file);
+  });
+  if (!dataB64) return setResult('#draw-result', '读文件失败', 'err');
+  const r = await post('/api/image-library', { name: file.name, dataB64 });
+  if (r.ok === false) return setResult('#draw-result', r.error ?? '上传失败', 'err');
+  setResult('#draw-result', `已上传 ${r.name}`, 'ok');
+  await loadDrawPanel();
+});
+
+$('#image-lib-list').addEventListener('click', async (e) => {
+  const del = e.target.closest('[data-image-del]');
+  if (!del) return;
+  const ok = await confirmBox({ title: '删除这张图片？', text: del.dataset.imageDel, okLabel: '删除' });
+  if (!ok) return;
+  const r = await api(`/api/image-library?name=${encodeURIComponent(del.dataset.imageDel)}`, { method: 'DELETE' });
+  if (r.ok === false) return setResult('#draw-result', r.error ?? '删除失败', 'err');
+  setResult('#draw-result', '已删除', 'ok');
+  await loadDrawPanel();
 });
 
 /* ── 启动 ───────────────────────────────────────────── */

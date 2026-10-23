@@ -44,6 +44,7 @@ desktop/automation.json
 
 # 本机个人模型池备份（不入库）
 models.local.json
+spike/data/
 
 # .github 不随公开仓库发布（签名工作流需要的 PAT 权限本机没有；要启用就在 GitHub 网页端添加）
 .github/

@@ -299,6 +299,9 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     permissions.push({ action: 'web-search-safe_*', resource: '*', effect: 'allow' });
     // 记忆日志只读工具（mcp-memory 注册的服务名是 memory-safe）
     permissions.push({ action: 'memory-safe_*', resource: '*', effect: 'allow' });
+    // 创作工具（mcp-create 注册的服务名是 create-safe）：画画 / 发图 / 空间动态增删查。
+    // 各工具在 MCP 侧再查 config.socialV2.tools 的创作组开关，双保险。
+    permissions.push({ action: 'create-safe_*', resource: '*', effect: 'allow' });
     // 视频工具（mcp-video-safe 注册的服务名是 video-safe）：热榜/搜索/看单条视频。
     // 只读；下载走 safe-fetch，不碰本地文件写入。
     if (isVideoEnabled()) {
@@ -372,6 +375,19 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   } else {
     notes.push(`⚠️ 找不到 ${memoryServer}，跳过记忆 MCP（每日记忆日志会不可读）`);
   }
+  // 创作工具（画画 + QQ 空间动态）：开关在桌面端「工具开关 → 创作」组，默认全关
+  // （momentList 只读默认开）。MCP 服务自己读 config 判定开关，改开关后重启桥接生效。
+  const createServer = path.join(CODE_ROOT, 'src', 'mcp-create.js');
+  if (fs.existsSync(createServer)) {
+    mcpServers['create-safe'] = {
+      type: 'local',
+      command: [process.execPath, createServer],
+      cwd: SESSION_WORKDIR,
+      codemode: false,
+      timeout: { startup: 20_000, catalog: 20_000, execution: 240_000 }
+    };
+  }
+
 
   // 视频工具：热榜/搜索/看单条。抖音解析要启动 headless Edge/Chrome，下载 + 抽帧
   // 可能跑几十秒，execution 给到 240s；catalog 首次列工具时也要留足。

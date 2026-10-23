@@ -1065,6 +1065,70 @@
         </details>
       </div>
 
+      <div class="panel" data-pf="qq">
+        <div class="panel-head">
+          <h2>画画与动态</h2>
+          <span class="hint">模型能画图、把图发进聊天、发/看/删 QQ 空间说说（能力开关在「工具开关 → 创作」）</span>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="draw-provider">出图引擎</label>
+            <select id="draw-provider">
+              <option value="auto">自动（Cloudflare 优先，失败落百炼 / 智谱）</option>
+              <option value="cloudflare">Cloudflare flux（免费额度，快）</option>
+              <option value="bailian">百炼 wanx（按张计额度）</option>
+              <option value="zhipu">智谱 CogView（需有效 key）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="draw-size">默认尺寸（宽x高）</label>
+            <input id="draw-size" placeholder="1024x1024" spellcheck="false" />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="draw-daily-limit">每日出图上限（张）</label>
+            <input id="draw-daily-limit" type="number" min="1" max="500" />
+          </div>
+          <div class="field">
+            <label for="draw-moment-limit">每日发动态上限（条）</label>
+            <input id="draw-moment-limit" type="number" min="1" max="500" />
+          </div>
+        </div>
+
+        <div class="field-row" style="margin-top:13px">
+          <div class="field" style="flex:1">
+            <label for="draw-preview-text">试画一张（消耗出图额度）</label>
+            <input id="draw-preview-text" placeholder="例：一只戴墨镜的橘猫坐在窗台上，扁平风格插画" spellcheck="false" />
+          </div>
+          <button class="btn" id="btn-draw-preview">生成试画</button>
+        </div>
+        <img id="draw-preview-img" alt="试画结果" hidden />
+        <span class="result" id="draw-result"></span>
+
+        <div class="voice-lib">
+          <div class="voice-lib-head">
+            <strong>图库</strong>
+            <span class="hint" id="image-lib-dir"></span>
+            <span style="flex:1"></span>
+            <button class="btn btn-sm" id="btn-image-refresh">刷新</button>
+            <button class="btn btn-sm" id="btn-image-upload">上传图片</button>
+            <input type="file" id="image-file-input" accept=".png,.jpg,.jpeg,.webp,.gif" hidden />
+          </div>
+          <div id="image-lib-list"></div>
+        </div>
+
+        <details class="help">
+          <summary>这是什么 / 怎么填</summary>
+          <div class="help-body">
+            <p>「图库」= config.socialV2.draw.dir（默认 images/）。模型发图、发带图说说只能用这里的文件；试画与上传的图都落在这里。</p>
+            <p>「出图引擎」按顺序自动降级：Cloudflare 免费额度 → 百炼 wanx → 智谱 CogView（key 失效会自动跳过）。引擎 / 尺寸 / 上限改完自动保存并重启在跑的 QQ BOT。</p>
+            <p>动态走 NapCat 的 QQ 空间接口：发 / 看 / 删在「工具开关 → 创作」里控制，默认全关；删动态不可恢复，模型只应删自己发的。</p>
+          </div>
+        </details>
+      </div>
+
       <div class="panel">
         <div class="panel-head">
           <h2>谁能对话</h2>
