@@ -2168,11 +2168,17 @@ async function checkAppUpdateOnce() {
   try {
     const info = await appUpdateInfo();
     const s = readJson(SETTINGS_FILE);
-    s.app = { ...(s.app ?? {}), lastUpdateCheck: Date.now(), lastUpdateFound: info.updateAvailable ? info.tag : '' };
+    s.app = { ...(s.app ?? {}), lastUpdateCheck: Date.now(), lastUpdateFound: info.updateAvailable ? info.tag : '', lastUpdateError: '' };
     writeJson(SETTINGS_FILE, s);
     return { ok: true, ...info };
   } catch (error) {
     pushLog(`软件更新检查失败：${error?.message ?? error}`, 'err', 'app');
+    // 失败不再静默：记进设置，总览横幅位显示「检查没连上」（网络/代理原因），下次开软件能看见
+    try {
+      const s = readJson(SETTINGS_FILE);
+      s.app = { ...(s.app ?? {}), lastUpdateError: String(error?.message ?? error).slice(0, 200) };
+      writeJson(SETTINGS_FILE, s);
+    } catch { /* 写不进就算了 */ }
     return { ok: false, error: String(error?.message ?? error) };
   }
 }
@@ -2197,7 +2203,14 @@ function scheduleAppUpdateCheck() {
       app.lastUpdateFound = info.updateAvailable ? info.tag : '';
       st.app = app;
       writeJson(SETTINGS_FILE, st);
-    } catch { /* 检查失败静默，不打扰 */ }
+    } catch (error) {
+      // 同上：失败也留痕，别让人以为「没提示 = 没更新」
+      try {
+        const st = readJson(SETTINGS_FILE);
+        st.app = { ...(st.app ?? {}), lastUpdateError: String(error?.message ?? error).slice(0, 200) };
+        writeJson(SETTINGS_FILE, st);
+      } catch { /* 写不进就算了 */ }
+    }
   }, 20_000);
 }
 
@@ -4282,7 +4295,7 @@ const server = http.createServer(async (req, res) => {
         updates: (() => {
           const s = readJson(SETTINGS_FILE);
           return {
-            app: { found: s.app?.lastUpdateFound ?? '', reminded: s.app?.lastReminded ?? '' },
+            app: { found: s.app?.lastUpdateFound ?? '', reminded: s.app?.lastReminded ?? '', lastCheck: s.app?.lastUpdateCheck ?? 0, error: s.app?.lastUpdateError ?? '' },
             napcat: { found: s.napcat?.lastUpdateFound ?? '', reminded: s.napcat?.lastReminded ?? '' }
           };
         })(),
@@ -5475,6 +5488,115 @@ const server = http.createServer(async (req, res) => {
      *   webhook 指到这里，就能按「转发规则」把微信消息转去 QQ / 微信）。
      * GET  /hook/notify/<口令>?text=...  方便脚本一行调用。
      * 口令错 / 没启用 → 404，不区分是哪种，免得帮人探测。 */
+    if (p === '/api/plugins/add') {
+      // 添加引导的落点：前端「+ 添加插件」把名字和代码交过来，这里写进 plugins/ 并就地热重载。
+      // 插件 = 桥接同权限的本机代码，所以：名字白名单、代码限长、已存在必须显式 overwrite。
+      if (req.method === 'POST') {
+        const body = await readBody(req);
+        const rawName = String(body?.name ?? '').trim();
+        if (!/^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,48}$/.test(rawName)) {
+          return sendJson(res, { ok: false, error: '插件名只能用字母 / 数字 / 下划线 / 连字符（1-49 位）' });
+        }
+        const code = String(body?.code ?? '');
+        if (code.trim().length < 20) return sendJson(res, { ok: false, error: '代码太短：至少要把 default 导出写全（选个模板起步最快）' });
+        if (code.length > 200_000) return sendJson(res, { ok: false, error: '代码超过 200KB 上限' });
+        const dir = path.join(dataRoot(), 'plugins');
+        const file = path.join(dir, `${rawName}.js`);
+        if (fs.existsSync(file) && body?.overwrite !== true) {
+          return sendJson(res, { ok: false, error: `plugins/${rawName}.js 已存在。要覆盖就勾上「覆盖同名文件」`, exists: true });
+        }
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(file, code.endsWith('\n') ? code : `${code}\n`);
+        } catch (error) {
+          return sendJson(res, { ok: false, error: `写入失败：${error?.message ?? error}` });
+        }
+        // 就地热重载（与 /api/plugins POST 同一条链路）；桥接没跑就下次启动自动装载
+        const cfg = loadConfig();
+        const port = Number(cfg.consolePort ?? 3100);
+        let token = '';
+        try {
+          token = fs.readFileSync(path.join(dataRoot(), 'state', 'console-token'), 'utf8').trim();
+        } catch {
+          /* 还没跑过桥接 */
+        }
+        let reload = { count: null, errors: [], bridge: false };
+        try {
+          const upstream = await fetch(`http://127.0.0.1:${port}/api/plugins/reload`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...(token ? { 'x-console-token': token } : {}) },
+            body: '{}',
+            signal: AbortSignal.timeout(10_000)
+          });
+          const data = await upstream.json().catch(() => ({}));
+          reload = { count: data.count ?? null, errors: data.errors ?? [], bridge: upstream.ok && data.ok !== false };
+        } catch {
+          reload.bridge = false;
+        }
+        return sendJson(res, { ok: true, file: `${rawName}.js`, reload });
+      }
+    }
+    if (p === '/api/plugins/template') {
+      // 添加引导的模板：hello = 仓库自带的 example-hello.js 原文（最全）；keyword / blank 内置。
+      if (req.method === 'GET') {
+        const name = String(url.searchParams.get('name') ?? 'hello');
+        let code = '';
+        if (name === 'hello') {
+          try {
+            code = fs.readFileSync(path.join(codeRoot(), 'plugins', 'example-hello.js'), 'utf8');
+          } catch {
+            code = '';
+          }
+        } else if (name === 'keyword') {
+          code = [
+            '// 关键词自动回复插件：onMessage 钩子里匹配关键词就回一句。',
+            '// 别做成复读机：同一个人短时间只回一次（这里用 60 秒冷却演示）。',
+            "const lastReply = new Map(); // chatId:from -> 上次回复时间戳",
+            '',
+            'export default {',
+            "  name: 'keyword-reply',",
+            "  description: '关键词自动回复（示例：消息里提到\"天气\"就回一句）',",
+            '  commands: [],',
+            '  hooks: {',
+            '    onMessage(ctx) {',
+            "      const text = String(ctx.text ?? '');",
+            "      if (!text || text.startsWith('/')) return; // 斜杠命令交给命令层",
+            "      if (!/天气|weather/i.test(text)) return;",
+            "      const key = ctx.chatId + ':' + ctx.from;",
+            '      const now = Date.now();',
+            '      if (now - (lastReply.get(key) ?? 0) < 60_000) return; // 60 秒冷却',
+            '      lastReply.set(key, now);',
+            "      ctx.reply('收到天气相关的话题啦（示例回复）。真正接天气 API 就写在这里。');",
+            '    }',
+            '  }',
+            '};',
+            ''
+          ].join('\n');
+        } else if (name === 'blank') {
+          code = [
+            '// 空白插件框架：改 name / description，往 commands 里加你的命令就能用。',
+            '// ctx 里有什么（reply / sendVoice / platform / config / log …）见示例插件文件头注释。',
+            'export default {',
+            "  name: 'my-plugin',",
+            "  description: '一句话说明这个插件是干嘛的',",
+            '  commands: [',
+            '    {',
+            "      name: 'myping',",
+            "      usage: '/myping',",
+            "      description: '验证插件能跑',",
+            '      run: async (ctx) => {',
+            "        await ctx.reply('pong —— 插件链路通了！');",
+            '      }',
+            '    }',
+            '  ],',
+            '  hooks: {}',
+            '};',
+            ''
+          ].join('\n');
+        }
+        return sendJson(res, { ok: true, name, code });
+      }
+    }
     if (p.startsWith('/hook/notify/')) {
       const hub = loadNotify();
       const token = p.slice('/hook/notify/'.length);

@@ -1883,8 +1883,37 @@
           <span class="hint" id="plugins-note">放在桥接根目录 plugins\ 下的 .js，QQ 和微信都能用</span>
         </div>
         <div id="plugins-list"></div>
+        <div id="plugins-add" hidden>
+          <div class="field-row">
+            <div class="field">
+              <label for="plugin-add-name">第 1 步 · 起个名字（文件名，不带 .js）</label>
+              <input id="plugin-add-name" placeholder="my-plugin" spellcheck="false" />
+            </div>
+            <div class="field">
+              <label for="plugin-add-template">第 2 步 · 选个起点模板</label>
+              <select id="plugin-add-template">
+                <option value="hello">示例插件（/hello /roll /统计，推荐先跑通）</option>
+                <option value="keyword">关键词自动回复（onMessage 钩子）</option>
+                <option value="blank">空白框架（一个最简命令）</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="plugin-add-code">第 3 步 · 改代码（default 导出 { name, description, commands, hooks }；ctx 里有什么见文件头注释）</label>
+            <textarea id="plugin-add-code" class="code-editor" rows="14" spellcheck="false"></textarea>
+          </div>
+          <div class="field-row" style="align-items:center;margin-top:8px">
+            <label class="switch-row" style="margin:0"><input type="checkbox" id="plugin-add-overwrite" /><span>覆盖同名文件</span></label>
+            <span style="flex:1"></span>
+            <button class="btn" id="btn-plugin-add-save">保存并热重载</button>
+            <span class="result" id="plugin-add-result"></span>
+          </div>
+          <p class="hint" style="margin-top:6px">保存后立即热重载（桥接在跑时；没在跑就下次启动自动装载）。插件拥有与桥接相同的本机权限 —— 只装信得过的代码。</p>
+        </div>
+
         <div class="actions">
           <button class="btn" id="btn-plugins-reload">重新装载</button>
+          <button class="btn" id="btn-plugins-add">+ 添加插件</button>
           <span class="result" id="plugins-result"></span>
         </div>
         <details>

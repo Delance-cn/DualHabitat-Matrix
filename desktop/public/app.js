@@ -1004,10 +1004,17 @@ function renderOverview() {
 
   /* 更新横幅 */
   const appNew = S.updates?.app?.found && S.updates.app.found !== S.updates.app.reminded;
-  $('#banner-app').hidden = !appNew;
+  const appErr = !appNew && S.updates?.app?.error ? String(S.updates.app.error) : '';
+  $('#banner-app').hidden = !appNew && !appErr;
   if (appNew) {
     $('#banner-app-title').textContent = `软件有新版本 ${S.updates.app.found}（当前 v${S.version}）`;
     $('#banner-app-sub').textContent = '下载完成后本程序会自动关闭并安装，装完自动重开。';
+    $('#btn-app-update').hidden = false;
+  } else if (appErr) {
+    // 检查失败不再静默：横幅位告诉人「不是没更新，是没查到」
+    $('#banner-app-title').textContent = '更新检查没连上';
+    $('#banner-app-sub').textContent = `自动检查没连上 GitHub（${appErr.slice(0, 90)}）。网络/代理通了以后重开软件就会重查；也可以直接去 GitHub releases 页手动下载。`;
+    $('#btn-app-update').hidden = true;
   }
   const ncNew = S.updates?.napcat?.found && S.updates.napcat.found !== S.updates.napcat.reminded;
   $('#banner-napcat').hidden = !ncNew;
@@ -3150,6 +3157,43 @@ $('#btn-plugins-reload')?.addEventListener('click', async (e) => {
     const r = await post('/api/plugins');
     if (r.ok === false) return setResult('#plugins-result', r.error ?? '装载失败', 'err');
     setResult('#plugins-result', `已重新装载 ${r.count ?? 0} 个插件${r.errors?.length ? `，${r.errors.length} 个失败` : ''}`, r.errors?.length ? 'err' : 'ok');
+    await loadPluginsUi();
+  });
+});
+
+
+/* ── 插件添加引导（高级页） ────────────────────────────────────────────── */
+
+$('#btn-plugins-add')?.addEventListener('click', () => {
+  const box = $('#plugins-add');
+  if (!box) return;
+  box.hidden = !box.hidden;
+  // 第一次展开就装上模板，让人从「能跑的代码」开始改
+  if (!box.hidden && !$('#plugin-add-code').value.trim()) fillPluginTemplate();
+});
+
+function fillPluginTemplate() {
+  const name = $('#plugin-add-template')?.value ?? 'hello';
+  api(`/api/plugins/template?name=${encodeURIComponent(name)}`)
+    .then((r) => {
+      if (r && r.ok !== false) $('#plugin-add-code').value = r.code ?? '';
+    })
+    .catch(() => { /* 服务没起好就留空 */ });
+}
+
+$('#plugin-add-template')?.addEventListener('change', fillPluginTemplate);
+
+$('#btn-plugin-add-save')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const name = $('#plugin-add-name').value.trim();
+    const code = $('#plugin-add-code').value;
+    const overwrite = $('#plugin-add-overwrite')?.checked === true;
+    const r = await post('/api/plugins/add', { name, code, overwrite });
+    if (r.ok === false) return setResult('#plugin-add-result', r.error ?? '保存失败', 'err');
+    const reloadNote = r.reload?.bridge
+      ? `已热重载（${r.reload.count ?? '?'} 个插件${r.reload.errors?.length ? `，${r.reload.errors.length} 个失败` : ''}）`
+      : '已保存；桥接没在跑，下次启动自动装载';
+    setResult('#plugin-add-result', `已保存 plugins/${r.file} —— ${reloadNote}`, 'ok');
     await loadPluginsUi();
   });
 });

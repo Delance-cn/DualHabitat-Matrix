@@ -1903,3 +1903,6 @@ html[data-view="home"] .app { grid-template-columns: minmax(0, 1fr); }
 .image-lib-thumb { width: 64px; height: 48px; object-fit: cover; border-radius: 8px; background: rgba(127, 127, 127, .12); }
 .image-lib-size { color: var(--muted, #8a8f98); font-size: 12px; white-space: nowrap; }
 #draw-preview-img { max-width: 100%; max-height: 260px; border-radius: 10px; margin-top: 10px; }
+
+/* ── 插件添加引导：代码编辑框 ── */
+.code-editor { width: 100%; font-family: Consolas, 'Courier New', monospace; font-size: 12.5px; line-height: 1.5; padding: 10px; border-radius: 10px; border: 1px solid rgba(127, 127, 127, .25); background: rgba(127, 127, 127, .06); color: inherit; resize: vertical; }
