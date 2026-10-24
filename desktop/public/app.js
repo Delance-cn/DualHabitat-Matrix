@@ -2697,11 +2697,19 @@ function renderPool() {
   $('#pool-spent-group').hidden = spent.length === 0;
   $('#pool-spent').innerHTML = spent
     .map(
-      (s) => `<div class="pool-item is-spent" data-id="${esc(s.id)}">
+      (s) => {
+        // quota 是「额度用完」：不会自己回来（永久坐废池），只能拿回来或删掉；
+        // 别的（限流/连不上/认证）是暂停，到期自动回队
+        const tag = s.kind === 'quota'
+          ? '额度用完 · 已废，不会自动恢复'
+          : '暂停中 · 到期自动恢复';
+        return `<div class="pool-item is-spent" data-id="${esc(s.id)}" title="${esc(s.detail ?? '')}">
         <span class="pool-name">${esc(s.id)}</span>
-        <span class="pool-tag">${esc(s.kind === 'quota' ? '额度用完' : '暂停中')}</span>
-        <button class="btn btn-sm" data-restore="${esc(s.id)}">拿回来</button>
-      </div>`
+        <span class="pool-tag">${esc(tag)}</span>
+        <button class="btn btn-sm" data-restore="${esc(s.id)}" title="清掉熔断记录，模型回到池里排队">拿回来</button>
+        <button class="btn btn-sm btn-ghost" data-discard="${esc(s.id)}" title="从模型池里整个删掉">删掉</button>
+      </div>`;
+      }
     )
     .join('');
 
@@ -2724,6 +2732,21 @@ function renderPool() {
     b.addEventListener('click', async () => {
       const r = await post('/api/model-pool/restore', { id: b.dataset.restore });
       toast(r.note ?? (r.ok ? '已解除' : r.error ?? '失败'));
+      await loadModels();
+    });
+  });
+
+  $$('#pool-spent [data-discard]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const ok = await confirmBox({
+        title: `从模型池删掉 ${b.dataset.discard}？`,
+        text: '熔断记录和池子条目一起删，重新生成配置。删错了得自己手动把条目加回来。',
+        okLabel: '删掉',
+        danger: true
+      });
+      if (!ok) return;
+      const r = await post('/api/model-pool/discard', { id: b.dataset.discard });
+      toast(r.note ?? (r.ok ? '已删掉' : r.error ?? '失败'));
       await loadModels();
     });
   });

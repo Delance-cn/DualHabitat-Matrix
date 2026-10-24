@@ -5262,7 +5262,7 @@ const server = http.createServer(async (req, res) => {
 
     /* ── 模型池 ───────────────────────────────────────── */
 
-    if (p === '/api/model-pool' || p === '/api/model-pool/restore') {
+    if (p === '/api/model-pool' || p === '/api/model-pool/restore' || p === '/api/model-pool/discard') {
       if (p === '/api/model-pool' && req.method === 'GET') {
         const pool = loadPool();
         // 只读接口不偷偷改文件：把坏条目原样带出去，前端标红提示；
@@ -5337,6 +5337,52 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
+      if (p === '/api/model-pool/discard' && req.method === 'POST') {
+        // 废池「删掉」：额度用尽的模型现在是永久坐废池（quota 熔断不过期），
+        // 不要了的得能整个移走 —— 清熔断记录 + 从池里删条目 + 重新生成配置。
+        const body = await readBody(req);
+        const id = String(body.id ?? '').trim();
+        if (!id) return sendJson(res, { ok: false, error: '缺少模型 id' });
+        const requested = url.searchParams.get('platform');
+        const platforms = requested === 'wechat' || requested === 'qq' ? [requested] : ['qq', 'wechat'];
+        let removedFuses = 0;
+        for (const platform of platforms) {
+          const file = chainStateFile(platform);
+          const d = readJson(file, null);
+          if (d && Array.isArray(d.health)) {
+            const before = d.health.length;
+            d.health = d.health.filter((e) => baseModelId(e.key) !== baseModelId(id));
+            const count = before - d.health.length;
+            if (count > 0) {
+              removedFuses += count;
+              writeJson(file, d);
+            }
+          }
+        }
+        const pool = loadPool();
+        const before = (pool.free ?? []).length + (pool.paid ?? []).length;
+        pool.free = (pool.free ?? []).filter((e) => baseModelId(e) !== baseModelId(id));
+        pool.paid = (pool.paid ?? []).filter((e) => baseModelId(e) !== baseModelId(id));
+        const removedEntries = before - pool.free.length - pool.paid.length;
+        if (removedEntries > 0) {
+          writeJson(modelsFile(), pool);
+        }
+        const regen = removedEntries > 0 ? await regenerateConfig() : { ok: true };
+        let bridgeRestarted = false;
+        let wechatRestarted = false;
+        if (bridge.child) bridgeRestarted = (await restartBridge()).ok === true;
+        if (wechat.child) wechatRestarted = await restartBotsFor('wechat');
+        return sendJson(res, {
+          ok: true,
+          removedFuses,
+          removedEntries,
+          regenerated: regen.ok !== false,
+          bridgeRestarted,
+          wechatRestarted,
+          note: removedEntries > 0 ? '已从模型池删掉' : '池里没这条（只清了熔断记录）'
+        });
+      }
+
       const body = await readBody(req);
       const pool = loadPool();
       // 本机服务（LM Studio/Ollama/…）的模型没有厂商前缀，池子又只认 provider/model ——
@@ -5388,7 +5434,7 @@ const server = http.createServer(async (req, res) => {
         _comment_free: pool._comment_free ?? '免费档，按优先级从上到下。上一个用光了（余额/无权/连不上）会自动换下一个；限流只冷却 60 秒后自动切回。',
         _comment_paid: pool._comment_paid ?? '付费档，默认不启用。allowPaid 打开后，免费档全部耗尽会自动降级到这里。',
         _comment_notice: pool._comment_notice ?? '所有候选都用完时，在群里回的这一句。',
-        _comment_cooldown: pool._comment_cooldown ?? '冷却覆盖（毫秒），一般不用改。kind 取值：quota / rate / unavailable / auth / unreachable。',
+        _comment_cooldown: pool._comment_cooldown ?? '冷却覆盖（毫秒），一般不用改。额度用完（quota）默认永久坐废池，只能手动拿回来或删掉；kind 取值：quota / rate / unavailable / auth / unreachable。',
         enabled: pool.enabled,
         allowPaid: pool.allowPaid,
         exhaustedNotice: pool.exhaustedNotice,

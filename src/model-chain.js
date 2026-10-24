@@ -39,9 +39,19 @@ export const KIND = {
 /** 会被熔断的失败类型（OTHER 不熔断，交给上层报错）。 */
 export const FUSING_KINDS = new Set([KIND.QUOTA, KIND.RATE, KIND.UNAVAILABLE, KIND.AUTH, KIND.UNREACHABLE]);
 
-/** 默认冷却时长（毫秒）。 */
+/**
+ * 「永久」冷却的哨兵时间戳：JS 日期上限（275760-09-13），有限数、JSON 能原样存。
+ * 不能用 Infinity —— JSON.stringify(Infinity) 会变成 null，状态文件一落盘就丢。
+ */
+export const PERMANENT_UNTIL = 8640000000000000;
+
+/** 默认冷却时长（毫秒）。
+ *
+ * quota 是「用完了」不是「坏了」：免费额度烧干不会自己长回来，等它复活只会让链
+ * 每轮都先撞一次墙再跳过。所以额度用尽永久坐废池，只能人在模型池里「拿回来」
+ * 或「删掉」。models.json 的 cooldownMs 覆盖仍然优先（想改回限时也行）。 */
 export const DEFAULT_COOLDOWN_MS = {
-  [KIND.QUOTA]: 6 * 60 * 60 * 1000, // 额度按天/按周期重置，等久一点没坏处
+  [KIND.QUOTA]: PERMANENT_UNTIL - Date.now(), // 永久：until 落在哨兵时间戳上
   [KIND.RATE]: 60 * 1000, // 限流只躲 60 秒
   [KIND.UNAVAILABLE]: 24 * 60 * 60 * 1000,
   [KIND.AUTH]: 24 * 60 * 60 * 1000,
@@ -311,9 +321,11 @@ export class ModelChain {
       ? retryAfterMs
       : (this.cooldownMs[kind] ?? DEFAULT_COOLDOWN_MS[KIND.UNAVAILABLE]);
     const at = this.now();
+    // 钳到 JS 日期上限（=PERMANENT_UNTIL）：冷却时长再大也不能溢出，
+    // 否则 new Date(until).toISOString() 会抛 Invalid time value。
     const entry = {
       kind,
-      until: at + wait,
+      until: Math.min(at + wait, PERMANENT_UNTIL),
       detail: failure.detail ?? prev?.detail ?? '',
       count: (prev?.count ?? 0) + 1,
       firstAt: prev?.firstAt ?? at,
