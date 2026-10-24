@@ -25,54 +25,152 @@ export const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url
  */
 export const ROOT = resolveDataRoot(CODE_ROOT);
 
-export function resolveStateDirectory(root, configuredPath = '') {
+export function resolveStateDirectory(root, configuredPath = '', fallback = path.join('.oc', 'state')) {
   const configured = String(configuredPath ?? '').trim();
-  return configured ? path.resolve(root, configured) : path.join(root, '.oc', 'state');
+  return configured ? path.resolve(root, configured) : path.join(root, fallback);
+}
+
+function readRootConfig(root) {
+  const configFile = path.join(root, 'config.json');
+  if (!fs.existsSync(configFile)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(configFile, 'utf8').replace(/^\uFEFF/, ''));
+  } catch (error) {
+    throw new Error(`无法读取模型实例数据目录设置：${configFile}（${error?.message ?? error}）`, { cause: error });
+  }
 }
 
 export function resolveConfiguredStateDirectory(root, envPath = '') {
   const override = String(envPath ?? '').trim();
   if (override) return path.resolve(root, override);
-
-  const configFile = path.join(root, 'config.json');
-  if (!fs.existsSync(configFile)) return resolveStateDirectory(root);
-  let config;
-  try {
-    config = JSON.parse(fs.readFileSync(configFile, 'utf8').replace(/^\uFEFF/, ''));
-  } catch (error) {
-    throw new Error(`无法读取模型实例数据目录设置：${configFile}（${error?.message ?? error}）`, { cause: error });
-  }
-  return resolveStateDirectory(root, config?.matrix?.stateDir);
+  return resolveStateDirectory(root, readRootConfig(root)?.matrix?.stateDir);
 }
 
+/** 模型实例的两个平台。QQ 沿用旧目录，微信从 0.5.5 起独立。 */
+export const MODEL_PLATFORMS = ['qq', 'wechat'];
+
 /** 固定端口：不跟桌面端的随机端口混，也不会撞 3080/3000/3001/3100。 */
-export const PORT = 4599;
+export const DEFAULT_PORT = 4599;
+
+/** 微信独立实例的端口。QQ 继续用 4599，CF shim 继续用 4600。 */
+export const WECHAT_PORT = 4601;
 
 /** CF 兼容代理（cf-shim）的固定端口。只在模型池里真有 CF 模型时才会起来。 */
 export const SHIM_PORT = 4600;
 
-/** 隔离出来的目录，全部落在项目内，便于整体删除/迁移/备份。 */
-export const PATHS = {
-  data: path.join(ROOT, '.oc', 'data'),
-  config: path.join(ROOT, '.oc', 'config'),
-  cache: path.join(ROOT, '.oc', 'cache'),
-  state: resolveConfiguredStateDirectory(ROOT, process.env.QQ_BRIDGE_STATE_DIR),
-  work: path.join(ROOT, '.oc', 'work'),
-  logs: path.join(ROOT, '.oc', 'logs'),
-  shimPid: path.join(ROOT, '.oc', 'cf-shim.pid'),
-  shimLog: path.join(ROOT, '.oc', 'logs', 'cf-shim.jsonl')
-};
+function normalizePlatform(platform) {
+  return platform === 'wechat' ? 'wechat' : 'qq';
+}
+
+/**
+ * 解析一个平台要用的模型实例。
+ *
+ * 关键兼容约束：QQ 的目录、端口、配置文件名全部保持 0.5.4 的样子，老数据不用迁移。
+ * 微信单独落在 `.oc/wechat` 下，配置文件名是 `.oc/wechat/opencode.json`；它的
+ * `cwd` / 会话目录也在 `.oc/wechat`，这样引擎不会把根目录的 QQ `opencode.json`
+ * 也合并进来。
+ *
+ * @param {'qq'|'wechat'} [platform]
+ * @param {{ root?: string, config?: object, env?: NodeJS.ProcessEnv, useEnv?: boolean }} [options]
+ */
+export function resolveModelInstance(platform = 'qq', options = {}) {
+  const p = normalizePlatform(platform);
+  const root = options.root ? path.resolve(options.root) : ROOT;
+  const env = options.env ?? process.env;
+  const config = options.config ?? readRootConfig(root);
+  const useEnv = options.useEnv !== false;
+  const envPlatform = String(env.QQ_BRIDGE_MODEL_PLATFORM ?? '').trim();
+  // 没显式标平台时，旧的 QQ_BRIDGE_STATE_DIR 仍按 QQ 处理；微信绝不误吃这个变量。
+  const envMatches = useEnv && (envPlatform ? normalizePlatform(envPlatform) === p : p === 'qq');
+  const shim = {
+    port: SHIM_PORT,
+    baseUrl: `http://127.0.0.1:${SHIM_PORT}/v1`,
+    pidFile: path.join(root, '.oc', 'cf-shim.pid'),
+    logFile: path.join(root, '.oc', 'logs', 'cf-shim.jsonl')
+  };
+
+  if (p === 'qq') {
+    const envState = envMatches ? env.QQ_BRIDGE_STATE_DIR : '';
+    const state = envState
+      ? path.resolve(root, envState)
+      : resolveStateDirectory(root, config?.matrix?.stateDir);
+    const configFile = envMatches && env.DHM_MODEL_QQ_CONFIG
+      ? path.resolve(root, env.DHM_MODEL_QQ_CONFIG)
+      : path.join(root, 'opencode.json');
+    return {
+      platform: p,
+      label: 'QQ',
+      port: Number(env.DHM_MODEL_QQ_PORT) || DEFAULT_PORT,
+      configDir: root,
+      configFile,
+      stateDir: state,
+      serviceFile: path.join(state, 'opencode', 'service.json'),
+      secretsFingerprintFile: path.join(state, 'service-secrets.sha256'),
+      paths: {
+        data: path.join(root, '.oc', 'data'),
+        config: path.join(root, '.oc', 'config'),
+        cache: path.join(root, '.oc', 'cache'),
+        state,
+        work: path.join(root, '.oc', 'work'),
+        logs: path.join(root, '.oc', 'logs'),
+        shimPid: shim.pidFile,
+        shimLog: shim.logFile
+      },
+      shim
+    };
+  }
+
+  const base = path.join(root, '.oc', 'wechat');
+  // 只认微信自己的变量；QQ_BRIDGE_STATE_DIR 是 QQ 的旧变量，微信不能吃。
+  const envState = envMatches ? env.QQ_BRIDGE_WECHAT_STATE_DIR : '';
+  const state = envState
+    ? path.resolve(root, envState)
+    : resolveStateDirectory(root, config?.matrix?.wechatStateDir, path.join('.oc', 'wechat', 'state'));
+  const configFile = envMatches && env.DHM_MODEL_WECHAT_CONFIG
+    ? path.resolve(root, env.DHM_MODEL_WECHAT_CONFIG)
+    : path.join(base, 'opencode.json');
+  return {
+    platform: p,
+    label: '微信',
+    port: Number(env.DHM_MODEL_WECHAT_PORT) || WECHAT_PORT,
+    configDir: base,
+    configFile,
+    stateDir: state,
+    serviceFile: path.join(state, 'opencode', 'service.json'),
+    secretsFingerprintFile: path.join(state, 'service-secrets.sha256'),
+    paths: {
+      data: path.join(base, 'data'),
+      config: path.join(base, 'config'),
+      cache: path.join(base, 'cache'),
+      state,
+      work: path.join(base, 'work'),
+      logs: path.join(base, 'logs'),
+      shimPid: shim.pidFile,
+      shimLog: shim.logFile
+    },
+    shim
+  };
+}
+
+/** 当前进程对应的实例（桥接/微信 Bot 由桌面端通过环境变量指定）。 */
+export const ACTIVE_INSTANCE = resolveModelInstance(process.env.QQ_BRIDGE_MODEL_PLATFORM);
+
+/** 当前实例端口。QQ=4599，微信=4601。 */
+export const PORT = ACTIVE_INSTANCE.port;
+
+/** 当前实例隔离出来的目录。QQ 保持旧布局，微信在 `.oc/wechat`。 */
+export const PATHS = ACTIVE_INSTANCE.paths;
 
 /** 注册文件（模型 API `--service` 模式自己写的，含 url/pid/password）。 */
-export const SERVICE_FILE = path.join(PATHS.state, 'opencode', 'service.json');
+export const SERVICE_FILE = ACTIVE_INSTANCE.serviceFile;
 
 /** CF 兼容代理的基址；写进 opencode.json 的 CF provider baseURL。 */
-export const SHIM_BASE_URL = `http://127.0.0.1:${SHIM_PORT}/v1`;
+export const SHIM_BASE_URL = ACTIVE_INSTANCE.shim.baseUrl;
 
-/** 模型 API 的配置文件名。 */
-export const CONFIG_FILE = path.join(ROOT, 'opencode.json');
+/** 模型 API 的配置文件名（当前实例）。 */
+export const CONFIG_FILE = ACTIVE_INSTANCE.configFile;
 
-/** 模型池配置文件名。 */
+/** 模型池配置文件名（两个平台共用策略，链由各自客户端按平台补充中转站候选）。 */
 export const MODELS_FILE = path.join(ROOT, 'models.json');
 
 /**
@@ -186,15 +284,20 @@ export function probeProxy(url, timeoutMs = 1500) {
  *     环境带着 OPENCODE=1 / OPENCODE_CLIENT=desktop / OPENCODE_SESSION_ID=ses_xxx /
  *     OPENCODE_TERMINAL=1 —— 这些指向前台会话，独立实例绝不能继承。
  *  3. （可选）接上代理，并保证回环地址不走代理。
- * @param {{ proxy?: string | null }} [options]
+ * @param {{ proxy?: string | null, instance?: object }} [options]
  *   `proxy` 传 `null` 表示"调用方已探活过，确认别用代理"；不传则按 `proxy.json` / 环境变量。
+ *   `instance` 不传就用当前进程对应的实例（`ACTIVE_INSTANCE`）。
  */
-export function isolatedEnv({ proxy: proxyOverride } = {}) {
+export function isolatedEnv({ proxy: proxyOverride, instance } = {}) {
+  const active = instance ?? ACTIVE_INSTANCE;
   const env = { ...process.env };
-  env.XDG_DATA_HOME = PATHS.data;
-  env.XDG_CONFIG_HOME = PATHS.config;
-  env.XDG_CACHE_HOME = PATHS.cache;
-  env.XDG_STATE_HOME = PATHS.state;
+  env.XDG_DATA_HOME = active.paths.data;
+  env.XDG_CONFIG_HOME = active.paths.config;
+  env.XDG_CACHE_HOME = active.paths.cache;
+  env.XDG_STATE_HOME = active.paths.state;
+  // 明确告诉引擎读哪一份配置。微信实例的 cwd 是 `.oc/wechat`，即使将来
+  // 会话目录换到别处，也不会再靠“从会话目录猜 opencode.json”。
+  env.OPENCODE_CONFIG = active.configFile;
   for (const key of [
     'OPENCODE',
     'OPENCODE_CLIENT',
@@ -202,6 +305,7 @@ export function isolatedEnv({ proxy: proxyOverride } = {}) {
     'OPENCODE_TERMINAL',
     'OPENCODE_DISABLE_EMBEDDED_WEB_UI',
     'OPENCODE_CLI_CONFIG_CONTENT',
+    'OPENCODE_CONFIG_CONTENT',
   ]) {
     delete env[key];
   }

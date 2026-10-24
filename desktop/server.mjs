@@ -209,20 +209,37 @@ const exampleFile = () => path.join(codeRoot(), 'config.example.json');
 async function reloadRunningModelServiceForSecrets() {
   const previousDataRoot = process.env.QQ_BRIDGE_DATA;
   const previousStateDir = process.env.QQ_BRIDGE_STATE_DIR;
+  const previousPlatform = process.env.QQ_BRIDGE_MODEL_PLATFORM;
   process.env.QQ_BRIDGE_DATA = dataRoot();
-  process.env.QQ_BRIDGE_STATE_DIR = matrixStateDir();
+  delete process.env.QQ_BRIDGE_MODEL_PLATFORM;
+  process.env.QQ_BRIDGE_STATE_DIR = matrixStateDir('qq');
   try {
     const bridgeRoot = codeRoot();
     const runtime = await import(pathToFileURL(path.join(bridgeRoot, 'src', 'oc-server.js')).href);
-    return await reloadSecretsInRunningServer({
-      serverStatus: runtime.serverStatus,
-      stopServer: runtime.stopServer
-    });
+    const envModule = await import(pathToFileURL(path.join(bridgeRoot, 'src', 'oc-env.js')).href);
+    const results = [];
+    for (const platform of ['qq', 'wechat']) {
+      const instance = envModule.resolveModelInstance(platform, { root: dataRoot(), useEnv: false });
+      results.push(
+        await reloadSecretsInRunningServer({
+          serverStatus: (options = {}) => runtime.serverStatus({ ...options, instance }),
+          stopServer: (options = {}) => runtime.stopServer({ ...options, instance, stopShim: false })
+        })
+      );
+    }
+    return {
+      applied: false,
+      pending: true,
+      reloadRequested: results.some((result) => result.reloadRequested === true),
+      instances: results
+    };
   } finally {
     if (previousDataRoot === undefined) delete process.env.QQ_BRIDGE_DATA;
     else process.env.QQ_BRIDGE_DATA = previousDataRoot;
     if (previousStateDir === undefined) delete process.env.QQ_BRIDGE_STATE_DIR;
     else process.env.QQ_BRIDGE_STATE_DIR = previousStateDir;
+    if (previousPlatform === undefined) delete process.env.QQ_BRIDGE_MODEL_PLATFORM;
+    else process.env.QQ_BRIDGE_MODEL_PLATFORM = previousPlatform;
   }
 }
 
@@ -1175,9 +1192,17 @@ const modelsFile = () => {
   return path.join(dataRoot(), 'models.json');
 };
 
-function matrixStateDir(config = loadConfig()) {
-  const configured = String(config.matrix?.stateDir ?? '').trim();
-  return configured ? path.resolve(dataRoot(), configured) : path.join(dataRoot(), '.oc', 'state');
+function matrixStateDir(platformOrConfig = 'qq', config = loadConfig()) {
+  // 兼容旧调用 `matrixStateDir(cfg)`：对象参数按 QQ 处理。
+  const isConfig = platformOrConfig && typeof platformOrConfig === 'object';
+  const platform = isConfig ? 'qq' : platformOrConfig === 'wechat' ? 'wechat' : 'qq';
+  const cfg = isConfig ? platformOrConfig : config;
+  const key = platform === 'wechat' ? 'wechatStateDir' : 'stateDir';
+  const configured = String(cfg.matrix?.[key] ?? '').trim();
+  if (configured) return path.resolve(dataRoot(), configured);
+  return platform === 'wechat'
+    ? path.join(dataRoot(), '.oc', 'wechat', 'state')
+    : path.join(dataRoot(), '.oc', 'state');
 }
 
 /**
@@ -1186,12 +1211,12 @@ function matrixStateDir(config = loadConfig()) {
  * 字段是 { id, version, url, pid, password } —— 注意存的是 **url** 不是 port，
  * 一开始按 port 读，界面上端口永远是「—」。
  */
-function ocInstance() {
+function ocInstance(platform = 'qq') {
   const cfg = loadConfig();
-  const stateDir = matrixStateDir(cfg);
+  const stateDir = matrixStateDir(platform, cfg);
   const file = path.join(stateDir, 'opencode', 'service.json');
   const info = readJson(file, null);
-  if (!info) return { alive: false, pid: null, url: null, port: null, version: null, file };
+  if (!info) return { platform, alive: false, pid: null, url: null, port: null, version: null, file };
 
   let alive = false;
   try {
@@ -1210,7 +1235,22 @@ function ocInstance() {
     port = null;
   }
 
-  return { alive, pid: info.pid ?? null, url: info.url ?? null, port, version: info.version ?? null, file };
+  return { platform, alive, pid: info.pid ?? null, url: info.url ?? null, port, version: info.version ?? null, file };
+}
+
+/** 两个模型实例的聚合状态：首页/状态页只关心“至少有一个在跑”。 */
+function ocInstances() {
+  const qq = ocInstance('qq');
+  const wechat = ocInstance('wechat');
+  return {
+    ...qq,
+    alive: qq.alive === true || wechat.alive === true,
+    url: qq.url ?? wechat.url ?? null,
+    pid: qq.pid ?? wechat.pid ?? null,
+    version: qq.version ?? wechat.version ?? null,
+    file: qq.file,
+    instances: { qq, wechat }
+  };
 }
 
 function loadPool() {
@@ -1229,15 +1269,15 @@ function loadPool() {
  * health: [{ key, kind, until, detail, count, firstAt, lastAt }]
  * key 形如 bailian/qwen3.8-max#low（也可能不带 #档位）。
  */
-function chainStateFile() {
+function chainStateFile(platform = 'qq') {
   const cfg = loadConfig();
-  const stateDir = matrixStateDir(cfg);
+  const stateDir = matrixStateDir(platform, cfg);
   return path.join(stateDir, 'model-chain.json');
 }
 
 /** 还在熔断期内（until 未到）的候选列表。 */
-function loadFused() {
-  const d = readJson(chainStateFile(), null);
+function loadFused(platform = 'qq') {
+  const d = readJson(chainStateFile(platform), null);
   const now = Date.now();
   return (Array.isArray(d?.health) ? d.health : [])
     .filter((e) => Number(e?.until) > now)
@@ -1266,34 +1306,41 @@ async function readModelUsage() {
     }
     if (!_sqliteCtor) return {};
     const cfg = loadConfig();
-    const stateDir = matrixStateDir(cfg);
     const candidates = [
-      path.join(path.dirname(stateDir), 'data', 'opencode', 'opencode.db'),
-      path.join(dataRoot(), '.oc', 'data', 'opencode', 'opencode.db')
+      path.join(path.dirname(matrixStateDir('qq', cfg)), 'data', 'opencode', 'opencode.db'),
+      path.join(dataRoot(), '.oc', 'data', 'opencode', 'opencode.db'),
+      path.join(path.dirname(matrixStateDir('wechat', cfg)), 'data', 'opencode', 'opencode.db'),
+      path.join(dataRoot(), '.oc', 'wechat', 'data', 'opencode', 'opencode.db')
     ];
-    const file = candidates.find((f) => fs.existsSync(f));
-    if (!file) return {};
-    const db = new _sqliteCtor(file, { readOnly: true });
-    const rows = db
-      .prepare('SELECT model, SUM(tokens_input + tokens_output) AS t, COUNT(*) AS n FROM session_v2 GROUP BY model')
-      .all();
-    db.close();
+    const files = [...new Set(candidates.filter((f) => fs.existsSync(f)))];
+    if (!files.length) return {};
     const out = {};
-    for (const r of rows) {
-      let id = String(r.model ?? '');
-      let provider = '';
+    for (const file of files) {
+      const db = new _sqliteCtor(file, { readOnly: true });
+      let rows = [];
       try {
-        const j = JSON.parse(id);
-        id = j.id || id;
-        provider = j.providerID || '';
-      } catch {
-        /* 不是 JSON（老数据）就按原样用 */
+        rows = db
+          .prepare('SELECT model, SUM(tokens_input + tokens_output) AS t, COUNT(*) AS n FROM session_v2 GROUP BY model')
+          .all();
+      } finally {
+        db.close();
       }
-      const key = provider ? `${provider}/${id}` : id;
-      const prev = out[key] ?? { tokens: 0, calls: 0 };
-      prev.tokens += Number(r.t) || 0;
-      prev.calls += Number(r.n) || 0;
-      out[key] = prev;
+      for (const r of rows) {
+        let id = String(r.model ?? '');
+        let provider = '';
+        try {
+          const j = JSON.parse(id);
+          id = j.id || id;
+          provider = j.providerID || '';
+        } catch {
+          /* 不是 JSON（老数据）就按原样用 */
+        }
+        const key = provider ? `${provider}/${id}` : id;
+        const prev = out[key] ?? { tokens: 0, calls: 0 };
+        prev.tokens += Number(r.t) || 0;
+        prev.calls += Number(r.n) || 0;
+        out[key] = prev;
+      }
     }
     return out;
   } catch {
@@ -1305,7 +1352,7 @@ async function readModelUsage() {
 function spentInPool(pool) {
   const ids = [...(pool.free ?? []), ...(pool.paid ?? [])].map(String);
   const spent = [];
-  for (const f of loadFused()) {
+  for (const f of [...loadFused('qq'), ...loadFused('wechat')]) {
     const id = ids.find((x) => x === f.key || baseModelId(x) === baseModelId(f.key));
     if (id && !spent.some((s) => s.id === id)) {
       spent.push({ id, until: f.until, kind: f.kind, detail: f.detail });
@@ -1322,7 +1369,7 @@ function spentInPool(pool) {
  */
 function regenerateConfig() {
   return new Promise((resolve) => {
-    const { command, env } = nodeRunner();
+    const { command, env } = nodeRunner('qq');
     const child = spawn(command, [path.join(getRoot(), 'src', 'oc-config.js')], {
       cwd: dataRoot(),
       env: { ...process.env, ...env },
@@ -2541,10 +2588,13 @@ async function bringUp(scope = 'all') {
     }
   }
 
-  // 微信也要模型 API（在桥接里），所以只开微信时也得确保桥接在
-  const bridgeResult = wantQq || !bridge.child ? startBridge() : { ok: true, skipped: true };
-  // 微信那条不依赖 NapCat，但依赖桥接拉起来的模型 API，所以放在桥接之后。
-  // 已经在跑就跳过，不会起第二份。
+  // 0.5.5 起微信有自己的 4601 实例，不再借 QQ 桥接的 4599；只开微信时不拉桥接。
+  const bridgeResult = wantQq
+    ? bridge.child
+      ? { ok: true, skipped: true }
+      : startBridge()
+    : { ok: true, skipped: true };
+  // 微信那条不依赖 NapCat，也不依赖桥接；自己的模型实例由 wechat-bot 幂等拉起。
   const wechatResult = wantWx
     ? wechat.child
       ? { ok: true, skipped: true }
@@ -2695,10 +2745,12 @@ function relay(stream, level, source) {
  * Electron 里 `process.execPath` 是 electron.exe，直接跑脚本会开个新窗口 ——
  * 必须带 ELECTRON_RUN_AS_NODE=1，或者退回系统 node。
  */
-function nodeRunner() {
+function nodeRunner(platform = 'qq') {
   const isElectron = Boolean(process.versions.electron);
   const env = isElectron ? { ELECTRON_RUN_AS_NODE: '1' } : {};
-  env.QQ_BRIDGE_STATE_DIR = matrixStateDir();
+  env.QQ_BRIDGE_MODEL_PLATFORM = platform === 'wechat' ? 'wechat' : 'qq';
+  env.QQ_BRIDGE_STATE_DIR = matrixStateDir(platform);
+  if (platform === 'wechat') env.QQ_BRIDGE_WECHAT_STATE_DIR = matrixStateDir('wechat');
   // 真实模型池在 models.local.json（公开仓只带空模板，个人池不进 git）。
   // 桥接、微信 bot、oc-config 重生成配置都从 QQ_BRIDGE_MODELS 拿池子——
   // 不注入的话，本机就一直在按空池跑，regen 还会报「模型池是空的」。
@@ -2765,7 +2817,7 @@ function startBridge() {
     return { ok: false, error: `数据根里没有 config.json，也没有可用的模板：${dataRoot()}` };
   }
 
-  const { command, env } = nodeRunner();
+  const { command, env } = nodeRunner('qq');
   const child = spawn(command, [path.join(getRoot(), 'src', 'bridge.js')], {
     cwd: dataRoot(),
     env: { ...process.env, ...env },
@@ -2782,7 +2834,7 @@ function startBridge() {
   child.on('close', (code) => {
     bridge = { child: null, startedAt: null, exitCode: code };
     onServiceExit('bridge');
-    if (!recentlyStopped('bridge')) void stopManagedModelService();
+    if (!recentlyStopped('bridge')) void stopManagedModelService('qq');
     pushLog(`桥接已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'bridge');
   });
 
@@ -2823,7 +2875,7 @@ function stopBridge() {
       clearTimeout(timeout);
       child.off('close', onClose);
     }
-    await stopManagedModelService();
+    await stopManagedModelService('qq');
     return { stopped: true };
   })();
   return withDone({ ok: true, pid: child.pid }, done);
@@ -2904,7 +2956,7 @@ function startWechat() {
     pushLog(`微信接入已在运行（pid ${externalPid}，不是本窗口启动的），直接复用`, 'sys', 'wechat');
     return { ok: true, pid: externalPid, external: true };
   }
-  const { command, env } = nodeRunner();
+  const { command, env } = nodeRunner('wechat');
   const script = path.join(getRoot(), 'src', 'wechat-bot.js');
   if (!fs.existsSync(script)) return { ok: false, error: '找不到 src/wechat-bot.js（桥接目录对吗）' };
 
@@ -2937,7 +2989,13 @@ function stopWechat() {
   const pid = child?.pid ?? externalWechatPid();
   if (!pid) return { ok: false, error: '微信接入没在运行' };
   pushLog('正在停止微信接入…', 'sys', 'wechat');
-  return withDone({ ok: true, pid }, killProcessTree(pid));
+  const done = (async () => {
+    const killed = await killProcessTree(pid);
+    // 微信 Bot 停了，它自己的 4601 模型实例也没人用了；QQ 的 4599 不动。
+    await stopManagedModelService('wechat');
+    return { stopped: true, killed };
+  })();
+  return withDone({ ok: true, pid }, done);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -2965,7 +3023,7 @@ function wechatPush({ to, text, dryRun = false } = {}) {
   args.push(target); // 文字不放进命令行（长文本/多行不用和转义搏斗），走 stdin
 
   return new Promise((resolve) => {
-    const { command, env } = nodeRunner();
+    const { command, env } = nodeRunner('wechat');
     const child = spawn(command, args, {
       cwd: dataRoot(),
       env: { ...process.env, ...env },
@@ -3294,21 +3352,22 @@ const SUMMARIZE_SYSTEM =
  *  secrets 里的厂商 key 全失效时，实例自己的模型链路往往还活着
  *  （self-test 走的就是它），所以它是省流总结的最后一档候选。
  *  流程照抄 src/self-test.js：建一次性会话 → 订阅事件流 → prompt → 等回合结束 → 归档。 */
-async function summarizeViaMatrix(prompt) {
+async function summarizeViaMatrix(prompt, platform = 'qq') {
   const { NodeApiClient, unwrap, createTurnCollector } = await import(
     pathToFileURL(path.join(getRoot(), 'src', 'oc-client.js')).href
   );
   const { ensureServer } = await import(pathToFileURL(path.join(getRoot(), 'src', 'oc-server.js')).href);
-  const { PATHS } = await import(pathToFileURL(path.join(getRoot(), 'src', 'oc-env.js')).href);
+  const { resolveModelInstance } = await import(pathToFileURL(path.join(getRoot(), 'src', 'oc-env.js')).href);
 
-  await ensureServer({ log: () => {} });
+  const instance = resolveModelInstance(platform, { root: dataRoot(), useEnv: false });
+  await ensureServer({ log: () => {}, instance });
 
   const api = new NodeApiClient(undefined, undefined, {
-    stateDir: PATHS.state,
-    sessionDir: PATHS.state,
+    stateDir: instance.stateDir,
+    sessionDir: instance.stateDir,
     log: () => {}
   });
-  const ws = unwrap(await api.workspace.create({ path: dataRoot() }), 'workspace.create');
+  const ws = unwrap(await api.workspace.create({ path: instance.configDir }), 'workspace.create');
   const workspaceId = ws.workspace.workspaceId;
   const created = unwrap(
     await api.sessions.create({ workspaceId, agentPreset: 'qq-chat', title: '省流总结（一次性，用完即归档）' }),
@@ -3423,7 +3482,7 @@ async function summarizeChat({ platform, conv, count } = {}) {
   // 直连厂商全挂（本机常见：secrets 里的 key 被轮换过）还有一条路：
   // 内置模型 API 实例 —— self-test 走的就是它，key 由实例自己管。
   try {
-    const out = await summarizeViaMatrix(prompt);
+    const out = await summarizeViaMatrix(prompt, pf);
     if (out) return { ok: true, summary: out, count: lines.length, via: '模型 API 实例', model: 'matrix' };
     lastError = '实例没有返回内容';
   } catch (error) {
@@ -4668,8 +4727,9 @@ const server = http.createServer(async (req, res) => {
         modelsPath: modelsFile(),
         projectRoot: dataRoot(),
         settingsPath: SETTINGS_FILE,
-        // 后端这块前端要显示「实例在不在」，只读注册文件，不碰它
-        matrix: ocInstance(),
+        // 后端这块前端要显示「实例在不在」，只读注册文件，不碰它。
+        // 0.5.5 起 QQ / 微信各一个实例，instances 里分别给出。
+        matrix: ocInstances(),
         updates: (() => {
           const s = readJson(SETTINGS_FILE);
           return {
@@ -4759,9 +4819,10 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/matrix') {
       /* 「默认方案」和「会话标题」跟着平台走 —— 微信的会话不该叫「QQ 聊天」。
-       * 其余字段（实例地址 / 隔离目录 / 会话目录 / 删不删归档）是同一个模型 API
-       * 服务的设置，两个平台共用，切平台不动它们。 */
+       * 0.5.5 起实例目录也按平台分开：QQ 继续用 matrix.stateDir，微信用
+       * matrix.wechatStateDir；会话目录同理，微信写 platforms.wechat.sessionCwd。 */
       const platform = url.searchParams.get('platform') === 'wechat' ? 'wechat' : 'qq';
+      const stateDirKey = platform === 'wechat' ? 'wechatStateDir' : 'stateDir';
 
       if (req.method === 'GET') {
         const cfg = loadConfig();
@@ -4769,14 +4830,15 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, {
           platform,
           baseUrl: cfg.matrix?.baseUrl ?? '',
-          stateDir: cfg.matrix?.stateDir ?? '',
+          stateDir: cfg.matrix?.[stateDirKey] ?? '',
           deleteArchived: cfg.matrix?.deleteArchived === true,
-          sessionCwd: cfg.sessionCwd ?? '',
+          sessionCwd: platform === 'wechat' ? wx.sessionCwd ?? '' : cfg.sessionCwd ?? '',
           // 微信没单独选过就跟着全局走，不会因为漏配而变成空值
           agentPreset: (platform === 'wechat' ? wx.agentPreset : null) ?? cfg.agentPreset ?? 'qq-chat',
           workspaceTitle:
             (platform === 'wechat' ? wx.workspaceTitle : cfg.workspaceTitle) ?? '',
-          instance: ocInstance()
+          instance: ocInstance(platform),
+          instances: ocInstances().instances
         });
       }
       const body = await readBody(req);
@@ -4791,15 +4853,23 @@ const server = http.createServer(async (req, res) => {
         sessionCwd = sessionCwdInput ? path.resolve(dataRoot(), sessionCwdInput) : '';
         const sessionCwdError = validateDirectoryPath(sessionCwd, '会话工作目录');
         if (sessionCwdError) return sendJson(res, { ok: false, error: sessionCwdError });
+        // 微信实例的 opencode.json 在 `.oc/wechat`，会话目录跑出这个根就会
+        // 把根目录 QQ 的 opencode.json 也合并进来，模型/服务商串台。
+        if (platform === 'wechat' && sessionCwd) {
+          const base = path.join(dataRoot(), '.oc', 'wechat');
+          const relative = path.relative(base, sessionCwd);
+          if (relative.startsWith('..') || path.isAbsolute(relative)) {
+            return sendJson(res, { ok: false, error: '微信会话目录必须在 .oc/wechat 内（否则会读到 QQ 的配置）' });
+          }
+        }
       }
       const oldPreset = platform === 'wechat' ? cfg.platforms?.wechat?.agentPreset : cfg.agentPreset;
       cfg.matrix = {
         ...(cfg.matrix ?? {}),
         baseUrl: String(body.baseUrl ?? '').trim(),
-        stateDir,
+        [stateDirKey]: stateDir,
         deleteArchived: body.deleteArchived === true
       };
-      if ('sessionCwd' in body) cfg.sessionCwd = sessionCwd;
 
       const preset = 'agentPreset' in body ? body.agentPreset : undefined;
       const title = 'workspaceTitle' in body ? String(body.workspaceTitle ?? '').trim() : undefined;
@@ -4808,11 +4878,13 @@ const server = http.createServer(async (req, res) => {
           ...(cfg.platforms ?? {}),
           wechat: {
             ...(cfg.platforms?.wechat ?? {}),
+            ...('sessionCwd' in body ? { sessionCwd } : {}),
             ...(preset !== undefined ? { agentPreset: preset } : {}),
             ...(title !== undefined ? { workspaceTitle: title } : {})
           }
         };
       } else {
+        if ('sessionCwd' in body) cfg.sessionCwd = sessionCwd;
         if (preset !== undefined) cfg.agentPreset = preset;
         if (title !== undefined) cfg.workspaceTitle = title;
       }
@@ -4826,8 +4898,8 @@ const server = http.createServer(async (req, res) => {
 
     /* ── 模型池 ───────────────────────────────────────── */
 
-    if (p === '/api/model-pool') {
-      if (req.method === 'GET') {
+    if (p === '/api/model-pool' || p === '/api/model-pool/restore') {
+      if (p === '/api/model-pool' && req.method === 'GET') {
         const pool = loadPool();
         return sendJson(res, {
           enabled: pool.enabled !== false,
@@ -4843,31 +4915,49 @@ const server = http.createServer(async (req, res) => {
       }
 
       // 「废池」手动解除：清掉这个模型的熔断记录。
-      // 桥接内存里的熔断表不会回读这个文件，所以和「保存模型池」一样：在跑就重启桥接。
+      // 两个实例各有自己的 model-chain.json；桥接内存里的熔断表不会回读文件，
+      // 所以和「保存模型池」一样：在跑就重启对应平台的 Bot。
       if (p === '/api/model-pool/restore' && req.method === 'POST') {
         const body = await readBody(req);
         const id = String(body.id ?? '').trim();
         if (!id) return sendJson(res, { ok: false, error: '缺少模型 id' });
-        const file = chainStateFile();
-        const d = readJson(file, null);
+        const requested = url.searchParams.get('platform');
+        const platforms = requested === 'wechat' || requested === 'qq' ? [requested] : ['qq', 'wechat'];
         let removed = 0;
-        if (d && Array.isArray(d.health)) {
-          const before = d.health.length;
-          d.health = d.health.filter((e) => baseModelId(e.key) !== baseModelId(id));
-          removed = before - d.health.length;
-          if (removed > 0) writeJson(file, d);
+        for (const platform of platforms) {
+          const file = chainStateFile(platform);
+          const d = readJson(file, null);
+          if (d && Array.isArray(d.health)) {
+            const before = d.health.length;
+            d.health = d.health.filter((e) => baseModelId(e.key) !== baseModelId(id));
+            const count = before - d.health.length;
+            if (count > 0) {
+              removed += count;
+              writeJson(file, d);
+            }
+          }
         }
         let bridgeRestarted = false;
-        if (removed > 0 && bridge.child) {
-          bridgeRestarted = (await restartBridge()).ok === true;
+        let wechatRestarted = false;
+        if (removed > 0) {
+          if (bridge.child && platforms.includes('qq')) {
+            bridgeRestarted = (await restartBridge()).ok === true;
+          }
+          if (wechat.child && platforms.includes('wechat')) {
+            wechatRestarted = await restartBotsFor('wechat');
+          }
         }
         return sendJson(res, {
           ok: true,
           removed,
+          platforms,
           bridgeRestarted,
+          wechatRestarted,
           note: removed === 0
             ? '这个模型现在不在废池里（可能已经自己冷却完了）'
-            : bridgeRestarted ? '已解除，桥接已重启让模型回到队列' : '已解除，下次桥接启动时生效'
+            : (bridgeRestarted || wechatRestarted)
+              ? '已解除，正在运行的 Bot 已重启让模型回到队列'
+              : '已解除，下次 Bot 启动时生效'
         });
       }
 
@@ -4898,18 +4988,20 @@ const server = http.createServer(async (req, res) => {
 
       const regen = await regenerateConfig();
 
-      // 模型链是**桥接启动时**读进内存的，光改 opencode.json 不会换链 ——
-      // 所以要真想"保存完就生效"，得顺手把桥接重启了。没在跑就跳过。
+      // 模型链是**Bot 启动时**读进内存的，光改 opencode.json 不会换链 ——
+      // 两个平台各有一份有效模型池（自定义中转站前置），所以都要重启。
       let bridgeRestarted = false;
       if (bridge.child) {
         const started = await restartBridge();
         bridgeRestarted = started.ok === true;
       }
+      const wechatRestarted = wechat.child ? await restartBotsFor('wechat') : false;
 
       return sendJson(res, {
         ok: true,
         configRegenerated: regen.ok,
         bridgeRestarted,
+        wechatRestarted,
         lines: regen.lines.slice(-8)
       });
     }
@@ -7053,8 +7145,9 @@ async function restartBotsFor(platform) {
   try {
     if (platform === 'wechat') {
       if (wechat.child) {
-        stopWechat();
-        await new Promise((r) => setTimeout(r, 800));
+        const stopped = stopWechat();
+        // stopWechat 现在会顺带停 4601 实例；等它真停完再拉新的，避免撞端口。
+        if (stopped.done) await stopped.done;
         startWechat();
         restarted = true;
       }
@@ -7189,16 +7282,36 @@ export function shutdownServer() {
   return shutdownPromise;
 }
 
-async function stopManagedModelService() {
+async function stopManagedModelService(platform = null, options = {}) {
+  // 不传 platform = 两个实例都停；只有全停时才收共享的 cf-shim。
+  const stopShim = options.stopShim ?? platform == null;
   const previousDataRoot = process.env.QQ_BRIDGE_DATA;
   const previousStateDir = process.env.QQ_BRIDGE_STATE_DIR;
+  const previousPlatform = process.env.QQ_BRIDGE_MODEL_PLATFORM;
   process.env.QQ_BRIDGE_DATA = dataRoot();
-  process.env.QQ_BRIDGE_STATE_DIR = matrixStateDir();
+  delete process.env.QQ_BRIDGE_MODEL_PLATFORM;
+  process.env.QQ_BRIDGE_STATE_DIR = matrixStateDir('qq');
   try {
     const runtime = await import(pathToFileURL(path.join(codeRoot(), 'src', 'oc-server.js')).href);
-    return await runtime.stopServer({
-      log: (message) => pushLog(message, 'sys', 'bridge')
-    });
+    const envModule = await import(pathToFileURL(path.join(codeRoot(), 'src', 'oc-env.js')).href);
+    const log = (message) => pushLog(message, 'sys', 'bridge');
+    const platforms = platform ? [platform] : ['qq', 'wechat'];
+    const results = [];
+    for (const pf of platforms) {
+      const instance = envModule.resolveModelInstance(pf, { root: dataRoot(), useEnv: false });
+      results.push(await runtime.stopServer({ log, instance, stopShim: false }));
+    }
+    let shim = false;
+    if (stopShim) {
+      const instance = envModule.resolveModelInstance('qq', { root: dataRoot(), useEnv: false });
+      shim = await runtime.stopShimService({ log, instance });
+    }
+    if (platform) return { ...results[0], shim };
+    return {
+      server: results.some((result) => result.server === true),
+      shim,
+      instances: Object.fromEntries(platforms.map((pf, index) => [pf, results[index]]))
+    };
   } catch (error) {
     const message = `关闭模型 API 服务失败：${error?.message ?? error}`;
     pushLog(message, 'err', 'bridge');
@@ -7208,6 +7321,8 @@ async function stopManagedModelService() {
     else process.env.QQ_BRIDGE_DATA = previousDataRoot;
     if (previousStateDir === undefined) delete process.env.QQ_BRIDGE_STATE_DIR;
     else process.env.QQ_BRIDGE_STATE_DIR = previousStateDir;
+    if (previousPlatform === undefined) delete process.env.QQ_BRIDGE_MODEL_PLATFORM;
+    else process.env.QQ_BRIDGE_MODEL_PLATFORM = previousPlatform;
   }
 }
 

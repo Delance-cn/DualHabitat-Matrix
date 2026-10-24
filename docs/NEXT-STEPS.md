@@ -1,8 +1,10 @@
 # DualHabitat Matrix · 下一步计划（2026-10-23 整理）
 
 > 配套文档：[AGENT-EXTENSIONS.md](./AGENT-EXTENSIONS.md)（给 AI agent 读的扩展开发指南）。
-> 现状基线：v0.5.4 已构建（2026-10-24，安装包与隔离数据根 Electron E2E 已过；GitHub 网络当前不可达，
-> `origin` / `test` 推送和 release 待网络恢复后补）。
+> 现状基线：v0.5.5 已构建（2026-10-24，安装包与隔离数据根 Electron E2E 已过；`origin` / `test` 推送与
+> GitHub release 见发布记录）。
+> v0.5.5 = QQ / 微信双模型实例（QQ 4599 + 根目录 `opencode.json`，微信 4601 + `.oc/wechat`，
+> 共享 4600 CF shim）+ 按平台自定义中转站与有效模型池 + 运行中实例配置读回校验修复。
 > v0.5.4 = 0.5.3 的本地服务商扩展（vLLM / llama.cpp / Jan + 自定义 baseUrl）+
 > GitHub Copilot 缺陷修复批次（保存档位不互相覆盖、密钥按平台/档位隔离、模型链限制可恢复、
 > 失败回合上报、`/api/raw` 不泄露 secrets、退出时收掉模型服务、日志轮转、入站去重与按会话串行）。

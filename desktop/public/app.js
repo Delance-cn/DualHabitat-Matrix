@@ -990,13 +990,18 @@ function renderOverview() {
     ? `pid ${b.pid ?? b.externalPid} · 起于 ${fmtTime(b.startedAt)}${b.exitCode != null ? ` · 上次退出 code ${b.exitCode}` : ''}`
     : '桥接没跑，QQ 收不到也回不了';
 
-  /* 模型 API */
-  setLed('#led-matrix', m.alive ? 'on' : '');
-  $('#svc-matrix').classList.toggle('is-on', Boolean(m.alive));
-  $('#state-matrix').textContent = m.alive ? '运行中' : '未运行';
-  $('#meta-matrix').textContent = m.alive
-    ? `${m.url ?? '—'}${m.version ? ` · v${m.version}` : ''}`
-    : '桥接启动时会自己拉起它';
+  /* 模型 API：QQ / 微信各一个实例，首页分开显示 */
+  const instances = m.instances ?? { qq: m, wechat: null };
+  const qq = instances.qq ?? {};
+  const wx = instances.wechat ?? {};
+  const aliveCount = [qq, wx].filter((x) => x?.alive === true).length;
+  setLed('#led-matrix', aliveCount > 0 ? 'on' : '');
+  $('#svc-matrix').classList.toggle('is-on', aliveCount > 0);
+  $('#state-matrix').textContent =
+    aliveCount === 2 ? '两个实例都在运行' : aliveCount === 1 ? (qq.alive ? 'QQ 实例运行中' : '微信实例运行中') : '未运行';
+  const instanceLine = (label, x) =>
+    `<div>${label}：${x?.alive ? `${esc(x.url ?? '—')}${x.version ? ` · v${esc(x.version)}` : ''}` : '未运行'}</div>`;
+  $('#meta-matrix').innerHTML = instanceLine('QQ', qq) + instanceLine('微信', wx);
 
   /* 看护开关 */
   const watch = S.automation?.watch ?? {};
@@ -1619,8 +1624,8 @@ $('#btn-up').addEventListener('click', async () => {
   const ok = await confirmBox({
     title: '一键全开？',
     text: wx
-      ? '将启动微信 Bot；若桥接未运行会一并启动（模型 API 由桥接提供）。已在运行的会跳过。'
-      : '将启动 NapCat 与 QQ 桥接；微信侧不受影响，如需启动请前往「微信 → 总览」。',
+      ? '将启动微信 Bot 和它自己的模型实例（4601）。QQ 侧不受影响。已在运行的会跳过。'
+      : '将启动 NapCat 与 QQ 桥接（模型实例 4599）；微信侧不受影响，如需启动请前往「微信 → 总览」。',
     okLabel: '开'
   });
   if (!ok) return;
@@ -1636,8 +1641,8 @@ $('#btn-down').addEventListener('click', async () => {
   const ok = await confirmBox({
     title: wx ? '停止微信 Bot？' : '全部停止？',
     text: wx
-      ? '仅停止微信 Bot，QQ 侧不受影响；若已开启看护，手动停止不会被立即重新拉起。'
-      : '将停止 NapCat 与 QQ 桥接；若微信 Bot 正在运行，其使用的模型 API 也会随之中断。',
+      ? '仅停止微信 Bot 和它的 4601 模型实例，QQ 侧不受影响；若已开启看护，手动停止不会被立即重新拉起。'
+      : '将停止 NapCat、QQ 桥接和 4599 模型实例；微信 Bot 和 4601 实例不受影响。',
     okLabel: wx ? '停' : '全停',
     danger: true
   });
@@ -2579,14 +2584,30 @@ $$('#type-grid .type-card').forEach((c) => {
   c.addEventListener('click', () => selectType(c.dataset.type, { fromClick: true }));
 });
 
-function renderMatrixInfo(m) {
-  const rows = [
-    ['实例状态', m?.alive ? '运行中' : '未运行'],
-    ['地址', m?.url ?? '—'],
-    ['进程号', m?.pid ?? '—'],
-    ['版本', m?.version ?? '—'],
-    ['运行数据', m?.file ?? '—']
-  ];
+function describeInstance(x) {
+  if (!x?.alive) return '未运行';
+  return `${x.url ?? '—'}${x.port ? ` · 端口 ${x.port}` : ''}${x.pid ? ` · pid ${x.pid}` : ''}${x.version ? ` · v${x.version}` : ''}`;
+}
+
+function renderMatrixInfo(m, instances = null) {
+  const qq = instances?.qq ?? (m?.platform === 'qq' ? m : null);
+  const wx = instances?.wechat ?? (m?.platform === 'wechat' ? m : null);
+  const rows = instances
+    ? [
+        ['QQ 实例', describeInstance(qq)],
+        ['微信实例', describeInstance(wx)],
+        ['当前实例地址', m?.url ?? '—'],
+        ['当前实例进程号', m?.pid ?? '—'],
+        ['当前实例版本', m?.version ?? '—'],
+        ['运行数据', m?.file ?? '—']
+      ]
+    : [
+        ['实例状态', m?.alive ? '运行中' : '未运行'],
+        ['地址', m?.url ?? '—'],
+        ['进程号', m?.pid ?? '—'],
+        ['版本', m?.version ?? '—'],
+        ['运行数据', m?.file ?? '—']
+      ];
   // 路径里带引擎自己的目录名，界面上不能露出来 —— 统一过一遍翻译层
   $('#oc-info').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(plainify(v))}</dd>`).join('');
 }
@@ -2600,7 +2621,7 @@ async function loadMatrix() {
   $('#ocDeleteArchived').checked = r.deleteArchived === true;
   $('#agentPreset').value = r.agentPreset ?? 'qq-chat';
   $('#workspaceTitle').value = r.workspaceTitle ?? '';
-  renderMatrixInfo(r.instance);
+  renderMatrixInfo(r.instance, r.instances);
 }
 
 $('#btn-save-oc').addEventListener('click', async (e) => {
@@ -2809,7 +2830,8 @@ async function loadBackend() {
   if (!S) await refreshState();
   const type = S?.backend?.type === 'model-api' ? 'model-api' : S?.backend?.type === 'cli' ? 'cli' : S?.backend?.type === 'ui' ? 'ui' : 'matrix';
   selectType(type);
-  renderMatrixInfo(S?.matrix);
+  const matrixState = S?.matrix ?? {};
+  renderMatrixInfo(matrixState.instances?.[platform()] ?? matrixState, matrixState.instances ?? null);
   renderModelApiSummary();
   renderCliDrivers();
 

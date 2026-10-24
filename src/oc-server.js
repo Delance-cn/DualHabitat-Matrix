@@ -25,17 +25,12 @@ import { Service } from '@opencode/client/service';
 import { appendRotatedLogFile, rotateLogFile } from './log-rotate.js';
 
 import {
-  CONFIG_FILE,
-  PATHS,
-  PORT,
-  SERVICE_FILE,
-  SHIM_BASE_URL,
-  SHIM_PORT,
   isolatedEnv,
   loadSecrets,
   probeProxy,
   proxyUrl,
-  resolveCli
+  resolveCli,
+  resolveModelInstance
 } from './oc-env.js';
 import { shimAlive } from './cf-shim.js';
 import { loadModelPool, poolUsesProvider } from './model-pool.js';
@@ -47,7 +42,6 @@ const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REGISTER_TIMEOUT_MS = 30_000;
 /** 等 shim 起来的最长时间。 */
 const SHIM_TIMEOUT_MS = 8_000;
-const SECRETS_FINGERPRINT_FILE = path.join(PATHS.state, 'service-secrets.sha256');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -63,7 +57,7 @@ export function secretsNeedReload(launchedFingerprint, currentFingerprint) {
   return launchedFingerprint !== currentFingerprint;
 }
 
-function readSecretsFingerprint(file = SECRETS_FINGERPRINT_FILE) {
+function readSecretsFingerprint(file) {
   try {
     return fs.readFileSync(file, 'utf8').trim() || null;
   } catch {
@@ -71,7 +65,7 @@ function readSecretsFingerprint(file = SECRETS_FINGERPRINT_FILE) {
   }
 }
 
-function writeSecretsFingerprint(fingerprint, file = SECRETS_FINGERPRINT_FILE) {
+function writeSecretsFingerprint(fingerprint, file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, `${fingerprint}\n`, 'utf8');
@@ -90,7 +84,7 @@ export function pidAlive(pid) {
 }
 
 /** 读注册文件（不存在/坏了都返回 null，不抛）。 */
-export function readServiceFile(file = SERVICE_FILE) {
+export function readServiceFile(file = resolveModelInstance().serviceFile) {
   try {
     if (!fs.existsSync(file)) return null;
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -105,8 +99,9 @@ export function readServiceFile(file = SERVICE_FILE) {
  *
  * @returns {Promise<{ running: boolean, url?: string, pid?: number, version?: string, endpoint?: object, reason: string }>}
  */
-export async function serverStatus({ serviceFile = SERVICE_FILE } = {}) {
-  const record = readServiceFile(serviceFile);
+export async function serverStatus({ serviceFile, instance } = {}) {
+  const file = serviceFile ?? instance?.serviceFile ?? resolveModelInstance().serviceFile;
+  const record = readServiceFile(file);
   if (!record) return { running: false, reason: '还没有注册文件（实例从没起来过）' };
   if (!record.url) return { running: false, reason: '注册文件里没有 url' };
   if (!pidAlive(Number(record.pid))) {
@@ -114,7 +109,7 @@ export async function serverStatus({ serviceFile = SERVICE_FILE } = {}) {
   }
   // 进程活着不代表服务能应答（可能正在启动/半死）。真答一次才算数。
   try {
-    const endpoint = await Service.discover({ file: serviceFile });
+    const endpoint = await Service.discover({ file });
     if (!endpoint?.url) return { running: false, reason: 'Service.discover 没给出 url' };
     const client = Sdk.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) });
     const info = await client.server.info();
@@ -199,85 +194,88 @@ function readPidFile(file) {
  * 只在**模型池里真有 CF 模型**时才起 —— 少一个进程就少一个故障点，
  * 而且这个判断和"要不要把 CF 写进链里"是同一个判断，不会出现"起了没用"。
  */
-async function ensureShim({ pool, log }) {
+async function ensureShim({ pool, log, instance }) {
+  const active = instance ?? resolveModelInstance();
+  const shim = active.shim;
   if (!poolUsesProvider(pool, 'cloudflare-workers-ai')) {
-    return { needed: false, started: false, port: SHIM_PORT };
+    return { needed: false, started: false, port: shim.port };
   }
 
   // 池子里有 CF，但 opencode.json 的 CF baseURL 没指到 shim 上的话，
   // CF 那条链注定每次失败。这不是致命错误（链会自动熔断跳过去），
   // 但一定要吼出来，否则会变成"CF 明明配了却从来没用上"。
-  checkCfWiring(log);
+  checkCfWiring(log, active);
 
-  if (await shimAlive(SHIM_PORT)) {
-    log(`cf-shim 已在运行（${SHIM_BASE_URL}）`);
-    return { needed: true, started: false, port: SHIM_PORT, ready: true };
+  if (await shimAlive(shim.port)) {
+    log(`cf-shim 已在运行（${shim.baseUrl}）`);
+    return { needed: true, started: false, port: shim.port, ready: true };
   }
 
   // 端口被占着、但健康检查不过 —— 真机踩过：那是**旧版本**的 shim
   // （没有 /health 路由）。这时闷头再起一个只会 `EADDRINUSE` 崩掉，
   // 而且崩得很快，看起来像"shim 起了但没生效"，很难查。
-  if (await portInUse(SHIM_PORT)) {
-    const stalePid = readPidFile(PATHS.shimPid);
+  if (await portInUse(shim.port)) {
+    const stalePid = readPidFile(shim.pidFile);
     if (pidAlive(stalePid)) {
-      log(`端口 ${SHIM_PORT} 被旧 shim 占着（pid=${stalePid}，健康检查不过），先收掉它`);
+      log(`端口 ${shim.port} 被旧 shim 占着（pid=${stalePid}，健康检查不过），先收掉它`);
       try {
         process.kill(stalePid);
         const deadline = Date.now() + 5000;
-        while ((await portInUse(SHIM_PORT, 300)) && Date.now() < deadline) await sleep(200);
+        while ((await portInUse(shim.port, 300)) && Date.now() < deadline) await sleep(200);
       } catch (error) {
         log(`收掉旧 shim 失败：${error?.message ?? error}`);
       }
     }
-    if (await portInUse(SHIM_PORT)) {
+    if (await portInUse(shim.port)) {
       log(
-        `⚠️ 端口 ${SHIM_PORT} 被别的进程占着，而且不是我们认识的 cf-shim（健康检查不过）。` +
+        `⚠️ 端口 ${shim.port} 被别的进程占着，而且不是我们认识的 cf-shim（健康检查不过）。` +
           `CF 候选这轮会失败（链会自动跳到下一个）。请先结束占用该端口的进程，或改 SHIM_PORT。`
       );
-      return { needed: true, started: false, port: SHIM_PORT, ready: false, blocked: true };
+      return { needed: true, started: false, port: shim.port, ready: false, blocked: true };
     }
   }
 
-  fs.mkdirSync(PATHS.logs, { recursive: true });
-  const out = fs.openSync(path.join(PATHS.logs, 'cf-shim.out.log'), 'a');
-  const err = fs.openSync(path.join(PATHS.logs, 'cf-shim.err.log'), 'a');
+  fs.mkdirSync(active.paths.logs, { recursive: true });
+  const out = fs.openSync(path.join(active.paths.logs, 'cf-shim.out.log'), 'a');
+  const err = fs.openSync(path.join(active.paths.logs, 'cf-shim.err.log'), 'a');
   const child = spawn(process.execPath, [path.join(SRC_DIR, 'cf-shim-main.js')], {
-    cwd: path.dirname(CONFIG_FILE),
-    env: { ...process.env, QQ_BRIDGE_SHIM_PORT: String(SHIM_PORT), QQ_BRIDGE_SHIM_LOG: PATHS.shimLog },
+    cwd: active.configDir,
+    env: { ...process.env, QQ_BRIDGE_SHIM_PORT: String(shim.port), QQ_BRIDGE_SHIM_LOG: shim.logFile },
     detached: true,
     windowsHide: true,
     stdio: ['ignore', out, err]
   });
   child.unref();
-  fs.mkdirSync(path.dirname(PATHS.shimPid), { recursive: true });
-  fs.writeFileSync(PATHS.shimPid, String(child.pid));
+  fs.mkdirSync(path.dirname(shim.pidFile), { recursive: true });
+  fs.writeFileSync(shim.pidFile, String(child.pid));
   log(`cf-shim 已启动 pid=${child.pid}（模型池里有 CF 模型才起）`);
 
   const deadline = Date.now() + SHIM_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (await shimAlive(SHIM_PORT)) return { needed: true, started: true, port: SHIM_PORT, pid: child.pid, ready: true };
+    if (await shimAlive(shim.port)) return { needed: true, started: true, port: shim.port, pid: child.pid, ready: true };
     await sleep(200);
   }
   log(
     `⚠️ cf-shim ${SHIM_TIMEOUT_MS}ms 内没应答（pid=${child.pid}）。看日志：` +
-      `${path.join(PATHS.logs, 'cf-shim.err.log')}`
+      `${path.join(active.paths.logs, 'cf-shim.err.log')}`
   );
-  return { needed: true, started: true, port: SHIM_PORT, pid: child.pid, ready: false };
+  return { needed: true, started: true, port: shim.port, pid: child.pid, ready: false };
 }
 
 /**
- * 读模型 API 的配置文件（CONFIG_FILE），确认 CF 的 baseURL 指到了 shim。
+ * 读模型 API 的配置文件，确认 CF 的 baseURL 指到了 shim。
  * 只告警，不拦。
  */
-function checkCfWiring(log) {
+function checkCfWiring(log, instance) {
+  const active = instance ?? resolveModelInstance();
   try {
-    if (!fs.existsSync(CONFIG_FILE)) return;
-    const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    if (!fs.existsSync(active.configFile)) return;
+    const config = JSON.parse(fs.readFileSync(active.configFile, 'utf8'));
     const base = config?.provider?.['cloudflare-workers-ai']?.options?.baseURL;
-    if (base !== SHIM_BASE_URL) {
+    if (base !== active.shim.baseUrl) {
       log(
         `⚠️ 模型池里有 CF 模型，但配置文件里 cloudflare-workers-ai 的 baseURL ` +
-          `不是 ${SHIM_BASE_URL}（当前：${base ?? '未设置'}）—— CF 候选会一直失败。` +
+          `不是 ${active.shim.baseUrl}（当前：${base ?? '未设置'}）—— CF 候选会一直失败。` +
           `这一步由配置生成器（②）负责写入。`
       );
     }
@@ -298,7 +296,8 @@ function checkCfWiring(log) {
  */
 export async function ensureServer(options = {}) {
   const log = options.log ?? ((m) => console.log(m));
-  const port = options.port ?? PORT;
+  const instance = options.instance ?? resolveModelInstance();
+  const port = options.port ?? instance.port;
   let currentSecretsFingerprint = null;
   let secretsLoadError = null;
   try {
@@ -309,26 +308,26 @@ export async function ensureServer(options = {}) {
 
   if (options.force) {
     log('force=true，先停掉现有实例');
-    await stopServer({ log });
+    await stopServer({ log, instance, stopShim: false });
   } else {
-    const status = await serverStatus();
+    const status = await serverStatus({ instance });
     if (status.running) {
       if (secretsLoadError) {
         log(`⚠️ 无法读取密钥配置，保留当前运行实例：${secretsLoadError?.message ?? secretsLoadError}`);
         const pool = options.pool ?? loadModelPool().pool;
         const shim = options.withShim === false
           ? { needed: false, started: false }
-          : await ensureShim({ pool, log });
+          : await ensureShim({ pool, log, instance });
         return { started: false, url: status.url, pid: status.pid, version: status.version, endpoint: status.endpoint, shim };
-      } else if (secretsNeedReload(readSecretsFingerprint(), currentSecretsFingerprint)) {
+      } else if (secretsNeedReload(readSecretsFingerprint(instance.secretsFingerprintFile), currentSecretsFingerprint)) {
         log('检测到已保存的 API 密钥与运行实例环境不一致，重启模型 API 服务以应用密钥');
-        await stopServer({ log });
+        await stopServer({ log, instance, stopShim: false });
       } else {
         log(`模型 API 服务已在运行（pid=${status.pid} version=${status.version}）`);
         const pool = options.pool ?? loadModelPool().pool;
         const shim = options.withShim === false
           ? { needed: false, started: false }
-          : await ensureShim({ pool, log });
+          : await ensureShim({ pool, log, instance });
         return { started: false, url: status.url, pid: status.pid, version: status.version, endpoint: status.endpoint, shim };
       }
     }
@@ -343,12 +342,12 @@ export async function ensureServer(options = {}) {
   const proxy = await resolveProxy(log);
   const pool = options.pool ?? loadModelPool().pool;
   const shim =
-    options.withShim === false ? { needed: false, started: false } : await ensureShim({ pool, log });
+    options.withShim === false ? { needed: false, started: false } : await ensureShim({ pool, log, instance });
 
   const cli = resolveCli();
-  fs.mkdirSync(PATHS.logs, { recursive: true });
-  const outFile = path.join(PATHS.logs, 'server.out.log');
-  const errFile = path.join(PATHS.logs, 'server.err.log');
+  fs.mkdirSync(instance.paths.logs, { recursive: true });
+  const outFile = path.join(instance.paths.logs, 'server.out.log');
+  const errFile = path.join(instance.paths.logs, 'server.err.log');
   rotateLogFile(outFile);
   rotateLogFile(errFile);
   // --service 是必须的：只有这个模式才会把 { url, pid, password } 写进
@@ -360,8 +359,8 @@ export async function ensureServer(options = {}) {
       cli,
       ['serve', '--service', '--hostname', '127.0.0.1', '--port', String(port)],
       {
-        cwd: path.dirname(CONFIG_FILE),
-        env: isolatedEnv({ proxy }),
+        cwd: instance.configDir,
+        env: isolatedEnv({ proxy, instance }),
         detached: true,
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe']
@@ -390,12 +389,12 @@ export async function ensureServer(options = {}) {
   const deadline = Date.now() + REGISTER_TIMEOUT_MS;
   let lastReason = '没等到注册文件';
   while (Date.now() < deadline) {
-    const record = readServiceFile();
+    const record = readServiceFile(instance.serviceFile);
     // 必须是**这个** pid 写的，不然会读到上一次残留的注册文件
     if (record && Number(record.pid) === child.pid && record.url) {
-      const status = await serverStatus();
+      const status = await serverStatus({ instance });
       if (status.running) {
-        writeSecretsFingerprint(launchedSecretsFingerprint);
+        writeSecretsFingerprint(launchedSecretsFingerprint, instance.secretsFingerprintFile);
         log(`实例就绪：${status.url} version=${status.version} pid=${status.pid}`);
         return { started: true, url: status.url, pid: status.pid, version: status.version, endpoint: status.endpoint, shim };
       }
@@ -405,64 +404,77 @@ export async function ensureServer(options = {}) {
     }
     if (!pidAlive(child.pid)) {
       throw new Error(
-        `模型 API 服务启动后立刻退出（pid=${child.pid}）。看日志：${path.join(PATHS.logs, 'server.err.log')}`
+        `模型 API 服务启动后立刻退出（pid=${child.pid}）。看日志：${path.join(instance.paths.logs, 'server.err.log')}`
       );
     }
     await sleep(250);
   }
   throw new Error(
     `等 模型 API 实例就绪超时（${REGISTER_TIMEOUT_MS}ms，最后状态：${lastReason}）。` +
-      `日志：${path.join(PATHS.logs, 'server.out.log')}`
+      `日志：${path.join(instance.paths.logs, 'server.out.log')}`
   );
 }
 
 /**
- * 停掉实例（以及由我们拉起的 cf-shim）。
+ * 停掉实例（默认连同由我们拉起的 cf-shim）。
  *
  * 只停**注册文件里记着的那个 pid** —— 不按端口杀进程，避免误杀用户桌面端的实例。
+ * 两个平台共用同一个 cf-shim，所以单独停 QQ/微信时传 `stopShim: false`，
+ * 只在最后一个实例退出时再收 shim。
  */
-export async function stopServer({ log = (m) => console.log(m) } = {}) {
+export async function stopServer({ log = (m) => console.log(m), instance, stopShim = true } = {}) {
+  const active = instance ?? resolveModelInstance();
   const result = { server: false, shim: false };
 
-  const record = readServiceFile();
+  const record = readServiceFile(active.serviceFile);
   const pid = Number(record?.pid);
   if (pidAlive(pid)) {
     try {
       process.kill(pid);
       result.server = true;
-      log(`已停模型 API 服务 pid=${pid}`);
+      log(`已停模型 API 服务 pid=${pid}（${active.label}）`);
       // 等它真的退出，否则紧接着重启会撞端口
       const deadline = Date.now() + 10_000;
       while (pidAlive(pid) && Date.now() < deadline) await sleep(200);
-      if (pidAlive(pid)) log(`⚠️ pid=${pid} 10 秒内没退出，可能还占着 ${PORT}`);
+      if (pidAlive(pid)) log(`⚠️ pid=${pid} 10 秒内没退出，可能还占着 ${active.port}`);
     } catch (error) {
       log(`停 pid=${pid} 失败：${error?.message ?? error}`);
     }
   } else {
-    log('没有在跑的模型 API 服务（运行数据缺失或进程已不在）');
+    log(`没有在跑的模型 API 服务（${active.label}，运行数据缺失或进程已不在）`);
   }
 
-  const shimPid = readPidFile(PATHS.shimPid);
-  if (pidAlive(shimPid)) {
-    try {
-      process.kill(shimPid);
-      result.shim = true;
-      log(`已停 cf-shim pid=${shimPid}`);
-      const deadline = Date.now() + 5000;
-      while ((await portInUse(SHIM_PORT, 300)) && Date.now() < deadline) await sleep(200);
-    } catch (error) {
-      log(`停 cf-shim pid=${shimPid} 失败：${error?.message ?? error}`);
-    }
-  } else if (await shimAlive(SHIM_PORT)) {
-    // 在跑但不是我们记的 pid（比如是从上一版手工起的）。至少要说清楚，
-    // 不然会出现"shim 还在转发、但我们以为已经停了"这种鬼状态。
-    log(`⚠️ cf-shim 还在 ${SHIM_PORT} 上应答，但 ${PATHS.shimPid} 里的 pid 无效，无法安全地停它`);
-  }
+  if (stopShim) result.shim = await stopShimService({ log, instance: active });
   // 注册文件留着没意义，删掉能避免"看着像在跑"的误判
   try {
-    fs.rmSync(SERVICE_FILE, { force: true });
+    fs.rmSync(active.serviceFile, { force: true });
   } catch {
     /* 删不掉也无妨，pidAlive 会拦住 */
   }
   return result;
+}
+
+/** 单独停 cf-shim（两个实例共用；只在全部实例都停了以后调用）。 */
+export async function stopShimService({ log = (m) => console.log(m), instance } = {}) {
+  const active = instance ?? resolveModelInstance();
+  const shim = active.shim;
+  const shimPid = readPidFile(shim.pidFile);
+  if (pidAlive(shimPid)) {
+    try {
+      process.kill(shimPid);
+      log(`已停 cf-shim pid=${shimPid}`);
+      const deadline = Date.now() + 5000;
+      while ((await portInUse(shim.port, 300)) && Date.now() < deadline) await sleep(200);
+      return true;
+    } catch (error) {
+      log(`停 cf-shim pid=${shimPid} 失败：${error?.message ?? error}`);
+      return false;
+    }
+  }
+  if (await shimAlive(shim.port)) {
+    // 在跑但不是我们记的 pid（比如是从上一版手工起的）。至少要说清楚，
+    // 不然会出现"shim 还在转发、但我们以为已经停了"这种鬼状态。
+    log(`⚠️ cf-shim 还在 ${shim.port} 上应答，但 ${shim.pidFile} 里的 pid 无效，无法安全地停它`);
+  }
+  return false;
 }

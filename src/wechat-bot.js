@@ -33,6 +33,9 @@ import {
   createTurnCollector
 } from './oc-client.js';
 import { ensureServer } from './oc-server.js';
+import { effectiveModelPool, readSlotProfiles, sessionWorkdir } from './oc-config.js';
+import { loadModelPool } from './model-pool.js';
+import { resolveModelInstance } from './oc-env.js';
 import { runLocalCommand, loadPlugins } from './chat-commands.js';
 import { appendMemory } from './memory-daily.js';
 import { resolveDataRoot } from './data-root.js';
@@ -41,6 +44,9 @@ import { emitEvent } from './events-out.js';
 /** 代码根 / 数据根：登录态与配置跟着数据走（打包态由桌面端注入 QQ_BRIDGE_DATA）。 */
 const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ROOT = resolveDataRoot(CODE_ROOT);
+// 微信模型实例（端口 4601 / `.oc/wechat`）和微信 Bot 自己的登录态（ROOT/state）
+// 是两套目录：拆实例不会动 wechat-token.json / wechat-sessions.json。
+const MODEL_INSTANCE = resolveModelInstance('wechat');
 const STATE_DIR = path.join(ROOT, 'state');
 const TOKEN_FILE = path.join(STATE_DIR, 'wechat-token.json');
 const SESS_FILE = path.join(STATE_DIR, 'wechat-sessions.json');
@@ -351,8 +357,7 @@ const userQueues = new Map();     // 微信用户 id → Promise（同一用户�
  */
 async function ensureAi() {
   if (aiReady && api) {
-    const cfg = readConfig();
-    const endpoint = await discoverMatrixEndpoint({ stateDir: cfg.matrix?.stateDir || '' });
+    const endpoint = await discoverMatrixEndpoint({ stateDir: MODEL_INSTANCE.stateDir });
     if (endpoint?.url === apiUrl) return;
     log(endpoint ? '模型 API 地址变了，重新连' : '模型 API 不在了，等它回来');
     aiReady = false;
@@ -364,15 +369,15 @@ async function ensureAi() {
 
 async function initAi() {
   const cfg = readConfig();
-  const stateDir = cfg.matrix?.stateDir || '';
+  const stateDir = MODEL_INSTANCE.stateDir;
   let endpoint = await discoverMatrixEndpoint({ stateDir });
   if (!endpoint) {
     // 微信-only 用户没人拉模型 API（它原本只由 QQ 桥接顺手拉起）——
-    // 这里自己幂等拉起：在跑就复用，没跑就 spawn 并等注册文件。
+    // 这里自己幂等拉起微信自己的 4601 实例：在跑就复用，没跑就 spawn。
     // 首次启动要等 opencode serve 就绪（十来秒），期间的消息会重试。
-    log('模型 API 不在，微信 Bot 自己拉一个（首次要等十几秒）…');
+    log('微信模型 API 不在，微信 Bot 自己拉一个（首次要等十几秒）…');
     try {
-      await ensureServer({ log });
+      await ensureServer({ log, instance: MODEL_INSTANCE });
       endpoint = await discoverMatrixEndpoint({ stateDir });
     } catch (error) {
       log(`模型 API 自启失败：${error?.message ?? error}`);
@@ -383,16 +388,21 @@ async function initAi() {
   // 裸 SDK 只有 session/event/provider，没有 workspace.* / sessions.* /
   // events.mux —— 微信这条线一上来就调 workspace.create，直接 TypeError。
   // 不传 baseUrl 是刻意的：让门面自己按注册文件发现（那里才有鉴权密码）。
+  const models = effectiveModelPool(loadModelPool().pool, readSlotProfiles('wechat'), 'wechat');
   api = new NodeApiClient(cfg.matrix?.baseUrl || undefined, undefined, {
     stateDir,
     sessionDir: stateDir,
     deleteArchived: cfg.matrix?.deleteArchived === true,
+    models,
     log
   });
   apiUrl = endpoint.url;
   log(`模型 API：${endpoint.url}`);
 
-  const dir = wxConfig().sessionCwd || path.join(STATE_DIR, 'wechat', 'agents');
+  // 微信的会话目录必须和它自己的 opencode.json 在一起（`.oc/wechat`），
+  // 否则引擎会把根目录 QQ 的 opencode.json 合并进来。用户配的子目录只接受
+  // `.oc/wechat` 内的路径，由 sessionWorkdir 统一判断。
+  const dir = sessionWorkdir('wechat', MODEL_INSTANCE);
   fs.mkdirSync(dir, { recursive: true });
   const ws = unwrap(await api.workspace.create({ path: dir }), 'workspace.create');
   workspaceId = ws.workspace.workspaceId;

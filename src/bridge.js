@@ -24,7 +24,9 @@ import { createInboundDeduper } from './inbound-dedupe.js';
 import { createKeyedSerialQueue } from './keyed-serial-queue.js';
 import { createBackend, TYPE_LABELS } from './backends/index.js';
 import { ensureServer, serverStatus } from './oc-server.js';
-import { PATHS } from './oc-env.js';
+import { PATHS, resolveModelInstance } from './oc-env.js';
+import { effectiveModelPool, readSlotProfiles } from './oc-config.js';
+import { loadModelPool } from './model-pool.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
@@ -2518,7 +2520,8 @@ async function main() {
   // 所以连接前必须先确保它在跑（幂等：已在跑就复用，不在才拉起），否则客户端
   // 会发现注册文件里的 pid 已经死了、抛"找不到实例"。这一步放在建客户端之前，
   // 保证拿到客户端就能直接用。
-  const stateDir = cfg.matrix.stateDir || PATHS.state;
+  const modelInstance = resolveModelInstance('qq');
+  const stateDir = modelInstance.stateDir;
 
   // 后端选择：config.json 配了 backend 段就走适配器（直连模型 / CLI agent），
   // 不配就维持原样（模型 API 隔离实例）。两条路的门面形状完全一致，
@@ -2542,7 +2545,10 @@ async function main() {
     api = adapterApi;
     log(`后端：${TYPE_LABELS[cfg.backend.type] ?? cfg.backend.type} —— 跳过独立运行环境`);
   } else {
-    await ensureServer({ log });
+    await ensureServer({ log, instance: modelInstance });
+    // 每个平台的自定义中转站要真正进模型链：池子里没有 relay 条目时，
+    // oc-client 会把会话模型换回池子里的模型，配置里的 agent.model 等于白写。
+    const models = effectiveModelPool(loadModelPool().pool, readSlotProfiles('qq'), 'qq');
     api = new NodeApiClient(cfg.matrix.baseUrl || undefined, undefined, {
       // 注册文件（url + 密码）就在隔离 state 目录里；不传 baseUrl 即走发现。
       stateDir,
@@ -2552,6 +2558,7 @@ async function main() {
       modelDirectory: path.resolve(cfg.sessionCwd ? String(cfg.sessionCwd) : path.join(STATE_DIR, 'agents')),
       // true 时 archiveSession 真的删会话；默认只 interrupt，怕丢历史账。
       deleteArchived: cfg.matrix.deleteArchived === true,
+      models,
       log
     });
   }
@@ -11967,13 +11974,13 @@ async function main() {
         // 空转刷"Transport: fetch failed"。所以断流时先探活：真死了就地重拉，
         // 并丢弃缓存的客户端（新实例的注册文件会换 pid/密码）。
         try {
-          const status = await serverStatus();
+          const status = await serverStatus({ instance: modelInstance });
           if (!status.running) {
             // 节流：重拉失败时（CLI 没了、端口被占等）最多每 30 秒试一次，别刷屏。
             if (Date.now() - lastInstanceReviveAt >= 30_000) {
               lastInstanceReviveAt = Date.now();
               log(`模型 API 服务不在运行（${status.reason}），自动重拉…`);
-              await ensureServer({ log });
+              await ensureServer({ log, instance: modelInstance });
               api.invalidate();
               log('模型 API 服务已重拉，事件流将自动重连');
             }

@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
 import { OpenCode } from '@opencode/client';
 import { Service } from '@opencode/client/service';
-import { CODE_ROOT, CONFIG_FILE, PATHS, ROOT, SHIM_BASE_URL } from './oc-env.js';
+import { CODE_ROOT, MODEL_PLATFORMS, ROOT, SHIM_BASE_URL, resolveModelInstance } from './oc-env.js';
 import { loadModelPool } from './model-pool.js';
 
 // agent 预置随包分发，属于代码不是数据 —— 必须跟代码根走，
@@ -45,8 +45,24 @@ export const SESSION_WORKDIR = path.join(ROOT, 'state', 'agents');
  * 目录向上找 `opencode.json`）；没配才回落到 `state/agents`。人设里写错这个路径会
  * 让主人档的模型去操作围栏外的路径（然后被 read 拒绝，白跑一轮）。
  */
-export function sessionWorkdir() {
+export function sessionWorkdir(platform = 'qq', instance = null) {
   const bridgeCfg = readJsonSafe(path.join(ROOT, 'config.json'), {});
+  if (platform === 'wechat') {
+    // 微信实例的配置文件在 `.oc/wechat/opencode.json`。引擎会从会话目录读项目
+    // 配置，所以默认就把会话目录放在同一个目录里，避免把根目录 QQ 的
+    // `opencode.json` 合并进来。用户配了子目录时也只接受 `.oc/wechat` 内的路径。
+    const base = instance?.configDir ?? path.join(ROOT, '.oc', 'wechat');
+    const wx = bridgeCfg?.platforms?.wechat ?? {};
+    const dir = typeof wx.sessionCwd === 'string' ? wx.sessionCwd.trim() : '';
+    if (dir) {
+      const resolved = path.isAbsolute(dir) ? path.resolve(dir) : path.resolve(ROOT, dir);
+      const relative = path.relative(base, resolved);
+      if (relative && !relative.startsWith('..') && !path.isAbsolute(relative) && fs.existsSync(resolved)) {
+        return resolved;
+      }
+    }
+    return base;
+  }
   const dir = typeof bridgeCfg.sessionCwd === 'string' ? bridgeCfg.sessionCwd.trim() : '';
   if (dir && fs.existsSync(dir)) return path.resolve(dir);
   return SESSION_WORKDIR;
@@ -158,10 +174,11 @@ function chatOnlyPersona() {
  * 权限"这些硬规则，改掉第一句也压不住 —— 实测模型会照着它拒绝干活（spike/probe-perms
  * 第 3 组：给了 read 权限，模型照样回"我不能读取本地文件"）。所以这里整份重写。
  */
-export function buildWorkPersona({ model, cwd, roleName, agentTools = false, sandboxRoot = '' }) {
+export function buildWorkPersona({ model, cwd, roleName, agentTools = false, sandboxRoot = '', platform = 'qq' }) {
   const who = roleName
     ? `你是「${roleName}」，一个**能真正干活**的编码 / 运维助理`
     : '你是一个**能真正干活**的编码 / 运维助理';
+  const channel = platform === 'wechat' ? '微信私聊' : 'QQ 私聊';
   const sandboxLine = agentTools
     ? `
 - 另有一组受控工具（agent-tools）：list_directory / read_file / write_file / execute_command / search_files。
@@ -169,15 +186,17 @@ export function buildWorkPersona({ model, cwd, roleName, agentTools = false, san
   符号链接绕行都会被拒）；execute_command 默认 30 秒超时，rm -rf / del /f /s /q / format /
   shutdown / git clean 等危险命令直接拒绝。优先用这组工具干活。`
     : '';
-  return `${who}，通过 QQ 私聊为管理员（owner）服务。
+  const qqToolsLine = platform === 'qq'
+    ? '\n- 你也能用 snowluma_qq_* 工具查/发 QQ 消息，但**只在管理员明确要求时**才发。'
+    : '';
+  return `${who}，通过${channel}为管理员（owner）服务。
 
 【你的能力】
 - 你能读写文件、搜索代码、执行命令。可用工具：read / write / edit / grep / glob / shell。${sandboxLine}
-- 文件操作被限制在会话工作目录：${cwd}
-- 你也能用 snowluma_qq_* 工具查/发 QQ 消息，但**只在管理员明确要求时**才发。
+- 文件操作被限制在会话工作目录：${cwd}${qqToolsLine}
 
 【怎么回话】
-- 对方在 QQ 私聊里看纯文本：不要输出 Markdown 表格，代码超过十行就说改了哪个文件、别整段贴。
+- 对方在${channel}里看纯文本：不要输出 Markdown 表格，代码超过十行就说改了哪个文件、别整段贴。
 - 先给结论，别复述推理过程。
 - 正常回复直接写正文即可（回合文本会自动转给管理员）。
 
@@ -254,13 +273,14 @@ export function readPresetPersona(presetId) {
  * 模型 API 的 `agents.<id>.system` 是静态字符串，只能生成时替换一次。
  * 模型会换（候选链），所以这里写"当前首选"，并在文字上避免让模型把模型名当事实。
  */
-export function renderPersona({ prefix, suffix }, { model, cwd }) {
+export function renderPersona({ prefix, suffix }, { model, cwd, platform = 'qq' }) {
+  const where = platform === 'wechat' ? 'WeChat' : 'QQ';
   return `${prefix}\n${suffix}`
     .replaceAll('{{model}}', model)
     .replaceAll('{{cwd}}', cwd)
     // 第一行原文是 "You are a coding agent powered by the X model."。
     // QQ 聊天档零工具，自称 coding agent 会让它尝试干本地活（然后编造结果）。
-    .replace(/^You are a coding agent powered by the .*? model\./m, `You are an AI assistant powered by the ${model} model, chatting with people on QQ.`)
+    .replace(/^You are a coding agent powered by the .*? model\./m, `You are an AI assistant powered by the ${model} model, chatting with people on ${where}.`)
     .trim();
 }
 
@@ -298,6 +318,7 @@ export function readSlotProfiles(platform = 'qq') {
       provider: id,
       model,
       baseUrl,
+      protocol: String(v.protocol ?? '').trim(),
       apiKeyEnv: String(v.apiKeyEnv ?? '').trim()
     };
   };
@@ -406,6 +427,66 @@ function slotProviderId(s) {
   return raw;
 }
 
+/**
+ * 一档 profile 最终走哪种端点。buildConfig 和有效模型池共用这一份判断，
+ * 避免“配置里写了 relay、模型链却还在用池子”这种半生效状态。
+ */
+function slotEndpointPlan(s, platform, slot) {
+  const rawProvider = String(s?.provider ?? '').trim();
+  const providerId = PROVIDER_ALIASES[slotProviderId(s)] ?? slotProviderId(s);
+  const presetId = UI_PROVIDERS[rawProvider]
+    ? rawProvider
+    : Object.keys(PROVIDER_ALIASES).find((id) => PROVIDER_ALIASES[id] === providerId) ?? providerId;
+  const preset = UI_PROVIDERS[presetId];
+  const local = Boolean(LOCAL_PROVIDERS[providerId]);
+  const compatible = COMPATIBLE_PROVIDER_IDS.has(providerId);
+  const builtin = BUILTIN_PROVIDERS.has(providerId);
+  const hasBaseUrl = Boolean(String(s?.baseUrl ?? '').trim());
+  // 自定义接入 / 中转站：包括显式 custom、空 provider + 地址、未知 provider、
+  // 以及给内置厂商填了另一套 baseUrl（例如 DeepSeek 走中转）。这类档位用
+  // dhm-<slot>-relay 独立 provider，QQ / 微信可以各用各的地址和密钥。
+  const customEndpoint =
+    providerId === CUSTOM_PROVIDER_ID ||
+    (!local && !compatible && !builtin) ||
+    (!local && !compatible && Boolean(hasBaseUrl && preset?.baseUrl && s.baseUrl !== preset.baseUrl));
+  return {
+    rawProvider,
+    providerId,
+    presetId,
+    preset,
+    local,
+    compatible,
+    builtin,
+    hasBaseUrl,
+    customEndpoint,
+    relayId: `dhm-${slot}-relay`,
+    model: String(s?.model ?? '').split('#')[0]
+  };
+}
+
+/**
+ * 该平台真正要用的模型池：把这一平台自定义中转站档位放到最前面。
+ *
+ * 客户端（`NodeApiClient`）启动时会把模型池读进内存，池里没有 relay 条目的话，
+ * 即使 opencode.json 把 agent 指到了 relay，模型链仍会按池子把会话模型换走。
+ * 所以这里把 relay 候选前置；失败时仍会回落到原池子，保留原来的熔断/降级能力。
+ */
+export function effectiveModelPool(pool, slots, platform = 'qq') {
+  if (!pool || pool.enabled === false) return pool;
+  const extras = [];
+  for (const slot of ['chat', 'work']) {
+    const s = slots?.[slot];
+    if (!s) continue;
+    const plan = slotEndpointPlan(s, platform, slot);
+    if (!plan.customEndpoint || !plan.hasBaseUrl || !plan.model) continue;
+    if (s.protocol && s.protocol !== 'openai') continue;
+    extras.push(`${plan.relayId}/${plan.model}`);
+  }
+  if (!extras.length) return pool;
+  const free = [...new Set([...extras, ...(pool.free ?? []).map(String)])];
+  return { ...pool, free };
+}
+
 /** `provider/model[#variant]` 或 `{provider, model, variant}` → 拆开的 provider / model（去掉变体）。 */
 function candidateParts(entry) {
   if (!entry) return { provider: '', model: '' };
@@ -475,7 +556,7 @@ function poolUsesProvider(pool, provider) {
  * 生成配置对象（纯函数，便于测试）。
  * @returns {{config: object, notes: string[]}}
  */
-export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = false, slots = {}, agentTools = null }) {
+export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = false, slots = {}, agentTools = null, platform = 'qq', workdir = SESSION_WORKDIR }) {
   const notes = [];
   const at = agentTools ?? readAgentTools();
   const head = poolHeadModel(pool);
@@ -539,7 +620,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     mcpServers.snowluma = {
       type: 'local',
       command: [process.execPath, qqServer],
-      cwd: SESSION_WORKDIR,
+      cwd: workdir,
       codemode: false,
       // execution 必须大于最长等待：AI 会用 qq_wait_for_messages 做 5 分钟沉睡前观察，
       // 默认 120s 会在等待中途把工具调用掐掉，模型收不到结果也没法收尾
@@ -556,7 +637,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     mcpServers['web-search-safe'] = {
       type: 'local',
       command: [process.execPath, webServer],
-      cwd: SESSION_WORKDIR,
+      cwd: workdir,
       codemode: false,
       // 搜索/抓网页比查本地状态慢得多，catalog 也给宽点，
       // 否则首次列工具的时候就超时，表现成"工具不存在"。
@@ -574,7 +655,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     mcpServers['memory-safe'] = {
       type: 'local',
       command: [process.execPath, memoryServer],
-      cwd: SESSION_WORKDIR,
+      cwd: workdir,
       codemode: false,
       timeout: { startup: 20_000, catalog: 20_000, execution: 60_000 }
     };
@@ -588,7 +669,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     mcpServers['create-safe'] = {
       type: 'local',
       command: [process.execPath, createServer],
-      cwd: SESSION_WORKDIR,
+      cwd: workdir,
       codemode: false,
       timeout: { startup: 20_000, catalog: 20_000, execution: 240_000 }
     };
@@ -602,7 +683,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     mcpServers['video-safe'] = {
       type: 'local',
       command: [process.execPath, videoServer],
-      cwd: SESSION_WORKDIR,
+      cwd: workdir,
       codemode: false,
       timeout: { startup: 20_000, catalog: 20_000, execution: 240_000 }
     };
@@ -617,7 +698,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
     mcpServers['agent-tools'] = {
       type: 'local',
       command: [process.execPath, agentToolsServer],
-      cwd: SESSION_WORKDIR,
+      cwd: workdir,
       codemode: false,
       // 工具内部 30s 超时（可配到 120s），MCP 这边留 15s 余量，别先被外层掐掉。
       timeout: { startup: 20_000, catalog: 20_000, execution: Math.max(45_000, at.timeoutMs + 15_000) }
@@ -693,36 +774,19 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   for (const { slot, ids, label } of slotPlan) {
     const s = slots?.[slot];
     if (!s) continue;
-    const rawProvider = String(s.provider ?? '').trim();
-    const providerId = PROVIDER_ALIASES[rawProvider] ?? rawProvider;
-    const presetId = UI_PROVIDERS[rawProvider]
-      ? rawProvider
-      : Object.keys(PROVIDER_ALIASES).find((id) => PROVIDER_ALIASES[id] === providerId);
-    const preset = UI_PROVIDERS[presetId];
-    const local = Boolean(LOCAL_PROVIDERS[providerId]);
-    const compatible = COMPATIBLE_PROVIDER_IDS.has(providerId);
-    const builtin = BUILTIN_PROVIDERS.has(providerId);
-    const hasBaseUrl = Boolean(String(s.baseUrl ?? '').trim());
-    // 自定义接入 / 中转站：包括显式 custom、空 provider + 地址、未知 provider、
-    // 以及给内置厂商填了另一套 baseUrl（例如 DeepSeek 走中转）。这类档位用
-    // dhm-<slot>-relay 独立 provider，QQ / 微信可以各用各的地址和密钥。
-    const customEndpoint =
-      providerId === CUSTOM_PROVIDER_ID ||
-      (!local && !compatible && !builtin) ||
-      (!local && !compatible && Boolean(hasBaseUrl && preset?.baseUrl && s.baseUrl !== preset.baseUrl));
-    if (customEndpoint) {
-      if (!hasBaseUrl || (s.protocol && s.protocol !== 'openai')) {
+    const plan = slotEndpointPlan(s, platform, slot);
+    if (plan.customEndpoint) {
+      if (!plan.hasBaseUrl || (s.protocol && s.protocol !== 'openai')) {
         notes.push(`「${label}」是自定义服务商，没填 baseUrl（或协议不是 OpenAI 兼容），需提供 OpenAI 兼容协议的 baseUrl 才能接到 agent`);
         continue;
       }
-      const relayId = `dhm-${slot}-relay`;
-      const model = String(s.model).split('#')[0];
+      const { relayId, model } = plan;
       const before = provider[relayId] ?? {};
-      const keyEnv = String(s.apiKeyEnv ?? '').trim() || modelProfileKeyEnv('qq', slot);
+      const keyEnv = String(s.apiKeyEnv ?? '').trim() || modelProfileKeyEnv(platform, slot);
       provider[relayId] = {
         ...before,
         npm: before.npm ?? '@ai-sdk/openai-compatible',
-        name: before.name ?? `自定义中转站（${slot}）`,
+        name: before.name ?? `自定义中转站（${platform === 'wechat' ? '微信' : 'QQ'} · ${slot}）`,
         options: {
           ...(before.options ?? {}),
           baseURL: String(s.baseUrl).trim(),
@@ -739,10 +803,11 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
       notes.push(`「${label}」使用独立中转站 ${s.baseUrl}（${relayId}）`);
       continue;
     }
-    if (!local && !compatible && !builtin) {
+    if (!plan.local && !plan.compatible && !plan.builtin) {
       notes.push(`「${label}」的服务商 ${s.provider} 不是 OpenCode 内置项，无法接到 agent`);
       continue;
     }
+    const { providerId, local, compatible, builtin } = plan;
     // 内置 / 本地 / 兼容厂商保留 #variant（opencode 的变体语法），但 #none
     // 表示不选变体，不能原样写进 agent.model。provider 的 models 清单仍用
     // 去掉变体的模型名；自定义中转站没有变体定义，走上面的 relay 分支。
@@ -867,6 +932,16 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
  * @param {object} config 期望的配置
  * @param {{agents: string[], permissions: object[]}} live 从实例读回的结果
  */
+function agentModelId(value) {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object') return '';
+  const provider = String(value.providerID ?? value.provider ?? '').trim();
+  const model = String(value.modelID ?? value.model ?? value.id ?? '').trim();
+  if (!provider || !model) return model;
+  const variant = String(value.variant ?? '').trim();
+  return `${provider}/${model}${variant && !model.includes('#') ? `#${variant}` : ''}`;
+}
+
 export function assertConfig(config, live) {
   const problems = [];
   const liveAgents = Array.isArray(live.agents) ? live.agents : [];
@@ -893,7 +968,7 @@ export function assertConfig(config, live) {
   }
   for (const [id, agent] of Object.entries(config.agents ?? {})) {
     const active = live.agentConfigs?.[id];
-    if (active && agent.model && active.model !== agent.model) {
+    if (active && agent.model && agentModelId(active.model) !== agentModelId(agent.model)) {
       problems.push(`agent "${id}" 的实例模型与生成配置不一致`);
     }
   }
@@ -904,7 +979,7 @@ export function assertConfig(config, live) {
   return problems;
 }
 
-export function extractLiveConfig(entries, configFile = CONFIG_FILE) {
+export function extractLiveConfig(entries, configFile = resolveModelInstance().configFile) {
   if (!Array.isArray(entries)) return null;
   const normalize = (file) => {
     const resolved = path.resolve(file);
@@ -919,37 +994,50 @@ export function extractLiveConfig(entries, configFile = CONFIG_FILE) {
   return entry?.info && typeof entry.info === 'object' ? entry.info : null;
 }
 
-async function readLiveConfig(workdir) {
-  const serviceFile = process.env.QQ_BRIDGE_SERVICE_FILE ||
-    path.join(PATHS.state, 'opencode', 'service.json');
+async function readLiveConfig(workdir, instance = resolveModelInstance()) {
+  const serviceFile = (instance.platform === 'qq' && process.env.QQ_BRIDGE_SERVICE_FILE) || instance.serviceFile;
   if (!fs.existsSync(serviceFile)) return null;
   const endpoint = await Service.discover({ file: serviceFile });
   if (!endpoint?.url) return null;
   const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) });
   const entries = await client.config.get({ location: { directory: workdir } });
-  const liveConfig = extractLiveConfig(entries);
+  const liveConfig = extractLiveConfig(entries, instance.configFile);
   if (!liveConfig) {
-    throw new Error(`运行中实例未返回生成配置文件：${CONFIG_FILE}`);
+    throw new Error(`运行中实例未返回生成配置文件：${instance.configFile}`);
   }
   return liveConfig;
 }
 
-async function main() {
-  const checkOnly = process.argv.includes('--check');
-  const log = (m) => console.log(`[config] ${m}`);
+function parsePlatformArg() {
+  const inline = process.argv.find((arg) => arg.startsWith('--platform='));
+  const raw = inline
+    ? inline.slice('--platform='.length)
+    : (() => {
+        const index = process.argv.indexOf('--platform');
+        return index >= 0 ? process.argv[index + 1] : '';
+      })();
+  const value = String(raw ?? '').trim().toLowerCase();
+  if (!value) return null;
+  return value === 'wechat' ? 'wechat' : 'qq';
+}
 
-  const { pool, source } = loadModelPool();
-  const head = poolHeadModel(pool);
-  if (!head) throw new Error('模型池是空的，没法决定默认模型');
-  const modelLabel = `${head.provider}/${head.model}`;
+async function generateForPlatform(platform, shared) {
+  const { pool, source, checkOnly, chatOnly, agentToolsCfg, modelLabel, roleName } = shared;
+  const log = (m) => console.log(`[config:${platform}] ${m}`);
+  const instance = resolveModelInstance(platform, { useEnv: false });
+  const workdir = sessionWorkdir(platform, instance);
+  // MCP 的 cwd 和运行中实例的 config.get(location) 都要求目录存在；新装数据根
+  // 里 `state/agents` 可能还没被桥接建出来，这里先补上，免得读回校验误报失败。
+  fs.mkdirSync(workdir, { recursive: true });
 
   const persona = {};
-  const workdir = sessionWorkdir();
-  const chatOnly = isChatOnly();
-  const agentToolsCfg = readAgentTools();
   if (!chatOnly) {
     for (const preset of PRESETS) {
-      persona[preset.id] = renderPersona(readPresetPersona(preset.id), { model: modelLabel, cwd: workdir });
+      persona[preset.id] = renderPersona(readPresetPersona(preset.id), {
+        model: modelLabel,
+        cwd: workdir,
+        platform
+      });
     }
   }
   // 主人档的人设：整份独立写，不借 qq-chat 的正文（理由见 buildWorkPersona 的注释）。
@@ -958,26 +1046,29 @@ async function main() {
   const workPersona = buildWorkPersona({
     model: modelLabel,
     cwd: workdir,
-    roleName: currentRoleName(),
+    roleName,
     agentTools: agentToolsCfg.enabled && !chatOnly,
-    sandboxRoot: agentToolsCfg.sandboxRoot || workdir
+    sandboxRoot: agentToolsCfg.sandboxRoot || workdir,
+    platform
   });
 
-  const base = readJsonSafe(CONFIG_FILE, {});
-  // 两档模型：配了哪档就把对应 agent 的 model 指过去（见 buildConfig 里的说明）。
-  //
-  // opencode.json 只有一份、QQ 和微信共用同一个 4599 实例，所以两边的档只能取一个：
-  // QQ 配了用 QQ 的，QQ 没配再退到微信那档。以前只读 qq —— 在微信页填完模型，
-  // 生成器压根不看，表现成"微信那边配了不生效"。
-  const qqSlots = readSlotProfiles('qq');
-  const wxSlots = readSlotProfiles('wechat');
-  const slots = {
-    chat: qqSlots.chat ?? wxSlots.chat,
-    work: qqSlots.work ?? wxSlots.work
-  };
-  const { config, notes } = buildConfig({ base, pool, persona, workPersona, chatOnly, slots, agentTools: agentToolsCfg });
+  const slots = readSlotProfiles(platform);
+  const base = readJsonSafe(instance.configFile, {});
+  const { config, notes } = buildConfig({
+    base,
+    pool,
+    persona,
+    workPersona,
+    chatOnly,
+    slots,
+    agentTools: agentToolsCfg,
+    platform,
+    workdir
+  });
   for (const note of notes) log(note);
   log(`模型池来自 ${source}；默认模型 ${config.model}`);
+  log(`配置：${instance.configFile}`);
+  log(`会话工作目录：${workdir}`);
   log(`agents: ${Object.keys(config.agents).join(', ')}`);
   if (chatOnly) {
     log('权限：只有兜底 deny *（纯聊天模式，模型工具面为空）');
@@ -987,39 +1078,76 @@ async function main() {
   log(`MCP：${Object.keys(config.mcp?.servers ?? {}).join(', ') || '(无)'}`);
 
   if (checkOnly) {
-    const live = readJsonSafe(CONFIG_FILE, {});
+    if (!fs.existsSync(instance.configFile)) {
+      log('还没有生成配置文件，跳过读回校验');
+      return { platform, ok: true, skipped: true };
+    }
+    const live = readJsonSafe(instance.configFile, {});
     log(`现有配置的 agents: ${Object.keys(live.agents ?? {}).join(', ') || '(空)'}`);
     const problems = assertConfig(config, {
       agents: Object.keys(live.agents ?? {}),
       permissions: live.permissions ?? []
     });
-    if (problems.length) throw new Error(`现有配置校验失败：${problems.join('；')}`);
+    if (problems.length) throw new Error(`[${platform}] 现有配置校验失败：${problems.join('；')}`);
     log('现有配置读回校验通过');
-    return;
+    return { platform, ok: true };
   }
 
-  writeJsonAtomically(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`);
-  const saved = readJsonSafe(CONFIG_FILE, {});
+  fs.mkdirSync(path.dirname(instance.configFile), { recursive: true });
+  writeJsonAtomically(instance.configFile, `${JSON.stringify(config, null, 2)}\n`);
+  const saved = readJsonSafe(instance.configFile, {});
   const problems = assertConfig(config, {
     agents: Object.keys(saved.agents ?? {}),
     permissions: saved.permissions ?? []
   });
-  if (problems.length) throw new Error(`生成配置读回校验失败：${problems.join('；')}`);
-  log(`已写入 ${CONFIG_FILE}`);
+  if (problems.length) throw new Error(`[${platform}] 生成配置读回校验失败：${problems.join('；')}`);
+  log(`已写入 ${instance.configFile}`);
   log('生成配置文件读回校验通过');
-  const live = await readLiveConfig(workdir);
+
+  let live = null;
+  try {
+    live = await readLiveConfig(workdir, instance);
+  } catch (error) {
+    log(`⚠️ 运行中实例读回失败（可能正在重启，先以文件为准）：${error?.message ?? error}`);
+  }
   if (live) {
-    const liveConfig = live;
-    const agentConfigs = liveConfig.agents && !Array.isArray(liveConfig.agents) ? liveConfig.agents : {};
+    const agentConfigs = live.agents && !Array.isArray(live.agents) ? live.agents : {};
     const liveProblems = assertConfig(config, {
-      agents: Array.isArray(liveConfig.agents) ? liveConfig.agents.map((agent) => agent.id ?? agent.name) : Object.keys(agentConfigs),
+      agents: Array.isArray(live.agents) ? live.agents.map((agent) => agent.id ?? agent.name) : Object.keys(agentConfigs),
       agentConfigs,
-      permissions: liveConfig.permission ?? liveConfig.permissions ?? []
+      permissions: live.permission ?? live.permissions ?? []
     });
-    if (liveProblems.length) throw new Error(`运行中实例配置校验失败：${liveProblems.join('；')}`);
+    if (liveProblems.length) throw new Error(`[${platform}] 运行中实例配置校验失败：${liveProblems.join('；')}`);
     log('运行中模型 API 实例配置读回校验通过');
   } else {
     log('当前没有可查询的运行中模型 API 实例；仅完成文件读回校验');
+  }
+  return { platform, ok: true };
+}
+
+async function main() {
+  const checkOnly = process.argv.includes('--check');
+  const onlyPlatform = parsePlatformArg();
+  const platforms = onlyPlatform ? [onlyPlatform] : MODEL_PLATFORMS;
+
+  const { pool, source } = loadModelPool();
+  const head = poolHeadModel(pool);
+  if (!head) throw new Error('模型池是空的，没法决定默认模型');
+  const modelLabel = `${head.provider}/${head.model}`;
+  const chatOnly = isChatOnly();
+  const agentToolsCfg = readAgentTools();
+  const shared = {
+    pool,
+    source,
+    checkOnly,
+    chatOnly,
+    agentToolsCfg,
+    modelLabel,
+    roleName: currentRoleName()
+  };
+
+  for (const platform of platforms) {
+    await generateForPlatform(platform, shared);
   }
 }
 
