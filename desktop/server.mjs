@@ -3023,6 +3023,11 @@ function externalWechatPid() {
   return pidFromLockFile(path.join('state', 'wechat.lock'));
 }
 
+/** 官方 QQ 机器人的单实例锁（state/qq-official.lock，由 qq-official-bot.js 写）。 */
+function externalQqOfficialPid() {
+  return pidFromLockFile(path.join('state', 'qq-official.lock'));
+}
+
 /**
  * 读一个「存着 PID 的锁文件」，只认「PID 解析得出来、而且那个进程还活着」。
  * 拿不准（文件不在 / 内容坏 / 权限不足）一律返回 null —— 宁可多 spawn 一次被锁挡回，
@@ -3155,6 +3160,7 @@ function bridgeState() {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 let wechat = { child: null, startedAt: null, exitCode: null };
+let qqOfficial = { child: null, startedAt: null, exitCode: null };
 
 function wechatFiles() {
   const base = path.join(dataRoot(), 'state');
@@ -3239,6 +3245,82 @@ function stopWechat() {
     return { stopped: true, killed };
   })();
   return withDone({ ok: true, pid }, done);
+}
+
+/* ── QQ 官方机器人（开放平台，不封号那条线） ─────────── */
+
+function startQqOfficial() {
+  if (qqOfficial.child) return { ok: false, error: '官方机器人已在运行' };
+  const externalPid = externalQqOfficialPid();
+  if (externalPid) {
+    pushLog(`官方机器人已在运行（pid ${externalPid}，不是本窗口启动的），直接复用`, 'sys', 'qqofficial');
+    return { ok: true, pid: externalPid, external: true };
+  }
+  const cfg = loadConfig();
+  const o = cfg.qqOfficial ?? {};
+  if (o.enabled !== true) return { ok: false, error: '先在面板里填好 AppID/AppSecret 并打开开关' };
+  if (!String(o.appId ?? '').trim() || !String(o.appSecret ?? '').trim()) return { ok: false, error: 'AppID/AppSecret 没填全' };
+  const { command, env } = nodeRunner('qq');
+  const script = path.join(getRoot(), 'src', 'qq-official-bot.js');
+  if (!fs.existsSync(script)) return { ok: false, error: '找不到 src/qq-official-bot.js（桥接目录对吗）' };
+
+  const child = spawn(command, [script], {
+    cwd: dataRoot(),
+    env: { ...process.env, ...env },
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  qqOfficial = { child, startedAt: Date.now(), exitCode: null };
+  pushLog(`官方机器人已启动（pid ${child.pid}）`, 'sys', 'qqofficial');
+  relay(child.stdout, 'out', 'qqofficial');
+  relay(child.stderr, 'err', 'qqofficial');
+
+  child.on('close', (code) => {
+    if (qqOfficial.child === child) qqOfficial = { child: null, startedAt: null, exitCode: code };
+    onServiceExit('qqofficial');
+    pushLog(`官方机器人已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'qqofficial');
+  });
+
+  return { ok: true, pid: child.pid };
+}
+
+function stopQqOfficial() {
+  markManualStop('qqofficial');
+  const child = qqOfficial.child;
+  const pid = child?.pid ?? externalQqOfficialPid();
+  if (!pid) return { ok: false, error: '官方机器人没在运行' };
+  pushLog('正在停止官方机器人…', 'sys', 'qqofficial');
+  // 不停 4599 模型实例：QQ 桥接（NapCat 那条）还在用它。
+  const done = (async () => ({ stopped: true, killed: await killProcessTree(pid) }))();
+  return withDone({ ok: true, pid }, done);
+}
+
+/** 面板/状态页的数据：进程在不在 + Bot 自己写在 state 里的运行况。 */
+function qqOfficialState() {
+  const cfg = loadConfig();
+  const o = cfg.qqOfficial ?? {};
+  const st = readJson(path.join(dataRoot(), 'state', 'qq-official-status.json'), null) ?? {};
+  const externalPid = qqOfficial.child ? null : externalQqOfficialPid();
+  const runningPid = qqOfficial.child?.pid ?? externalPid ?? null;
+  const statusAt = Number(st.at ?? 0);
+  return {
+    running: Boolean(runningPid),
+    pid: runningPid,
+    externalPid,
+    startedAt: qqOfficial.startedAt,
+    enabled: o.enabled === true,
+    appId: String(o.appId ?? ''),
+    appSecretSet: Boolean(String(o.appSecret ?? '').trim()),
+    // Bot 进程在但状态文件 2 分钟没心跳 = 网关那边多半出事了
+    connected: Boolean(runningPid) && st.connected === true && Date.now() - statusAt < 2 * 60_000,
+    botName: st.botName ?? '',
+    lastEventAt: Number(st.lastEventAt ?? 0),
+    received: Number(st.received ?? 0),
+    replied: Number(st.replied ?? 0),
+    errors: Number(st.errors ?? 0),
+    lastError: st.lastError ?? ''
+  };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -4304,7 +4386,7 @@ const APP_VERSION = readJson(path.join(here, 'package.json'), {}).version ?? '0.
 const BOOT_AT = Date.now();
 
 function automationDefaults() {
-  return { watch: { napcat: false, bridge: false, wechat: false }, launchAtLogin: false, schedules: [] };
+  return { watch: { napcat: false, bridge: false, wechat: false, qqofficial: false }, launchAtLogin: false, schedules: [] };
 }
 
 function loadAutomation() {
@@ -4355,6 +4437,7 @@ function onServiceExit(kind) {
     try {
       if (kind === 'bridge') startBridge();
       else if (kind === 'wechat') startWechat();
+      else if (kind === 'qqofficial') startQqOfficial();
       pushLog(`看护：「${kind}」已重新拉起`, 'sys', 'app');
     } catch (error) {
       pushLog(`看护重启「${kind}」失败：${error?.message ?? error}`, 'err', 'app');
@@ -4365,7 +4448,7 @@ function onServiceExit(kind) {
 /** 服务稳定跑过 5 分钟就清零计数 —— 偶尔崩一次和连环崩要区别对待。 */
 setInterval(() => {
   for (const k of Object.keys(restartAttempts)) {
-    const startedAt = k === 'bridge' ? bridge.startedAt : k === 'wechat' ? wechat.startedAt : napcatLaunch.startedAt;
+    const startedAt = k === 'bridge' ? bridge.startedAt : k === 'wechat' ? wechat.startedAt : k === 'qqofficial' ? qqOfficial.startedAt : napcatLaunch.startedAt;
     if (startedAt && Date.now() - startedAt > 5 * 60_000) restartAttempts[k] = 0;
   }
 }, 60_000);
@@ -5062,6 +5145,7 @@ const server = http.createServer(async (req, res) => {
         pool: (() => { const p = loadPool(); return { enabled: p.enabled !== false, free: (p.free ?? []).length, paid: (p.paid ?? []).length }; })(),
         bridge: bridgeState(),
         wechat: wechatState(),
+        qqOfficial: qqOfficialState(),
         napcat: {
           reachable: napcatReachable,
           port: n.wsPort,
@@ -5668,6 +5752,30 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, await startBotFlow(body?.platform === 'wechat' ? 'wechat' : 'qq'));
     }
     if (p === '/api/wechat/stop') return sendJson(res, stopWechat());
+
+    if (p === '/api/qq-official') {
+      if (req.method === 'GET') return sendJson(res, { ok: true, ...qqOfficialState() });
+      const body = await readBody(req);
+      if (body.action === 'start') return sendJson(res, startQqOfficial());
+      if (body.action === 'stop') return sendJson(res, stopQqOfficial());
+      // 保存配置：AppID/AppSecret/开关。存完按开关状态顺手启停。
+      const cfg = loadConfig();
+      const prev = cfg.qqOfficial ?? {};
+      const appId = body.appId !== undefined ? String(body.appId).trim() : String(prev.appId ?? '');
+      const appSecret = body.appSecret !== undefined ? String(body.appSecret).trim() : String(prev.appSecret ?? '');
+      if (appId && !/^\d{6,15}$/.test(appId)) return sendJson(res, { ok: false, error: 'AppID 应该是一串数字（开放平台管理端的那份）' });
+      const enabled = body.enabled === undefined ? prev.enabled === true : body.enabled === true;
+      if (enabled && (!appId || !appSecret)) return sendJson(res, { ok: false, error: 'AppID 和 AppSecret 都要填才能启用' });
+      cfg.qqOfficial = { ...(cfg.qqOfficial ?? {}), enabled, appId, appSecret };
+      writeJson(configFile(), cfg);
+      pushLog(`官方机器人配置已保存（${enabled ? '启用' : '停用'}，AppID ${appId ? appId.slice(0, 4) + '…' : '未填'}）`, 'sys', 'qqofficial');
+      let started = null;
+      let stopped = null;
+      if (enabled) started = startQqOfficial();
+      else stopped = stopQqOfficial();
+      await Promise.resolve(stopped?.done ?? null);
+      return sendJson(res, { ok: true, ...qqOfficialState(), startedOk: started ? started.ok : null });
+    }
 
     if (p === '/api/config') {
       if (req.method === 'GET') return sendJson(res, loadConfig());
@@ -7686,6 +7794,13 @@ export async function startServer(preferred = PORT) {
       if (phoneSettings().enabled) startPhoneListener();
       scheduleNapcatUpdateCheck();
       scheduleAppUpdateCheck();
+      // QQ 官方机器人：配置里开了就随软件一起起来（没配/没开就是空操作）
+      try {
+        const o = (loadConfig().qqOfficial ?? {});
+        if (o.enabled === true && String(o.appId ?? '').trim() && String(o.appSecret ?? '').trim()) {
+          setTimeout(() => startQqOfficial(), 5000);
+        }
+      } catch { /* 配置读不了就当没配 */ }
       if (port !== preferred) {
         pushLog(`端口 ${preferred} 被占用，改用 ${result.port}`, 'sys');
       }

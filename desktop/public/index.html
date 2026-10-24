@@ -411,6 +411,36 @@
         </div>
       </div>
 
+      <div class="panel" data-pf="qq" id="qq-official-panel">
+        <div class="panel-head">
+          <h2>QQ 官方机器人</h2>
+          <span class="hint">开放平台官方接口，带机器人标识、不会封号；群聊和私聊都走它，与 NapCat 那条互不影响</span>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="qof-app-id">AppID</label>
+            <input id="qof-app-id" placeholder="开放平台管理端的一串数字" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="qof-app-secret">AppSecret</label>
+            <input id="qof-app-secret" type="password" placeholder="和 AppID 一起复制的那份" spellcheck="false" autocomplete="off" />
+          </div>
+        </div>
+        <label class="switch-row">
+          <input type="checkbox" id="qof-enabled" />
+          <span>
+            <strong>启用官方机器人（群聊 + 私聊）</strong>
+            <em>和 NapCat 那条同时开也没关系：各走各的，人设和模型池共用，会话分开。</em>
+          </span>
+        </label>
+        <div class="actions">
+          <button class="btn btn-primary" id="qof-save">保存并启动</button>
+          <button class="btn" id="qof-stop" hidden>停止</button>
+          <span class="result" id="qof-result"></span>
+        </div>
+        <div class="svc-meta" id="qof-meta">—</div>
+      </div>
+
       <div class="panel">
         <div class="panel-head">
           <h2>模型</h2>

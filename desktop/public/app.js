@@ -767,7 +767,7 @@ function renderShell() {
 setInterval(refreshState, 6000);
 
 /* 日志流（高级页用，但一直连着：总览的「最近动态」也吃它） */
-const SOURCE_LABEL = { napcat: 'NapCat', bridge: '桥接', wechat: '微信', phone: '手机', app: '软件' };
+const SOURCE_LABEL = { napcat: 'NapCat', bridge: '桥接', wechat: '微信', phone: '手机', app: '软件', qqofficial: '官方QQ' };
 const PANE_MAX = 1200;
 const panes = {};
 
@@ -1044,6 +1044,34 @@ function renderStatus() {
         <div class="status-slot-note">${note}</div>
         <div class="status-slot-actions">${btn}${toolBtn}</div>
       </div>`;
+  }
+
+  /* QQ 官方机器人面板：QQ 通道才显示（data-pf 由 applyPlatform 控制），
+     这里只负责把状态画出来；表单值只在首次加载时填，别覆盖正在编辑的内容 */
+  const qof = S.qqOfficial;
+  const qofMeta = $('#qof-meta');
+  if (qof && qofMeta) {
+    if (!qof.enabled) {
+      qofMeta.textContent = '未启用 —— 填好 AppID/AppSecret，勾上开关，点「保存并启动」。';
+    } else if (qof.running && qof.connected) {
+      const last = qof.lastEventAt ? `，最近消息 ${new Date(qof.lastEventAt).toLocaleTimeString('zh-CN')}` : '';
+      qofMeta.textContent = `已连接${qof.botName ? `（机器人「${qof.botName}」）` : ''}：收到 ${qof.received} 条、回出 ${qof.replied} 条${last}`;
+    } else if (qof.running) {
+      qofMeta.textContent = `进程在跑，网关还没就绪${qof.lastError ? `（${qof.lastError}）` : '，凭证或网络问题看日志页「官方QQ」'}`;
+    } else {
+      qofMeta.textContent = '配置已保存但没在运行 —— 点「保存并启动」拉起来。';
+    }
+    const stopBtn = $('#qof-stop');
+    if (stopBtn) stopBtn.hidden = !qof.running;
+    if (!qofMeta.dataset.filled) {
+      qofMeta.dataset.filled = '1';
+      const idEl = $('#qof-app-id');
+      if (idEl && !idEl.value) idEl.value = qof.appId ?? '';
+      const enEl = $('#qof-enabled');
+      if (enEl) enEl.checked = qof.enabled === true;
+      const secEl = $('#qof-app-secret');
+      if (secEl && qof.appSecretSet) secEl.placeholder = '已保存（要换再填）';
+    }
   }
 
   const svcBox = $('#status-services');
@@ -1798,6 +1826,32 @@ async function openNapcatPanel() {
 $('#btn-napcat-panel').addEventListener('click', () => openNapcatPanel());
 
 $('#status-napcat-login')?.addEventListener('click', () => openNapcatPanel());
+
+/* QQ 官方机器人：保存（=启用+启动）和停止。凭证只回显「已保存」，不往回带。 */
+$('#qof-save')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const body = {
+      enabled: $('#qof-enabled').checked === true,
+      appId: $('#qof-app-id').value.trim()
+    };
+    const secret = $('#qof-app-secret').value.trim();
+    if (secret) body.appSecret = secret; // 留空 = 沿用已存的
+    const r = await post('/api/qq-official', body);
+    if (r.ok === false) return setResult('#qof-result', r.error, 'err');
+    $('#qof-app-secret').value = '';
+    setResult('#qof-result', r.running ? '已启动 ✓（等网关连上，几秒内状态更新）' : '已保存 ✓', 'saved');
+    await refreshState();
+  });
+});
+
+$('#qof-stop')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '停止中…', async () => {
+    const r = await post('/api/qq-official', { action: 'stop' });
+    if (r.ok === false) return setResult('#qof-result', r.error, 'err');
+    setResult('#qof-result', '已停止', 'busy');
+    await refreshState();
+  });
+});
 
 $$('[data-watch]').forEach((el) => {
   el.addEventListener('change', async () => {
