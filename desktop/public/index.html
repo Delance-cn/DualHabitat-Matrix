@@ -2014,9 +2014,9 @@
           <span class="hint">发行版里的资产名要含 <code>Setup</code> 并以 <code>.exe</code> 结尾。</span>
         </div>
         <div class="field" data-adv>
-          <label for="upd-app-mirror">软件下载镜像前缀</label>
-          <input id="upd-app-mirror" placeholder="https://ghproxy.cn/  （直连下不动时填）" spellcheck="false" />
-          <span class="hint">只拼在安装包下载地址前面，版本查询仍然直连 GitHub。</span>
+          <label for="upd-app-mirror">软件下载线路</label>
+          <input id="upd-app-mirror" placeholder="留空 = 自动测速选最快；off = 直连；或填 https://ghproxy.cn/" spellcheck="false" />
+          <span class="hint">默认自动：下载前对直连和常用镜像各发一个 1 字节探测，挑最快的。填 off 强制直连，填地址固定走那条线路。版本查询始终直连 GitHub。</span>
         </div>
         <div class="field-row" data-adv>
           <div class="field">
@@ -2024,8 +2024,8 @@
             <input id="upd-napcat-repo" placeholder="NapNeko/NapCatQQ" spellcheck="false" />
           </div>
           <div class="field">
-            <label for="upd-napcat-mirror">下载镜像前缀</label>
-            <input id="upd-napcat-mirror" placeholder="https://ghproxy.cn/  （直连下不动时填）" spellcheck="false" />
+            <label for="upd-napcat-mirror">NapCat 下载线路</label>
+            <input id="upd-napcat-mirror" placeholder="留空 = 自动测速选最快；off = 直连；或填 https://ghproxy.cn/" spellcheck="false" />
           </div>
         </div>
         <div class="field" data-adv>

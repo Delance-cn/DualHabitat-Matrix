@@ -1836,7 +1836,7 @@ $('#btn-napcat-install').addEventListener('click', async (e) => {
   const ok = await confirmBox({
     title: `下载并安装 NapCat ${info.tag}？`,
     text: '会从 GitHub 下最新版 Shell 包，解压到用户目录（不动安装目录），装完把路径填好。',
-    list: [`安装包：${asset.name}（${fmtBytes(asset.size)}）`, '下载完成后需手动点击「启动」，再通过面板扫码登录', '下不动的话，「高级」页可以填镜像前缀'],
+    list: [`安装包：${asset.name}（${fmtBytes(asset.size)}）`, '下载前会自动测速，直连和几个镜像里挑最快的', '下载完成后需手动点击「启动」，再通过面板扫码登录'],
     okLabel: '下载并装好'
   });
   if (!ok) return;
@@ -1861,7 +1861,7 @@ $('#btn-app-update').addEventListener('click', async (e) => {
   const ok = await confirmBox({
     title: `安装 ${info.tag}？`,
     text: '下载完成后本程序会自动关闭，安装程序静默装到原来的位置，装完自动重开。',
-    list: [`安装包：${asset.name}（${fmtBytes(asset.size)}）`, '当前版本会先退出，聊天服务会中断几秒', '配置和人格都在项目目录里，不受影响'],
+    list: [`安装包：${asset.name}（${fmtBytes(asset.size)}）`, '下载前自动测速，直连和镜像里挑最快的；「高级」页可固定线路', '当前版本会先退出，聊天服务会中断几秒', '配置和人格都在项目目录里，不受影响'],
     okLabel: '下载并安装'
   });
   if (!ok) return;

@@ -2108,15 +2108,14 @@ async function applyNapcatUpdate(assetUrl) {
   const info = await napcatUpdateInfo();
   const asset = assetUrl ? (info.assets.find((a) => a.url === assetUrl) ?? null) : info.picked;
   if (!asset) return { ok: false, error: '发行版里没有匹配的 Shell 压缩包 —— 去「参数与日志」页调一下匹配规则，或从资产列表里手动指定' };
-  const mirror = String(n.updateMirror || '').replace(/\/$/, '');
-  const url = mirror ? `${mirror}/${asset.url}` : asset.url;
+  const line = await pickDownloadLine(asset.url, n.updateMirror);
   const tmp = path.join(os.tmpdir(), `napcat-update-${Date.now()}`);
   fs.mkdirSync(tmp, { recursive: true });
-  pushLog(`下载 NapCat 更新：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB）`, 'sys', 'napcat');
+  pushLog(`下载 NapCat 更新：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB，线路 ${line.via}）`, 'sys', 'napcat');
   const zipPath = path.join(tmp, asset.name);
-  const dl = await downloadToFile(url, zipPath);
+  const dl = await downloadToFile(line.url, zipPath);
   if (!dl.ok) {
-    return { ok: false, error: `下载失败：${dl.error}${mirror ? '' : '（GitHub 直连不行就在「高级 → 更新」填镜像前缀，比如 https://ghfast.top/）'}` };
+    return { ok: false, error: `下载失败：${dl.error}${downloadHint(line.mode)}` };
   }
   const dest = path.join(tmp, 'unpacked');
   fs.mkdirSync(dest, { recursive: true });
@@ -2165,6 +2164,65 @@ async function applyNapcatUpdate(assetUrl) {
 function tarExe() {
   const sys = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
   return fs.existsSync(sys) ? sys : 'tar';
+}
+
+/* ── 下载线路：自动测速选快 ────────────────────────────
+ *
+ * GitHub 直连在国内不稳，镜像站又各有快慢和存亡。updateMirror 三档语义：
+ *   空（默认）= 自动：下载前对直连 + 内置镜像并发发一个 1 字节的探测请求
+ *               （Range: bytes=0-0），可用的里挑最快的，日志写明选了谁；
+ *   'off'     = 直连，不碰镜像；
+ *   填 URL    = 固定走这条镜像（老用法不变）。
+ * 探测只花一个字节和最多 4 秒，下载是几百 MB 的大头，这点开销值得。
+ * 镜像列表是内置的常用站，挂了会自动在测速里被淘汰，不阻塞下载。
+ */
+const DOWNLOAD_MIRRORS = ['https://ghproxy.cn', 'https://ghfast.top', 'https://gh.ddlc.top'];
+
+async function probeLine(url) {
+  const t0 = Date.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 4000);
+  try {
+    const res = await fetch(url, { headers: { range: 'bytes=0-0', 'user-agent': 'DualHabitat-Matrix' }, signal: ctrl.signal, redirect: 'follow' });
+    await res.body?.cancel().catch(() => { /* 取消失败无所谓 */ });
+    if (res.status === 200 || res.status === 206) return { ok: true, ms: Date.now() - t0 };
+    return { ok: false, status: res.status };
+  } catch (error) {
+    return { ok: false, error: String(error?.cause?.code ?? error?.message ?? error).slice(0, 40) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 三档线路策略，返回 { url, via, mode, probed }：
+ * via 是给日志看的人话（选了哪条线、多少毫秒），probed 只在 auto 档有值。
+ */
+async function pickDownloadLine(assetUrl, mirrorSetting) {
+  const mirror = String(mirrorSetting ?? '').trim().replace(/\/$/, '');
+  if (mirror === 'off') return { url: assetUrl, via: '直连', mode: 'direct' };
+  if (mirror) return { url: `${mirror}/${assetUrl}`, via: `固定镜像 ${mirror}`, mode: 'fixed' };
+  const candidates = [
+    { via: '直连', url: assetUrl },
+    ...DOWNLOAD_MIRRORS.map((m) => ({ via: m.replace('https://', ''), url: `${m}/${assetUrl}` }))
+  ];
+  const probed = await Promise.all(candidates.map(async (c) => ({ ...c, ...(await probeLine(c.url)) })));
+  const alive = probed.filter((r) => r.ok).sort((a, b) => a.ms - b.ms);
+  const detail = probed.map((r) => `${r.via} ${r.ok ? `${r.ms}ms` : `不通(${r.status ?? r.error ?? '?'})`}`).join(' · ');
+  if (!alive.length) {
+    pushLog(`线路测速全挂：${detail} → 还是回落直连试一下`, 'sys');
+    return { url: assetUrl, via: '直连', mode: 'auto', probed };
+  }
+  const best = alive[0];
+  pushLog(`线路测速：${detail} → 用 ${best.via}`, 'sys');
+  return { url: best.url, via: best.via, mode: 'auto', probed };
+}
+
+/** 下载失败时按线路档位给的人话建议。 */
+function downloadHint(mode) {
+  if (mode === 'fixed') return '';
+  if (mode === 'direct') return '（GitHub 直连不行可在「高级 → 更新」填镜像前缀，比如 https://ghproxy.cn/）';
+  return '（线路是下载前自动测速挑的，重试会重新测速换线；也可以在「高级 → 更新」固定一条镜像，比如 https://ghproxy.cn/）';
 }
 
 /**
@@ -2234,18 +2292,17 @@ async function installNapcat() {
     return { ok: false, error: '发行版里没有匹配的 Shell 压缩包 —— 去「高级」页调一下资产匹配规则' };
   }
   const n = napcatSettings();
-  const mirror = String(n.updateMirror || '').replace(/\/$/, '');
-  const url = mirror ? `${mirror}/${asset.url}` : asset.url;
+  const line = await pickDownloadLine(asset.url, n.updateMirror);
   const tmp = path.join(os.tmpdir(), `napcat-install-${Date.now()}`);
   fs.mkdirSync(tmp, { recursive: true });
-  pushLog(`开始下载 NapCat ${info.tag}：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB）`, 'sys', 'napcat');
+  pushLog(`开始下载 NapCat ${info.tag}：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB，线路 ${line.via}）`, 'sys', 'napcat');
 
   const zipPath = path.join(tmp, asset.name);
-  const dl = await downloadToFile(url, zipPath, (ratio) => {
+  const dl = await downloadToFile(line.url, zipPath, (ratio) => {
     componentJob = { ...(componentJob ?? {}), id: 'napcat', pct: Math.round(ratio * 70), note: '下载中' };
   });
   if (!dl.ok) {
-    return { ok: false, error: `下载失败：${dl.error}${mirror ? '' : '（GitHub 直连不行就在「高级 → 更新」填镜像前缀，比如 https://ghfast.top/）'}` };
+    return { ok: false, error: `下载失败：${dl.error}${downloadHint(line.mode)}` };
   }
   return installNapcatFromZip(zipPath, info.tag, asset.size);
 }
@@ -2385,17 +2442,16 @@ function componentList() {
 /** 下载 ffmpeg 的 Windows 静态包，只留 bin 下那三个 exe。 */
 async function installFfmpeg() {
   const zipPath = path.join(os.tmpdir(), `ffmpeg-dl-${Date.now()}.zip`);
-  // 镜像前缀和 NapCat 共用一个设置项：国内 GitHub 直连基本下不动
-  const mirror = String(napcatSettings().updateMirror || '').replace(/\/$/, '');
-  const url = mirror ? `${mirror}/${FFMPEG_ZIP_URL}` : FFMPEG_ZIP_URL;
-  componentJob = { ...componentJob, pct: 1, note: '连接下载源' };
+  // 线路和 NapCat 共用一个设置项：空=自动测速选最快，off=直连，URL=固定镜像
+  const line = await pickDownloadLine(FFMPEG_ZIP_URL, napcatSettings().updateMirror);
+  componentJob = { ...componentJob, pct: 1, note: `连接下载源（${line.via}）` };
 
-  const dl = await downloadToFile(url, zipPath, (ratio) => {
+  const dl = await downloadToFile(line.url, zipPath, (ratio) => {
     // 下载占 0-70%，解压 70-95%
     componentJob = { ...componentJob, pct: Math.round(ratio * 70), note: '下载中' };
   });
   if (!dl.ok) {
-    return { ok: false, error: `下载失败：${dl.error}${mirror ? '' : '（GitHub 直连不行就在「高级 → 更新」填镜像前缀，比如 https://ghfast.top/）'}` };
+    return { ok: false, error: `下载失败：${dl.error}${downloadHint(line.mode)}` };
   }
   return installFfmpegFromZip(zipPath);
 }
@@ -2545,7 +2601,7 @@ function appSettings() {
   return {
     updateMode: a.updateMode === 'off' ? 'off' : 'notify',
     updateRepo: String(a.updateRepo ?? 'Delance-cn/DualHabitat-Matrix'),
-    // 国内直连 GitHub 不稳：镜像前缀和 NapCat 那套同款，下载 URL 拼成 镜像/原始URL
+    // 三档：空=自动测速选最快（默认）、off=直连、URL=固定镜像 —— 见 pickDownloadLine
     updateMirror: String(a.updateMirror ?? '').replace(/\/$/, ''),
     lastUpdateCheck: Number(a.lastUpdateCheck) || 0
   };
@@ -2597,15 +2653,14 @@ async function applyAppUpdate(assetUrl) {
   const info = await appUpdateInfo();
   const asset = assetUrl ? (info.assets.find((a) => a.url === assetUrl) ?? null) : info.picked;
   if (!asset) return { ok: false, error: '发行版里没有找到 Setup 安装包（资产名要含 Setup 并以 .exe 结尾）' };
-  const { updateMirror } = appSettings();
-  // 和 NapCat / ffmpeg 同一套：镜像前缀拼在下载 URL 前面，API 查询不走镜像
-  const url = updateMirror ? `${updateMirror}/${asset.url}` : asset.url;
+  // 线路三档：空=自动测速选最快（默认）、off=直连、URL=固定镜像
+  const line = await pickDownloadLine(asset.url, appSettings().updateMirror);
   const tmp = path.join(os.tmpdir(), `dhm-update-${Date.now()}`);
   fs.mkdirSync(tmp, { recursive: true });
   const exePath = path.join(tmp, asset.name);
-  pushLog(`下载新版本安装包：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB）${updateMirror ? `（镜像 ${updateMirror}）` : ''}`, 'sys', 'app');
-  appUpdateJob = { phase: 'download', pct: 0, got: 0, total: asset.size, note: '连接中…', startedAt: Date.now(), error: '' };
-  const dl = await downloadToFile(url, exePath, (ratio, got, total) => {
+  pushLog(`下载新版本安装包：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB，线路 ${line.via}）`, 'sys', 'app');
+  appUpdateJob = { phase: 'download', pct: 0, got: 0, total: asset.size, note: `测速选线：${line.via}`, startedAt: Date.now(), error: '' };
+  const dl = await downloadToFile(line.url, exePath, (ratio, got, total) => {
     if (appUpdateJob) {
       appUpdateJob.pct = Math.round(ratio * 100);
       appUpdateJob.got = got;
@@ -2619,7 +2674,7 @@ async function applyAppUpdate(assetUrl) {
       appUpdateJob.error = dl.error;
       appUpdateJob.note = '下载失败';
     }
-    return { ok: false, error: `下载失败：${dl.error}${updateMirror ? '' : '（GitHub 直连不行就在「高级 → 更新」填镜像前缀，比如 https://ghproxy.cn/）'}` };
+    return { ok: false, error: `下载失败：${dl.error}${downloadHint(line.mode)}` };
   }
   if (appUpdateJob) {
     appUpdateJob.phase = 'install';
