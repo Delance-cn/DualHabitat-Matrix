@@ -109,6 +109,101 @@ function fmtBytes(n) {
   return `${v} B`;
 }
 
+/* ── 用量统计 ────────────────────────────────────────── */
+
+const fmtTok = (n) => {
+  const v = Number(n) || 0;
+  if (v >= 1e8) return `${(v / 1e8).toFixed(2)} 亿`;
+  if (v >= 1e4) return `${(v / 1e4).toFixed(1)} 万`;
+  return String(v);
+};
+const fmtMoney = (n) => (Number(n) > 0 ? `$${Number(n).toFixed(4)}` : '—');
+const fmtTps = (v) => (Number(v) > 0 ? `≈${v} tok/s` : '—');
+const fmtTtft = (ms) => (Number(ms) > 0 ? (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`) : '—');
+
+let usageCache = null;
+
+async function loadUsage() {
+  const u = await api('/api/usage');
+  if (u.ok === false) {
+    usageCache = null;
+    $('#us-cost').textContent = '—';
+    $('#us-req').textContent = '—';
+    $('#us-tok').textContent = '—';
+    $('#us-hit').textContent = '—';
+    return setResult('#usage-result', u.error ?? '读不了会话库', 'err');
+  }
+  usageCache = u;
+  renderUsage(u);
+}
+
+function hmLevel(tokens, max) {
+  if (!tokens || !max) return 0;
+  const r = tokens / max;
+  if (r > 0.75) return 4;
+  if (r > 0.5) return 3;
+  if (r > 0.25) return 2;
+  return 1;
+}
+
+function renderUsage(u) {
+  if (!u || u.ok === false) return;
+  const t = u.totals;
+  if (u.empty || !t) {
+    $('#us-cost').textContent = '—';
+    $('#us-req').textContent = '—';
+    $('#us-tok').textContent = '—';
+    $('#us-hit').textContent = '—';
+    $('#us-heatmap').innerHTML = '<span class="hint">还没有任何调用记录 —— 发一条消息就有了。</span>';
+    $('#us-log').innerHTML = '';
+    return;
+  }
+  $('#us-cost').textContent = fmtMoney(t.cost);
+  $('#us-cost-sub').textContent = t.cost > 0 ? '按厂商定价估算' : '（免费额度 / 未计价模型）';
+  $('#us-req').textContent = String(t.requests);
+  $('#us-req-sub').textContent = t.errors ? `${t.ok} 成功 · ${t.errors} 失败` : '全部成功';
+  const spent = t.input + t.output + t.reasoning + t.cacheWrite;
+  $('#us-tok').textContent = fmtTok(spent);
+  $('#us-tok-sub').textContent = `入 ${fmtTok(t.input)} · 出 ${fmtTok(t.output)}`;
+  $('#us-hit').textContent = t.cacheHitRate > 0 ? `${Math.round(t.cacheHitRate * 100)}%` : '—';
+  $('#us-hit-sub').textContent = t.cacheRead > 0 ? `命中 ${fmtTok(t.cacheRead)}` : '没有缓存统计';
+
+  /* 热力图：列对齐周一，最后一列是本周；从本周一回退 25 周共 26 列 */
+  const byDay = new Map(u.days.map((d) => [d.date, d]));
+  const maxTok = Math.max(1, ...u.days.map((d) => d.tokens));
+  const today = new Date();
+  const end = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const daysSinceMonday = (end.getDay() + 6) % 7;
+  const start = new Date(end);
+  start.setDate(end.getDate() - daysSinceMonday - 25 * 7);
+  const cells = [];
+  const pad2 = (n) => String(n).padStart(2, '0');
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const key = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    const row = byDay.get(key);
+    cells.push(`<span class="hm-cell hm-${hmLevel(row?.tokens, maxTok)}" title="${key}：${row ? `${row.requests} 次请求 · ${fmtTok(row.tokens)} tokens · ${fmtMoney(row.cost)}` : '无调用'}"></span>`);
+  }
+  $('#us-heatmap').innerHTML = cells.join('');
+
+  /* 请求日志：最新 100 条 */
+  $('#us-log').innerHTML = (u.recent ?? [])
+    .map((r) => {
+      const d = new Date(r.t);
+      const sameDay = new Date().toDateString() === d.toDateString();
+      const when = sameDay
+        ? `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
+        : `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+      const model = r.provider ? `${esc(r.model)}<span class="usage-prov">${esc(r.provider)}</span>` : esc(r.model);
+      const status = r.status === 'error' ? `<span class="usage-err" title="${esc(r.error)}">失败</span>` : '<span class="usage-ok">成功</span>';
+      return `<tr><td class="mono">${when}</td><td>${esc(r.app)}</td><td class="usage-model">${model}</td><td>${fmtMoney(r.cost)}</td><td>${fmtTok(r.input)}</td><td>${fmtTok(r.output)}</td><td>${fmtTok(r.cacheRead)}</td><td>${fmtTps(r.tps)}</td><td>${fmtTtft(r.ttftMs)}</td><td>${status}</td></tr>`;
+    })
+    .join('');
+}
+
+$('#btn-usage-refresh').addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '统计中…', loadUsage);
+});
+
 /* ── 通用确认弹窗 ───────────────────────────────────── */
 
 let modalResolve = null;
@@ -596,7 +691,11 @@ function loadPage(name) {
   if (name === 'status') return renderStatus();
   if (name === 'wx-overview') return loadWxOverview();
   if (name === 'hook') return loadHook();
-  if (name === 'models') return loadModels();
+  if (name === 'models') {
+    // 用量统计独立拉，不挡模型表加载 —— 哪个先回来哪个先画
+    loadUsage();
+    return loadModels();
+  }
   if (name === 'backend') return loadBackend();
   if (name === 'chat') return loadChat();
   if (name === 'messages') return loadMessages();
@@ -1766,11 +1865,28 @@ $('#btn-app-update').addEventListener('click', async (e) => {
     okLabel: '下载并安装'
   });
   if (!ok) return;
-  await busy(btn, '下载中…', async () => {
-    const r = await post('/api/app/update/apply', { assetUrl: asset.url });
-    if (r.ok === false) toast(r.error ?? '安装失败');
-    else toast('安装程序已启动，本程序马上退出');
-  });
+  // 下载进度条：apply 请求会一直挂到下载完，另起 1 秒轮询把进度画在横幅里
+  const bar = $('#app-update-progress');
+  const fill = $('#app-update-pct');
+  const label = $('#app-update-progress-text');
+  bar.hidden = false;
+  fill.style.width = '0%';
+  const poll = setInterval(async () => {
+    const p = await api('/api/app/update/progress');
+    if (!p.active) return;
+    fill.style.width = `${p.pct}%`;
+    label.textContent = p.total ? `${p.note}（${fmtBytes(p.got)} / ${fmtBytes(p.total)}）` : (p.note ?? '');
+  }, 1000);
+  try {
+    await busy(btn, '下载中…', async () => {
+      const r = await post('/api/app/update/apply', { assetUrl: asset.url });
+      if (r.ok === false) toast(r.error ?? '安装失败');
+      else toast('安装程序已启动，本程序马上退出');
+    });
+  } finally {
+    clearInterval(poll);
+    bar.hidden = true;
+  }
 });
 
 $('#btn-napcat-update').addEventListener('click', async (e) => {
@@ -4411,6 +4527,7 @@ async function loadSettings() {
   const a = r.app ?? {};
   $('#upd-app-mode').value = a.updateMode ?? 'notify';
   $('#upd-repo').value = a.updateRepo ?? '';
+  $('#upd-app-mirror').value = a.updateMirror ?? '';
 }
 
 $('#btn-save-settings').addEventListener('click', async (e) => {
@@ -4436,7 +4553,7 @@ $('#btn-save-settings').addEventListener('click', async (e) => {
 $('#btn-save-updates').addEventListener('click', async (e) => {
   await busy(e.target.closest('button'), '保存中…', async () => {
     const r = await post('/api/settings', {
-      app: { updateMode: $('#upd-app-mode').value, updateRepo: $('#upd-repo').value.trim() },
+      app: { updateMode: $('#upd-app-mode').value, updateRepo: $('#upd-repo').value.trim(), updateMirror: $('#upd-app-mirror').value.trim() },
       napcat: {
         updateMode: $('#upd-napcat-mode').value,
         updateRepo: $('#upd-napcat-repo').value.trim(),

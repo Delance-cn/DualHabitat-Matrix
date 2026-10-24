@@ -123,6 +123,10 @@
         <div class="banner-text">
           <strong id="banner-app-title">有新版本</strong>
           <span id="banner-app-sub">下载后会自动关掉本程序并安装，装完自动重开。</span>
+          <div class="update-progress" id="app-update-progress" hidden>
+            <div class="update-progress-bar"><div class="update-progress-fill" id="app-update-pct"></div></div>
+            <span class="update-progress-text" id="app-update-progress-text">0%</span>
+          </div>
         </div>
         <div class="banner-actions">
           <button class="btn btn-sm btn-primary" id="btn-app-update">下载并安装</button>
@@ -440,6 +444,35 @@
           <span class="badge warn" id="mh-pool">模型池 —</span>
           <span class="badge warn" id="mh-bridge">服务未启动</span>
         </div>
+      </div>
+
+      <div class="panel" id="usage-panel">
+        <div class="panel-head">
+          <h2>用量统计</h2>
+          <span class="hint">读本地会话库，QQ 和微信一起算；打开本页时自动加载</span>
+          <span class="spacer"></span>
+          <button class="btn btn-sm btn-ghost" id="btn-usage-refresh">刷新</button>
+        </div>
+        <div class="usage-cards">
+          <div class="usage-card"><span class="usage-k">总成本</span><strong id="us-cost">—</strong><span class="usage-sub" id="us-cost-sub"></span></div>
+          <div class="usage-card"><span class="usage-k">请求次数</span><strong id="us-req">—</strong><span class="usage-sub" id="us-req-sub"></span></div>
+          <div class="usage-card"><span class="usage-k">消耗 Tokens</span><strong id="us-tok">—</strong><span class="usage-sub" id="us-tok-sub"></span></div>
+          <div class="usage-card"><span class="usage-k">缓存命中率</span><strong id="us-hit">—</strong><span class="usage-sub" id="us-hit-sub"></span></div>
+        </div>
+        <div class="usage-heatmap-wrap">
+          <div class="usage-hm-title">每日用量<span class="hint" style="margin-left:8px">最近 26 周，颜色越深当天用得越多</span></div>
+          <div class="usage-heatmap" id="us-heatmap"></div>
+          <div class="usage-hm-legend">少 <span class="hm-cell hm-0"></span><span class="hm-cell hm-1"></span><span class="hm-cell hm-2"></span><span class="hm-cell hm-3"></span><span class="hm-cell hm-4"></span> 多</div>
+        </div>
+        <div class="usage-log-wrap">
+          <table class="usage-table">
+            <thead>
+              <tr><th>时间</th><th>应用</th><th>模型</th><th>成本</th><th>输入</th><th>输出</th><th>缓存</th><th>速度</th><th>首字</th><th>状态</th></tr>
+            </thead>
+            <tbody id="us-log"></tbody>
+          </table>
+        </div>
+        <div class="actions"><span class="result" id="usage-result"></span></div>
       </div>
 
       <div class="panel">
@@ -1979,6 +2012,11 @@
           <label for="upd-repo">软件更新源</label>
           <input id="upd-repo" placeholder="GitHub 仓库，owner/repo" spellcheck="false" />
           <span class="hint">发行版里的资产名要含 <code>Setup</code> 并以 <code>.exe</code> 结尾。</span>
+        </div>
+        <div class="field" data-adv>
+          <label for="upd-app-mirror">软件下载镜像前缀</label>
+          <input id="upd-app-mirror" placeholder="https://ghproxy.cn/  （直连下不动时填）" spellcheck="false" />
+          <span class="hint">只拼在安装包下载地址前面，版本查询仍然直连 GitHub。</span>
         </div>
         <div class="field-row" data-adv>
           <div class="field">

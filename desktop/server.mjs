@@ -15,7 +15,6 @@ import path from 'node:path';
 import os from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { reloadSecretsInRunningServer, saveSecretsAndApply } from './secrets-reload.mjs';
@@ -1348,6 +1347,142 @@ async function readModelUsage() {
   }
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * 用量统计
+ *
+ * 数据源是 OpenCode 的本地会话库（opencode.db，只读打开）：每条助手消息里
+ * 记了 cost、五类 token 和 created / streamed / completed 三个时间戳 ——
+ * 首字延迟、出字速度都从时间差里算。只在本地读，不联网、不写库。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+function usageDbFiles() {
+  const cfg = loadConfig();
+  // 和 readModelUsage 同一套候选路径；带 wechat 的是微信实例的库
+  const list = [
+    ['QQ', path.join(path.dirname(matrixStateDir('qq', cfg)), 'data', 'opencode', 'opencode.db')],
+    ['QQ', path.join(dataRoot(), '.oc', 'data', 'opencode', 'opencode.db')],
+    ['微信', path.join(path.dirname(matrixStateDir('wechat', cfg)), 'data', 'opencode', 'opencode.db')],
+    ['微信', path.join(dataRoot(), '.oc', 'wechat', 'data', 'opencode', 'opencode.db')]
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const [app, file] of list) {
+    if (!fs.existsSync(file)) continue;
+    const key = path.resolve(file).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ app, file: path.resolve(file) });
+  }
+  return out;
+}
+
+async function readUsageStats() {
+  if (_sqliteCtor === null) {
+    _sqliteCtor = await import('node:sqlite').then((m) => m.DatabaseSync).catch(() => false);
+  }
+  if (!_sqliteCtor) return { ok: false, error: '这个环境没有 node:sqlite，读不了会话库' };
+  const files = usageDbFiles();
+  if (!files.length) return { ok: true, empty: true, totals: null, days: [], models: [], recent: [] };
+  const rows = [];
+  for (const { app, file } of files) {
+    let db;
+    try {
+      db = new _sqliteCtor(file, { readOnly: true });
+    } catch {
+      continue;
+    }
+    try {
+      const rs = db
+        .prepare(
+          `SELECT
+             json_extract(data, '$.time.created')   AS t0,
+             json_extract(data, '$.time.streamed')  AS tts,
+             json_extract(data, '$.time.completed') AS t1,
+             json_extract(data, '$.cost')           AS cost,
+             json_extract(data, '$.tokens.input')   AS tin,
+             json_extract(data, '$.tokens.output')  AS tout,
+             json_extract(data, '$.tokens.reasoning') AS treason,
+             json_extract(data, '$.tokens.cache.read')  AS tcr,
+             json_extract(data, '$.tokens.cache.write') AS tcw,
+             json_extract(data, '$.model.id')        AS model,
+             json_extract(data, '$.model.providerID') AS provider,
+             json_extract(data, '$.finish')          AS finish,
+             json_extract(data, '$.error.message')   AS err
+           FROM session_message WHERE type = 'assistant' ORDER BY time_created ASC`
+        )
+        .all();
+      for (const r of rs) rows.push({ app, ...r });
+    } catch {
+      /* 这个库读不了（老版本结构？）就跳过，另一个库可能还好着 */
+    } finally {
+      try { db.close(); } catch { /* 关不掉就算了 */ }
+    }
+  }
+  const num = (v) => Number(v) || 0;
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const totals = { cost: 0, requests: rows.length, ok: 0, errors: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+  const days = new Map();
+  const models = new Map();
+  const recent = [];
+  for (const r of rows) {
+    const failed = r.finish === 'error' || r.err != null;
+    if (failed) totals.errors += 1;
+    else totals.ok += 1;
+    const inTok = num(r.tin);
+    const outTok = num(r.tout);
+    const cacheRead = num(r.tcr);
+    totals.cost += num(r.cost);
+    totals.input += inTok;
+    totals.output += outTok;
+    totals.reasoning += num(r.treason);
+    totals.cacheRead += cacheRead;
+    totals.cacheWrite += num(r.tcw);
+    if (r.t0) {
+      const d = new Date(r.t0);
+      const key = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+      const day = days.get(key) ?? { date: key, cost: 0, requests: 0, tokens: 0 };
+      day.cost += num(r.cost);
+      day.requests += 1;
+      day.tokens += inTok + outTok + num(r.treason) + num(r.tcw);
+      days.set(key, day);
+    }
+    const modelId = String(r.model ?? '未知');
+    const provider = String(r.provider ?? '');
+    const mkey = provider ? `${provider}/${modelId}` : modelId;
+    const m = models.get(mkey) ?? { model: mkey, requests: 0, cost: 0, input: 0, output: 0 };
+    m.requests += 1;
+    m.cost += num(r.cost);
+    m.input += inTok;
+    m.output += outTok;
+    models.set(mkey, m);
+    // 速度：出字段的 token / 流式传输秒数；首字：streamed - created
+    const tps = r.t1 > r.tts && outTok > 0 ? outTok / ((r.t1 - r.tts) / 1000) : 0;
+    const ttft = r.tts > r.t0 ? r.tts - r.t0 : 0;
+    recent.push({
+      t: r.t0,
+      app: r.app,
+      model: modelId,
+      provider,
+      cost: num(r.cost),
+      input: inTok,
+      output: outTok,
+      cacheRead,
+      tps: Math.round(tps),
+      ttftMs: ttft,
+      status: failed ? 'error' : 'ok',
+      error: failed ? String(r.err ?? '').slice(0, 120) : ''
+    });
+  }
+  const denom = totals.input + totals.cacheRead;
+  return {
+    ok: true,
+    totals: { ...totals, cacheHitRate: denom > 0 ? totals.cacheRead / denom : 0 },
+    days: [...days.values()].sort((a, b) => (a.date < b.date ? -1 : 1)),
+    models: [...models.values()].sort((a, b) => b.cost - a.cost || b.requests - a.requests).slice(0, 8),
+    recent: recent.slice(-100).reverse()
+  };
+}
+
 /** 池子里有哪些模型正在坐废池：熔断记录 ∩ 池内 id。 */
 function spentInPool(pool) {
   const ids = [...(pool.free ?? []), ...(pool.paid ?? [])].map(String);
@@ -2410,6 +2545,8 @@ function appSettings() {
   return {
     updateMode: a.updateMode === 'off' ? 'off' : 'notify',
     updateRepo: String(a.updateRepo ?? 'Delance-cn/DualHabitat-Matrix'),
+    // 国内直连 GitHub 不稳：镜像前缀和 NapCat 那套同款，下载 URL 拼成 镜像/原始URL
+    updateMirror: String(a.updateMirror ?? '').replace(/\/$/, ''),
     lastUpdateCheck: Number(a.lastUpdateCheck) || 0
   };
 }
@@ -2451,21 +2588,43 @@ async function appUpdateInfo() {
   };
 }
 
+/* 本体安装包下载的实时进度 —— /api/app/update/progress 轮询的就是它。
+   下载动辄几百 MB、几分钟，前端必须能看到走到哪了。 */
+let appUpdateJob = null;
+
 async function applyAppUpdate(assetUrl) {
   if (!electronApp) return { ok: false, error: '开发模式不支持自更新（没有安装器），请手动下载新安装包' };
   const info = await appUpdateInfo();
   const asset = assetUrl ? (info.assets.find((a) => a.url === assetUrl) ?? null) : info.picked;
   if (!asset) return { ok: false, error: '发行版里没有找到 Setup 安装包（资产名要含 Setup 并以 .exe 结尾）' };
+  const { updateMirror } = appSettings();
+  // 和 NapCat / ffmpeg 同一套：镜像前缀拼在下载 URL 前面，API 查询不走镜像
+  const url = updateMirror ? `${updateMirror}/${asset.url}` : asset.url;
   const tmp = path.join(os.tmpdir(), `dhm-update-${Date.now()}`);
   fs.mkdirSync(tmp, { recursive: true });
   const exePath = path.join(tmp, asset.name);
-  pushLog(`下载新版本安装包：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB）`, 'sys', 'app');
-  try {
-    const res = await fetch(asset.url, { signal: AbortSignal.timeout(600_000) });
-    if (!res.ok) return { ok: false, error: `下载失败 HTTP ${res.status}` };
-    await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(exePath));
-  } catch (error) {
-    return { ok: false, error: `下载失败：${error?.message ?? error}` };
+  pushLog(`下载新版本安装包：${asset.name}（${(asset.size / 1048576).toFixed(1)} MB）${updateMirror ? `（镜像 ${updateMirror}）` : ''}`, 'sys', 'app');
+  appUpdateJob = { phase: 'download', pct: 0, got: 0, total: asset.size, note: '连接中…', startedAt: Date.now(), error: '' };
+  const dl = await downloadToFile(url, exePath, (ratio, got, total) => {
+    if (appUpdateJob) {
+      appUpdateJob.pct = Math.round(ratio * 100);
+      appUpdateJob.got = got;
+      appUpdateJob.total = total;
+      appUpdateJob.note = `下载中 ${Math.round(ratio * 100)}%`;
+    }
+  });
+  if (!dl.ok) {
+    if (appUpdateJob) {
+      appUpdateJob.phase = 'error';
+      appUpdateJob.error = dl.error;
+      appUpdateJob.note = '下载失败';
+    }
+    return { ok: false, error: `下载失败：${dl.error}${updateMirror ? '' : '（GitHub 直连不行就在「高级 → 更新」填镜像前缀，比如 https://ghproxy.cn/）'}` };
+  }
+  if (appUpdateJob) {
+    appUpdateJob.phase = 'install';
+    appUpdateJob.pct = 100;
+    appUpdateJob.note = '下载完成，正在启动安装程序…';
   }
   const child = spawn(exePath, ['/S'], { detached: true, stdio: 'ignore', windowsHide: true });
   child.unref();
@@ -5843,6 +6002,11 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, { ...result, secrets: secretPresence() });
     }
 
+    if (p === '/api/usage') {
+      // GET：从本地会话库汇总用量（成本 / token / 热力图 / 请求日志）
+      return sendJson(res, await readUsageStats());
+    }
+
     if (p === '/api/models') {
       const body = await readBody(req);
       try {
@@ -5963,6 +6127,11 @@ const server = http.createServer(async (req, res) => {
       s.app = { ...(s.app ?? {}), lastReminded: s.app?.lastUpdateFound ?? '' };
       writeJson(SETTINGS_FILE, s);
       return sendJson(res, { ok: true });
+    }
+
+    if (p === '/api/app/update/progress') {
+      // 下载进度轮询：没在下载时给 active:false，前端好收尾
+      return sendJson(res, appUpdateJob ? { active: true, ...appUpdateJob } : { active: false });
     }
 
     if (p === '/api/app/update/apply') {
