@@ -726,6 +726,9 @@ async function refreshState() {
   } else if (currentPage === 'status') {
     // 状态页跟着轮询重画，运行时长才会自己走
     renderStatus();
+  } else if (currentPage === 'models') {
+    // 探测结果跟着状态轮询走：chips / 模型候选 / 一键切换横幅保持新鲜，表单不动
+    refreshModelsLive();
   }
 }
 
@@ -2117,6 +2120,97 @@ function renderLocalServers(s) {
   });
 }
 
+/* ── 本机服务一键切换提示 ──────────────────────────────
+ *
+ * 探测到本机有在跑的模型服务、而当前平台的模型配置没有指向它时，横幅给一个
+ * 「一键切换」：填表 + 点保存并应用，一气呵成。忽略过的地址记在 localStorage，
+ * 同一个服务不再弹第二次；探测结果每 6 秒跟着状态刷新。
+ */
+const LOCAL_SUGGEST_KEY = 'dhm-local-suggest-dismissed';
+
+function dismissedLocalSuggest() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(LOCAL_SUGGEST_KEY) ?? '[]'));
+  } catch {
+    return new Set();
+  }
+}
+
+function localSuggestApply(x) {
+  const sel = document.getElementById('chat-provider');
+  const has = sel && Array.from(sel.options).some((o) => o.value === x.id);
+  if (sel) sel.value = has ? x.id : 'custom';
+  applyProvider('chat', sel.value, { force: true });
+  const baseUrl = document.getElementById('chat-baseUrl');
+  if (baseUrl) baseUrl.value = x.baseUrl;
+  const picked = localChatModels(x.id)[0] ?? x.models?.[0] ?? '';
+  const model = document.getElementById('chat-model');
+  if (model && picked) model.value = picked;
+  const key = document.getElementById('chat-apiKey');
+  if (key && !key.value) key.value = 'local';
+  refreshModelSuggestions('chat');
+  // 程序化改值不触发 change，发事件让自动保存链路知道；再点「保存并应用」走完整保存
+  for (const name of ['baseUrl', 'model']) {
+    document.getElementById(`chat-${name}`)?.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  document.getElementById('chat-btn-save-model')?.click();
+  toast(`正在切换到 ${x.label}${picked ? ` · ${picked}` : ''}…`);
+}
+
+function renderLocalModelBanner() {
+  const banner = document.getElementById('banner-local-model');
+  if (!banner) return;
+  const running = (S?.localModelServers ?? []).filter((x) => x.running && localChatModels(x.id).length);
+  const profile = modelProfilesLoaded ? modelProfiles?.[platform()]?.chat ?? null : null;
+  const curBase = String(profile?.baseUrl ?? '').trim().replace(/\/$/, '');
+  const current = profile
+    ? running.find((x) => profile.provider === x.id && (!curBase || curBase === x.baseUrl.replace(/\/$/, '')))
+    : null;
+  const dismissed = dismissedLocalSuggest();
+  const offered = running.filter((x) => (!current || x.id !== current.id) && !dismissed.has(`${x.id}|${x.baseUrl}`));
+  const actions = document.getElementById('local-model-actions');
+  const title = document.getElementById('local-model-title');
+  const sub = document.getElementById('local-model-sub');
+  if (!actions || !title || !sub) return;
+  if (!offered.length) {
+    banner.hidden = true;
+    return;
+  }
+  banner.hidden = false;
+  title.textContent = current ? '本机还有别的模型服务在跑' : '检测到本机模型服务，一键就能用';
+  sub.textContent = offered
+    .map((x) => `${x.label}（${localChatModels(x.id).length} 个模型 · ${localChatModels(x.id)[0]}）`)
+    .join(' · ') + ' —— 点「一键切换」自动填好并保存生效，不用手动搬地址和模型名。';
+  actions.innerHTML = '';
+  for (const x of offered) {
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-sm btn-primary';
+    btn.textContent = `一键切换到 ${x.label}`;
+    btn.addEventListener('click', () => localSuggestApply(x));
+    actions.appendChild(btn);
+  }
+  const later = document.createElement('button');
+  later.className = 'btn btn-sm btn-ghost';
+  later.textContent = '忽略';
+  later.title = '这些服务地址不再提醒（换了地址或新服务会再提示）';
+  later.addEventListener('click', () => {
+    dismissLocalSuggest(offered.map((x) => `${x.id}|${x.baseUrl}`));
+    banner.hidden = true;
+  });
+  actions.appendChild(later);
+}
+
+/** models 页开着时的轻刷新：只重画探测 chips / 模型候选 / 提示横幅，不动表单。 */
+function refreshModelsLive() {
+  if (currentPage !== 'models') return;
+  for (const def of SLOT_DEFS) {
+    if (!document.getElementById(`${def.key}-local-servers`)) continue;
+    renderLocalServers(def.key);
+    refreshModelSuggestions(def.key);
+  }
+  renderLocalModelBanner();
+}
+
 function collectSource(s) {
   const el = (name) => document.getElementById(`${s}-${name}`);
   const num = (name) => {
@@ -2528,11 +2622,34 @@ function refreshPoolSuggestions() {
   for (const id of [...(poolDraft?.free ?? []), ...(poolDraft?.paid ?? [])]) add(id);
 }
 
-/** 模型池条目必须是 `provider/model`，不能是裸模型名、`/model` 或 `provider/`。 */
+/** 裸模型名能不能对上本机在跑的本地服务（ollama/lmstudio/…）？对上返回服务 id。 */
+function localModelForBare(id) {
+  const bare = String(id ?? '').split('#')[0].trim();
+  if (!bare || bare.includes('/')) return null;
+  const servers = S?.localModelServers ?? [];
+  const running = servers.filter((x) => x.running);
+  for (const x of [...running, ...servers]) {
+    if ((x.models ?? []).some((m) => String(m).split('#')[0] === bare)) return x.id;
+  }
+  return null;
+}
+
+/** 模型池条目必须是 `provider/model`。例外：本机服务里真实存在的裸模型名 ——
+    LM Studio / Ollama 的模型本来就没有厂商前缀，保存时自动补上，不算写法不对。 */
 function poolEntryBad(id) {
   const text = String(id ?? '').trim();
   const slash = text.indexOf('/');
-  return slash <= 0 || slash === text.length - 1;
+  if (slash > 0 && slash !== text.length - 1) return false;
+  return !localModelForBare(text);
+}
+
+/** 裸名条目保存时会被补成什么。 */
+function poolEntryNormalized(id) {
+  const text = String(id ?? '').trim();
+  const owner = localModelForBare(text);
+  if (!owner || text.includes('/')) return text;
+  const at = text.indexOf('#');
+  return at > 0 ? `${owner}/${text.slice(0, at)}${text.slice(at)}` : `${owner}/${text}`;
 }
 
 function renderPool() {
@@ -2540,10 +2657,12 @@ function renderPool() {
   refreshPoolSuggestions();
   const row = (id, list) => {
     const bad = poolEntryBad(id);
+    const bareLocal = !bad && !String(id).includes('/');
+    const tag = bad ? '<span class="pool-tag">写法不对</span>' : bareLocal ? `<span class="pool-tag">保存时补 ${esc(localModelForBare(id))}/</span>` : '';
     return `
-    <div class="pool-item ${bad ? 'is-invalid' : ''}" data-id="${esc(id)}" data-list="${list}" title="${bad ? '写法不对：要写成 厂商/模型' : ''}">
+    <div class="pool-item ${bad ? 'is-invalid' : ''}" data-id="${esc(id)}" data-list="${list}" title="${bad ? '写法不对：要写成 厂商/模型' : bareLocal ? '本机服务里的模型，保存时自动补上厂商前缀' : ''}">
       <span class="pool-name">${esc(id)}</span>
-      ${bad ? '<span class="pool-tag">写法不对</span>' : ''}
+      ${tag}
       <button class="btn btn-sm btn-ghost" data-move="up" title="上移">↑</button>
       <button class="btn btn-sm btn-ghost" data-move="down" title="下移">↓</button>
       <button class="btn btn-sm btn-ghost" data-remove="1" title="移出">✕</button>
@@ -2638,8 +2757,9 @@ async function savePoolAuto() {
     enabled: poolDraft.enabled !== false,
     allowPaid: poolDraft.allowPaid === true,
     exhaustedNotice: $('#poolNotice').value,
-    free: poolDraft.free,
-    paid: poolDraft.paid
+    // 本机服务的裸模型名在出口统一补上厂商前缀，别让服务端当写法错误丢掉
+    free: (poolDraft.free ?? []).map(poolEntryNormalized),
+    paid: (poolDraft.paid ?? []).map(poolEntryNormalized)
   });
   if (r.ok === false) return setResult('#pool-result', r.error ?? '保存失败', 'err');
   autoSavedSig.set('pool', mark);
@@ -2807,6 +2927,7 @@ async function loadModels() {
 
   await loadPrice();
   renderModelHero();
+  renderLocalModelBanner();
 }
 
 /** 模型页顶部的一行“现在到底在用谁”，省得用户在长表单里自己拼。 */

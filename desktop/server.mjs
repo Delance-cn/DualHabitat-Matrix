@@ -5339,19 +5339,36 @@ const server = http.createServer(async (req, res) => {
 
       const body = await readBody(req);
       const pool = loadPool();
+      // 本机服务（LM Studio/Ollama/…）的模型没有厂商前缀，池子又只认 provider/model ——
+      // 能对上探测结果的裸名就自动补上，补不上的才丢弃。
+      const localServers = await detectLocalModelServers();
+      const ownerOfBare = (bare) => {
+        const text = String(bare ?? '').split('#')[0].trim();
+        if (!text || text.includes('/')) return null;
+        const running = localServers.filter((x) => x.running);
+        for (const x of [...running, ...localServers]) {
+          if ((x.models ?? []).some((m) => String(m).split('#')[0] === text)) return x.id;
+        }
+        return null;
+      };
       const dropped = [];
       const clean = (v, label) => {
         const out = [];
         const seen = new Set();
         for (const raw of Array.isArray(v) ? v : []) {
-          const id = String(raw ?? '').trim();
+          let id = String(raw ?? '').trim();
           if (!id) continue;
           // 模型池只认 provider/model。裸模型名传进 ModelChain 会抛错，
-          // 0.5.5 的桥接就是被这一条带崩的 —— 保存时直接拒绝，别留到运行时。
+          // 0.5.5 的桥接就是被这一条带崩的 —— 所以要么补上厂商前缀，要么拒绝。
           const slash = id.indexOf('/');
           if (slash <= 0 || slash === id.length - 1) {
-            dropped.push(`${label}: ${id}`);
-            continue;
+            const owner = ownerOfBare(id);
+            if (!owner) {
+              dropped.push(`${label}: ${id}`);
+              continue;
+            }
+            const at = id.indexOf('#');
+            id = at > 0 ? `${owner}/${id.slice(0, at)}${id.slice(at)}` : `${owner}/${id}`;
           }
           if (seen.has(id)) continue;
           seen.add(id);
