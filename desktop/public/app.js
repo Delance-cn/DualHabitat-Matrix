@@ -217,6 +217,8 @@ const I18N_EN = {
   '浅色': 'Light',
   '设置': 'Settings',
   '联系': 'Contact',
+  '有新版本': 'Update available',
+  '有新版本，点这里回总览页升级': 'Update available — click to go back to Overview',
   '设置：语言、字体大小、开机自启': 'Settings: language, font size, launch at login',
   '联系方式与仓库地址': 'Contact info & repository',
   '语言': 'Language',
@@ -273,6 +275,8 @@ function applyFootLabels() {
   $('#contact-label').textContent = t('联系');
   $('#btn-settings').title = t('设置：界面模式、语言、字体大小、外观、开机自启');
   $('#btn-contact').title = t('联系方式与仓库地址');
+  $('#update-indicator-label').textContent = t('有新版本');
+  $('#btn-update-indicator').title = t('有新版本，点这里回总览页升级');
 }
 
 /* 字号：整体 zoom（布局大量用 px，改根字号无效）。1 = 标准，不写内联样式 */
@@ -317,6 +321,8 @@ function openSettings() {
 }
 
 $('#btn-settings').addEventListener('click', openSettings);
+/* 侧栏底部的更新指示：任何页面点了都回总览，横幅在那等着 */
+$('#btn-update-indicator').addEventListener('click', () => showPage('overview'));
 $('#settings-done').addEventListener('click', () => $('#settings-mask').classList.remove('is-on'));
 $('#settings-mask').addEventListener('click', (e) => {
   if (e.target.id === 'settings-mask') $('#settings-mask').classList.remove('is-on');
@@ -624,6 +630,9 @@ async function refreshState() {
   }
 }
 
+/* 本次会话是否已经为「有新版本」弹过气泡 —— 只弹一次，之后靠指示按钮常亮 */
+let updateToastShown = false;
+
 function renderShell() {
   if (!S) return;
   const running = [S.napcat?.reachable, S.bridge?.running, S.wechat?.running].filter(Boolean).length;
@@ -639,6 +648,18 @@ function renderShell() {
   // 否则这里每 6 秒抛一次 TypeError，总览页的状态灯永远刷不动。
   const badge = $('#nav-badge-update');
   if (badge) badge.hidden = !(appNew || ncNew);
+
+  // 全局更新入口：横幅只在总览页，待在通道页里的人什么提示都收不到 ——
+  // 侧栏底部常驻一个按钮，任何页面都看得见，点了回总览升级。
+  const updBtn = $('#btn-update-indicator');
+  if (updBtn) updBtn.hidden = !(appNew || ncNew);
+  // 每次开软件只弹一次气泡提醒；之后指示按钮常亮，不再打扰
+  if ((appNew || ncNew) && !updateToastShown) {
+    updateToastShown = true;
+    const en = uiLang() === 'en';
+    if (appNew) toast(en ? `New version ${S.updates.app.found} available — go to Overview to update` : `软件有新版本 ${S.updates.app.found}，回总览页可升级`);
+    else toast(en ? `New NapCat ${S.updates.napcat.found} available — go to Overview to update` : `NapCat 有新版本 ${S.updates.napcat.found}，回总览页可升级`);
+  }
 }
 
 setInterval(refreshState, 6000);

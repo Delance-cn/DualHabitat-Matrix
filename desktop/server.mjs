@@ -2349,6 +2349,8 @@ function startComponentInstall(id) {
   return { ok: true, started: true, id };
 }
 
+/** 静默查一次 NapCat 更新并记账。不写日志 —— 周期复查每 30 分钟调一次，
+    在这里打日志就是刷屏；「有新版本」的提示由 runNapcatUpdateCheck 去重后发。 */
 async function checkNapcatUpdateOnce() {
   try {
     const info = await napcatUpdateInfo();
@@ -2361,32 +2363,36 @@ async function checkNapcatUpdateOnce() {
       lastUpdateFound: upToDate ? '' : info.tag
     };
     writeJson(SETTINGS_FILE, s);
-    if (upToDate) {
-      pushLog(`NapCat 已是最新（${info.tag}）`, 'sys', 'napcat');
-      return { ok: true, ...info, updateAvailable: false };
-    }
-    pushLog(`NapCat 有新版本：${info.tag}（当前 ${info.current || '未知'}）。去「总览」页更新`, 'sys', 'napcat');
-    return { ok: true, ...info, updateAvailable: true };
+    return { ok: true, ...info, updateAvailable: !upToDate };
   } catch (error) {
-    pushLog(`NapCat 更新检查失败：${error?.message ?? error}`, 'err', 'napcat');
+    // 周期检查失败不吭声：网络/代理问题一会儿就过去了，下一轮自然重试
     return { ok: false, error: String(error?.message ?? error) };
   }
 }
 
-/** 启动时按档位查一次；24 小时内不重复查（省得每次开软件都打 GitHub）。 */
+async function runNapcatUpdateCheck() {
+  const r = await checkNapcatUpdateOnce().catch(() => null);
+  if (!r?.updateAvailable) return;
+  const s = readJson(SETTINGS_FILE);
+  // 日志去重走 lastUpdateLogged；lastReminded 只由「忽略这个版本」写 ——
+  // 之前在这里写 lastReminded，前端「found ≠ reminded 才亮横幅」的判断
+  // 就永远不成立，自动查到的新版一条提示都不出。
+  if (s.napcat?.lastUpdateLogged === r.tag) return;
+  s.napcat = { ...(s.napcat ?? {}), lastUpdateLogged: r.tag };
+  writeJson(SETTINGS_FILE, s);
+  pushLog(`NapCat 有新版本 ${r.tag}（当前 ${r.current || '未知'}）—— 去「总览」页更新`, 'sys', 'napcat');
+}
+
+/** 启动必查（10 分钟内查过就免了，防快速重启连环打 GitHub），之后每 30 分钟复查。
+    0.5.6 之前是「20 小时内不查」—— 发行版发得晚，用户重启也等不到提示。 */
 function scheduleNapcatUpdateCheck() {
   const n = napcatSettings();
   if (n.updateMode === 'off') return;
-  if (Date.now() - n.lastUpdateCheck < 20 * 3600_000) return;
-  setTimeout(async () => {
-    const r = await checkNapcatUpdateOnce().catch(() => null);
-    if (!r?.updateAvailable) return;
-    const s = readJson(SETTINGS_FILE);
-    if (s.napcat?.lastReminded === r.tag) return;
-    s.napcat = { ...(s.napcat ?? {}), lastReminded: r.tag };
-    writeJson(SETTINGS_FILE, s);
-    pushLog(`NapCat 有新版本 ${r.tag}（当前 ${r.current || '未知'}）—— 这个版本只提醒这一次，去「总览」页更新`, 'sys', 'napcat');
-  }, 15_000);
+  if (Date.now() - n.lastUpdateCheck >= 10 * 60_000) setTimeout(() => runNapcatUpdateCheck(), 15_000);
+  setInterval(() => {
+    if (napcatSettings().updateMode === 'off') return;
+    runNapcatUpdateCheck();
+  }, 30 * 60_000);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -2489,35 +2495,45 @@ async function checkAppUpdateOnce() {
   }
 }
 
+async function runAppUpdateCheck() {
+  try {
+    const info = await appUpdateInfo();
+    const st = readJson(SETTINGS_FILE);
+    const app = { ...(st.app ?? {}) };
+    // 日志只对同一个 tag 提一次，别因为周期复查刷屏。横幅/角标的显隐走
+    // 「lastUpdateFound ≠ lastReminded」，lastReminded 只由「忽略这个版本」
+    // 写（/api/app/update/dismiss）—— 之前在这里顺手写 lastReminded，等于一查到
+    // 就替用户点了忽略，横幅永远出不来。
+    if (info.updateAvailable && app.lastUpdateLogged !== info.tag) {
+      app.lastUpdateLogged = info.tag;
+      pushLog(`有新版本 ${info.tag}（当前 ${APP_VERSION}），去「总览」页升级`, 'sys', 'app');
+    }
+    app.lastUpdateCheck = Date.now();
+    app.lastUpdateFound = info.updateAvailable ? info.tag : '';
+    app.lastUpdateError = '';
+    st.app = app;
+    writeJson(SETTINGS_FILE, st);
+  } catch (error) {
+    // 同上：失败也留痕，别让人以为「没提示 = 没更新」
+    try {
+      const st = readJson(SETTINGS_FILE);
+      st.app = { ...(st.app ?? {}), lastUpdateError: String(error?.message ?? error).slice(0, 200) };
+      writeJson(SETTINGS_FILE, st);
+    } catch { /* 写不进就算了 */ }
+  }
+}
+
+/** 启动必查（10 分钟内成功查过就免了，防快速重启连环打 GitHub；失败的
+    check 不写 lastUpdateCheck，所以网络一通重开软件就会重查），之后每
+    30 分钟复查一次 —— 软件开着不动也能等到新版本。 */
 function scheduleAppUpdateCheck() {
   const s = appSettings();
   if (s.updateMode === 'off') return;
-  if (Date.now() - s.lastUpdateCheck < 20 * 3600_000) return;
-  setTimeout(async () => {
-    try {
-      const info = await appUpdateInfo();
-      const st = readJson(SETTINGS_FILE);
-      const app = { ...(st.app ?? {}) };
-      // 同一个版本只提醒一次：提醒过 X 版，X 就不再弹，直到出现更高的版本。
-      // 记的是"提醒过哪个 tag"而不是"有没有提醒过"，所以跳过 0.2.0 之后
-      // 0.3.0 出现时照样会提醒。
-      if (info.updateAvailable && app.lastReminded !== info.tag) {
-        app.lastReminded = info.tag;
-        pushLog(`有新版本 ${info.tag}（当前 ${APP_VERSION}），去「总览」页升级 —— 这个版本只提醒这一次`, 'sys', 'app');
-      }
-      app.lastUpdateCheck = Date.now();
-      app.lastUpdateFound = info.updateAvailable ? info.tag : '';
-      st.app = app;
-      writeJson(SETTINGS_FILE, st);
-    } catch (error) {
-      // 同上：失败也留痕，别让人以为「没提示 = 没更新」
-      try {
-        const st = readJson(SETTINGS_FILE);
-        st.app = { ...(st.app ?? {}), lastUpdateError: String(error?.message ?? error).slice(0, 200) };
-        writeJson(SETTINGS_FILE, st);
-      } catch { /* 写不进就算了 */ }
-    }
-  }, 20_000);
+  if (Date.now() - s.lastUpdateCheck >= 10 * 60_000) setTimeout(runAppUpdateCheck, 20_000);
+  setInterval(() => {
+    if (appSettings().updateMode === 'off') return;
+    runAppUpdateCheck();
+  }, 30 * 60_000);
 }
 
 

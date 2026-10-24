@@ -267,6 +267,12 @@ a:hover { text-decoration: underline; }
 .foot-btn:hover { color: var(--text); border-color: var(--text-3); }
 .foot-btn span:first-child { font-size: 12px; color: var(--text-3); }
 
+/* 更新指示：横幅只在总览页，通道页里没有入口 —— 侧栏底部放一个哪个页面
+   都看得见的按钮，亮色底 + 下箭头，点了回总览升级 */
+.foot-btn-update { border-color: var(--accent-2); background: var(--accent-soft); color: var(--text); }
+.foot-btn-update span:first-child { color: var(--accent); font-weight: 700; }
+.foot-btn-update:hover { border-color: var(--accent); }
+
 main { overflow-y: auto; scroll-behavior: smooth; }
 
 .page { max-width: 1060px; margin: 0 auto; padding: 26px 30px 90px; }
