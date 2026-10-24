@@ -180,7 +180,7 @@ bailian/qwen3.8-max → bailian/kimi-k3 → bailian/MiniMax-M2.5 → bailian/qwe
 
 ## 联系
 
-邮箱：2585175752@qq.com（Delance／杜继承）。遇到问题、想提需求或参与开发，欢迎来信。
+邮箱：2585175752@qq.com（Delance）。遇到问题、想提需求或参与开发，欢迎来信。
 
 ## 许可证
 
