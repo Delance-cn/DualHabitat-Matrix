@@ -140,6 +140,16 @@ export function listProviders() {
   }));
 }
 
+/** Stable, non-secret environment-variable name for one custom model profile slot. */
+export function modelProfileKeyEnv(platform, slot) {
+  const pf = String(platform ?? '').toLowerCase();
+  const key = String(slot ?? '').toLowerCase();
+  if (!['qq', 'wechat'].includes(pf) || !['chat', 'work'].includes(key)) {
+    throw new Error('模型档位必须是 qq/wechat × chat/work');
+  }
+  return `DHM_MODEL_${pf.toUpperCase()}_${key.toUpperCase()}_API_KEY`;
+}
+
 /**
  * 把用户配置（可能只写了 provider 名）补全成完整的 profile。
  *

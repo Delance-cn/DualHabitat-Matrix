@@ -29,12 +29,13 @@ export function mdToPlain(md) {
   return s.trim();
 }
 
-/** 按 QQ 单条消息长度上限切分（群消息一般 ≤ 4500 字，留余量）。 */
-export function splitForQQ(text, max = 4000) {
+/** 按 QQ 单条消息长度上限切分，并限制单次回复最多 20 条。 */
+export function splitForQQ(text, max = 4000, maxParts = 20) {
   const safeMax = Number.isFinite(max) && max >= 1 ? Math.floor(max) : 4000;
+  const safeParts = Number.isFinite(maxParts) && maxParts >= 1 ? Math.floor(maxParts) : 20;
   const parts = [];
   let rest = text;
-  while (rest.length > safeMax) {
+  while (rest.length > safeMax && parts.length < safeParts - 1) {
     let cut = rest.lastIndexOf('\n', safeMax - 1);
     let eat = 0;
     if (cut <= 0) {
@@ -55,7 +56,15 @@ export function splitForQQ(text, max = 4000) {
     parts.push(rest.slice(0, cut + eat));
     rest = rest.slice(cut + eat);
   }
-  if (rest.length > 0) parts.push(rest);
+  if (rest.length > safeMax) {
+    const marker = '…（内容过长，已截断）';
+    let cut = Math.max(0, safeMax - marker.length);
+    if (cut > 0 && rest.charCodeAt(cut - 1) >= 0xd800 && rest.charCodeAt(cut - 1) <= 0xdbff) cut -= 1;
+    if (cut === 0) parts.push(marker.slice(0, safeMax));
+    else parts.push(rest.slice(0, cut) + marker);
+  } else if (rest.length > 0) {
+    parts.push(rest);
+  }
   return parts;
 }
 

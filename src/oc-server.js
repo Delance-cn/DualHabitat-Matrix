@@ -13,6 +13,7 @@
 // 最典型的是代理 —— Clash 开着时起的实例，Clash 关掉后它仍在把**所有** provider
 // 请求发往那个死端口，表现是"整轮静默失败"。所以代理要在**起之前**探活。
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -21,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 // 包名改不了（`@opencode/client`），本地别名统一叫 `Sdk`；导出名必须是 `OpenCode`。
 import { OpenCode as Sdk } from '@opencode/client';
 import { Service } from '@opencode/client/service';
+import { appendRotatedLogFile, rotateLogFile } from './log-rotate.js';
 
 import {
   CONFIG_FILE,
@@ -30,6 +32,7 @@ import {
   SHIM_BASE_URL,
   SHIM_PORT,
   isolatedEnv,
+  loadSecrets,
   probeProxy,
   proxyUrl,
   resolveCli
@@ -44,8 +47,36 @@ const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REGISTER_TIMEOUT_MS = 30_000;
 /** 等 shim 起来的最长时间。 */
 const SHIM_TIMEOUT_MS = 8_000;
+const SECRETS_FINGERPRINT_FILE = path.join(PATHS.state, 'service-secrets.sha256');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Stable digest of the actual secrets injected into the detached service; never persist raw keys. */
+export function secretsFingerprint(secrets = loadSecrets()) {
+  const entries = Object.entries(secrets)
+    .filter(([, value]) => typeof value === 'string' && value)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return createHash('sha256').update(JSON.stringify(entries)).digest('hex');
+}
+
+export function secretsNeedReload(launchedFingerprint, currentFingerprint) {
+  return launchedFingerprint !== currentFingerprint;
+}
+
+function readSecretsFingerprint(file = SECRETS_FINGERPRINT_FILE) {
+  try {
+    return fs.readFileSync(file, 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSecretsFingerprint(fingerprint, file = SECRETS_FINGERPRINT_FILE) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(temporary, `${fingerprint}\n`, 'utf8');
+  fs.renameSync(temporary, file);
+}
 
 /** 进程还活着吗（0 号信号只做权限/存在性检查，不打扰进程）。 */
 export function pidAlive(pid) {
@@ -128,6 +159,28 @@ export function portInUse(port, timeoutMs = 800) {
     socket.once('connect', () => done(true));
     socket.once('timeout', () => done(false));
     socket.once('error', () => done(false));
+  });
+}
+
+export async function assertPortAvailable(port, checkPort = portInUse) {
+  if (await checkPort(port)) {
+    throw new Error(`模型 API 端口 ${port} 已被占用。请结束占用该端口的进程后重试。`);
+  }
+}
+
+export function waitForSpawn(child, onRuntimeError) {
+  return new Promise((resolve, reject) => {
+    const onSpawn = () => {
+      child.removeListener('error', onError);
+      child.on('error', onRuntimeError);
+      resolve(child);
+    };
+    const onError = (error) => {
+      child.removeListener('spawn', onSpawn);
+      reject(error);
+    };
+    child.once('spawn', onSpawn);
+    child.once('error', onError);
   });
 }
 
@@ -246,6 +299,13 @@ function checkCfWiring(log) {
 export async function ensureServer(options = {}) {
   const log = options.log ?? ((m) => console.log(m));
   const port = options.port ?? PORT;
+  let currentSecretsFingerprint = null;
+  let secretsLoadError = null;
+  try {
+    currentSecretsFingerprint = secretsFingerprint();
+  } catch (error) {
+    secretsLoadError = error;
+  }
 
   if (options.force) {
     log('force=true，先停掉现有实例');
@@ -253,16 +313,33 @@ export async function ensureServer(options = {}) {
   } else {
     const status = await serverStatus();
     if (status.running) {
-      log(`模型 API 服务已在运行（pid=${status.pid} version=${status.version}）`);
-      const pool = options.pool ?? loadModelPool().pool;
-      const shim = options.withShim === false
-        ? { needed: false, started: false }
-        : await ensureShim({ pool, log });
-      return { started: false, url: status.url, pid: status.pid, version: status.version, endpoint: status.endpoint, shim };
+      if (secretsLoadError) {
+        log(`⚠️ 无法读取密钥配置，保留当前运行实例：${secretsLoadError?.message ?? secretsLoadError}`);
+        const pool = options.pool ?? loadModelPool().pool;
+        const shim = options.withShim === false
+          ? { needed: false, started: false }
+          : await ensureShim({ pool, log });
+        return { started: false, url: status.url, pid: status.pid, version: status.version, endpoint: status.endpoint, shim };
+      } else if (secretsNeedReload(readSecretsFingerprint(), currentSecretsFingerprint)) {
+        log('检测到已保存的 API 密钥与运行实例环境不一致，重启模型 API 服务以应用密钥');
+        await stopServer({ log });
+      } else {
+        log(`模型 API 服务已在运行（pid=${status.pid} version=${status.version}）`);
+        const pool = options.pool ?? loadModelPool().pool;
+        const shim = options.withShim === false
+          ? { needed: false, started: false }
+          : await ensureShim({ pool, log });
+        return { started: false, url: status.url, pid: status.pid, version: status.version, endpoint: status.endpoint, shim };
+      }
     }
-    log(`实例不在运行（${status.reason}），开始拉起`);
+    if (!status.running) {
+      if (secretsLoadError) throw secretsLoadError;
+      log(`实例不在运行（${status.reason}），开始拉起`);
+    }
   }
 
+  const launchedSecretsFingerprint = currentSecretsFingerprint;
+  await assertPortAvailable(port);
   const proxy = await resolveProxy(log);
   const pool = options.pool ?? loadModelPool().pool;
   const shim =
@@ -270,26 +347,44 @@ export async function ensureServer(options = {}) {
 
   const cli = resolveCli();
   fs.mkdirSync(PATHS.logs, { recursive: true });
-  const out = fs.openSync(path.join(PATHS.logs, 'server.out.log'), 'a');
-  const err = fs.openSync(path.join(PATHS.logs, 'server.err.log'), 'a');
-
+  const outFile = path.join(PATHS.logs, 'server.out.log');
+  const errFile = path.join(PATHS.logs, 'server.err.log');
+  rotateLogFile(outFile);
+  rotateLogFile(errFile);
   // --service 是必须的：只有这个模式才会把 { url, pid, password } 写进
   // $XDG_STATE_HOME/opencode/service.json。裸 serve 只在 stdout 打印密码，
   // 而桥接需要一份可读、可重启后重建的长期凭据。
-  const child = spawn(
-    cli,
-    ['serve', '--service', '--hostname', '127.0.0.1', '--port', String(port)],
-    {
-      cwd: path.dirname(CONFIG_FILE),
-      env: isolatedEnv({ proxy }),
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', out, err]
+  let child;
+  try {
+    child = spawn(
+      cli,
+      ['serve', '--service', '--hostname', '127.0.0.1', '--port', String(port)],
+      {
+        cwd: path.dirname(CONFIG_FILE),
+        env: isolatedEnv({ proxy }),
+        detached: true,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe']
+      }
+    );
+    for (const [stream, file] of [[child.stdout, outFile], [child.stderr, errFile]]) {
+      stream.on('data', (chunk) => {
+        try {
+          appendRotatedLogFile(file, chunk);
+        } catch (error) {
+          log(`写模型 API 日志失败（${path.basename(file)}）：${error?.message ?? error}`);
+        }
+      });
+      stream.on('error', (error) => log(`读取模型 API 日志失败（${path.basename(file)}）：${error?.message ?? error}`));
     }
-  );
+    await waitForSpawn(child, (error) => log(`模型 API CLI 子进程错误：${error?.message ?? error}`));
+  } catch (error) {
+    throw new Error(
+      `无法启动模型 API CLI（${cli}）：${error?.message ?? error}`,
+      { cause: error }
+    );
+  }
   child.unref();
-  fs.mkdirSync(path.dirname(PATHS.pid), { recursive: true });
-  fs.writeFileSync(PATHS.pid, String(child.pid));
   log(`模型 API 服务启动中 pid=${child.pid} port=${port}`);
 
   const deadline = Date.now() + REGISTER_TIMEOUT_MS;
@@ -300,6 +395,7 @@ export async function ensureServer(options = {}) {
     if (record && Number(record.pid) === child.pid && record.url) {
       const status = await serverStatus();
       if (status.running) {
+        writeSecretsFingerprint(launchedSecretsFingerprint);
         log(`实例就绪：${status.url} version=${status.version} pid=${status.pid}`);
         return { started: true, url: status.url, pid: status.pid, version: status.version, endpoint: status.endpoint, shim };
       }

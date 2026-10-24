@@ -47,7 +47,7 @@ if (fs.existsSync(exe)) {
 console.log('3/5 放代码进 resources/app …');
 fs.mkdirSync(appDir, { recursive: true });
 
-for (const item of ['main.mjs', 'shutdown.mjs', 'server.mjs']) {
+for (const item of ['main.mjs', 'shutdown.mjs', 'server.mjs', 'secrets-reload.mjs', 'path-validation.mjs']) {
   fs.copyFileSync(path.join(root, item), path.join(appDir, item));
 }
 for (const dir of ['public', 'vendor']) {
@@ -72,19 +72,8 @@ fs.writeFileSync(path.join(appDir, 'package.json'), JSON.stringify(appPkg, null,
 //
 // ⚠️ 这里**不能**直接拷 desktop/settings.json：那份里是开发机的绝对路径
 // （bridgeRoot=C:\Users\<用户>\DualHabitatMatrix）、我的 napcat-shell 目录、我的 QQ 号。
-// 别人拿到包，这三样全是错的，点「启动」只会 Cannot find module ...\src\bridge.js。
-// 所以写空白模板：bridgeRoot 留空 → server.mjs 的 getRoot() 回落到包内 resources/bridge；
-// napcat.dir 留空 → 用包内自带的 app/napcat；QQ 号让用户自己填。
-const defaultSettings = {
-  _comment: '首次启动自动生成。bridgeRoot 留空 = 用软件自带的桥接；napcat.dir 留空 = 用自带的 NapCat。',
-  bridgeRoot: '',
-  napcat: { dir: '', qq: '' }
-};
-fs.writeFileSync(
-  path.join(appDir, 'default-settings.json'),
-  JSON.stringify(defaultSettings, null, 2) + '\n',
-  'utf8'
-);
+// 共享空白模板，不把开发机路径或 QQ 号打进包里。
+fs.copyFileSync(path.join(root, 'default-settings.json'), path.join(appDir, 'default-settings.json'));
 console.log('    默认设置 → default-settings.json（空白模板，不含本机路径）');
 
 // 旧构建可能在 app/ 里留过一份 settings.json（带开发机路径和 QQ 号）。
@@ -101,6 +90,16 @@ const bridgeDst = path.join(outDir, 'resources', 'bridge');
 if (!fs.existsSync(path.join(bridgeSrc, 'src', 'bridge.js'))) {
   console.error('4/5 找不到 bridge-dist：先跑 npm run prepare:bridge');
   process.exit(1);
+}
+for (const dependency of [
+  'node_modules/@opencode/client/package.json',
+  'node_modules/effect/package.json',
+  'node_modules/@snowluma/sdk/package.json'
+]) {
+  if (!fs.existsSync(path.join(bridgeSrc, dependency))) {
+    console.error(`4/5 桥接产物缺少 ${dependency}：请重新运行 npm run prepare:bridge`);
+    process.exit(1);
+  }
 }
 console.log('4/5 拷贝桥接本体…');
 fs.rmSync(bridgeDst, { recursive: true, force: true });
@@ -143,6 +142,7 @@ const must = [
   path.join(appDir, 'package.json'),
   path.join(appDir, 'main.mjs'),
   path.join(appDir, 'server.mjs'),
+  path.join(appDir, 'path-validation.mjs'),
   path.join(appDir, 'public', 'index.html'),
   path.join(appDir, 'public', 'tray.png'),
   path.join(appDir, 'vendor', 'backends', 'providers.js'),

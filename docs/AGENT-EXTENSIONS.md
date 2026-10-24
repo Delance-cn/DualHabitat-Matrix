@@ -103,7 +103,7 @@ key 格式正则 → `modeAllowed(key, kind, id, cfg, currentMode)` → `shouldB
 
 ### F. 出站事件 Webhook（`src/events-out.js`）
 
-- 用：`config.events = { enabled, url, secret, onMessage, onReply }` → 机器人把收/发事件 POST 到 url（`x-dhm-secret` 头）。
+- 用：`config.events = { enabled, url, secret, onMessage, onReply }` → 机器人把收/发事件 POST 到 url（`x-dhm-secret` 头）；QQ 发送最终失败时也推送 `delivery_failed`（只含平台、会话和失败分段，不含正文）。
 - 配置 UI：扩展页「出站 · 事件推送」；`POST /api/events {test:true}` 可发测试事件。
 - 加新事件类型：在 `events-out.js` 加类型守卫 → 在 bridge/wechat-bot 的对应挂点旁加 `emitEvent(cfg, type, data)`（现有挂点：QQ 收发、微信收发，紧跟 appendMemory）。
 - 纪律：fire-and-forget，3s 超时，**绝不 await 进收发主链路**。

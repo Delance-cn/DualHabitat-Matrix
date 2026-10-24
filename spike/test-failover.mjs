@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { NodeApiClient, createTurnCollector } from '../src/oc-client.js';
 
+const exhaustedNotice = '我这会儿 API 连不上了，等会儿再聊吧。';
 let pass = 0;
 let fail = 0;
 const ok = (name, condition, extra = '') => {
@@ -151,8 +152,8 @@ console.log('\n=== 3. 工具权限被拒 / 网络抖动不换模型 ===');
   }
 }
 
-// ── 4. 全部用完 → 回 429ERROR ─────────────────────────────────────────────
-console.log('\n=== 4. 全部用完时回 429ERROR ===');
+// ── 4. 全部用完 → 回配置的耗尽提示 ────────────────────────────────────────
+console.log('\n=== 4. 全部用完时回配置的耗尽提示 ===');
 {
   const client = makeClient({ free: ['zhipuai/glm-4.5-flash#none'], paid: [], allowPaid: false });
   const calls = [];
@@ -167,7 +168,7 @@ console.log('\n=== 4. 全部用完时回 429ERROR ===');
     data: { sessionID: sid, error: { message: '1113 余额不足' } }
   });
 
-  ok('回的是 429ERROR', done.ended?.text === '429ERROR', JSON.stringify(done.ended?.text));
+  ok('返回配置的耗尽提示', done.ended?.text === exhaustedNotice, JSON.stringify(done.ended?.text));
   ok('回合以正常结束收尾（桥接才会发出去）', done.ended?.reason?.kind === 'completed');
   ok('没有可用的候选了', client.chainStatus().every((s) => s.usable === false));
 }
@@ -185,7 +186,7 @@ console.log('\n=== 5. 已全用完：直接回话，不再空跑 ===');
 
   ok('返回被接受（桥接不会以为出错）', res.result.ok === true);
   ok('注入了 turn/start + 回复 + turn/end', injected.length === 3, `实得 ${injected.length}`);
-  ok('注入的回复是 429ERROR', injected[1]?.event?.data?.message?.content?.[0]?.text === '429ERROR');
+  ok('注入的回复是耗尽提示', injected[1]?.event?.data?.message?.content?.[0]?.text === exhaustedNotice);
   ok('注入的回合是正常结束', injected[2]?.event?.data?.reason?.kind === 'completed');
 
   // 而且这三帧喂给 collector 能正常出文本
@@ -195,7 +196,7 @@ console.log('\n=== 5. 已全用完：直接回话，不再空跑 ===');
     const r = c2.push(f.event);
     if (r) ended = r;
   }
-  ok('合成回合能被上游 collector 正常消费', ended?.text === '429ERROR');
+  ok('合成回合能被上游 collector 正常消费', ended?.text === exhaustedNotice);
 }
 
 // ── 6. 成本闸门：付费关着时，免费全用完不会偷偷用付费 ─────────────────────
@@ -217,7 +218,7 @@ console.log('\n=== 6. 付费开关关着时绝不越界 ===');
     data: { sessionID: sid, error: { message: '1113 余额不足' } }
   });
   ok('没有降级到付费模型', !calls.some((c) => c.op === 'switchModel'));
-  ok('而是回了 429ERROR', done.ended?.text === '429ERROR');
+  ok('而是回了耗尽提示', done.ended?.text === exhaustedNotice);
 }
 
 // ── 7. CLI 准备原地重试时就换掉不可用的模型 ────────────────────────────────
@@ -310,7 +311,7 @@ console.log('\n=== 9. 提前换时已全用完：立刻回话且不重复收尾 
     type: 'session.retry.scheduled',
     data: { sessionID: sid, reason: '1113 余额不足' }
   });
-  ok('立刻回了 429ERROR', early.ended?.text === '429ERROR', JSON.stringify(early.ended?.text));
+  ok('立刻返回耗尽提示', early.ended?.text === exhaustedNotice, JSON.stringify(early.ended?.text));
   ok('回合正常收尾（自己补的 turn/end）', early.ended?.reason?.kind === 'completed');
 
   // OpenCode 之后真正结束这个回合：不能再产生第二个 turn/end

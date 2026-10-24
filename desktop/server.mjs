@@ -18,6 +18,8 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { reloadSecretsInRunningServer, saveSecretsAndApply } from './secrets-reload.mjs';
+import { validateDirectoryPath } from './path-validation.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -47,7 +49,8 @@ const vendorBackends = path.join(here, 'vendor', 'backends');
 const backendsRoot = fs.existsSync(vendorBackends) ? vendorBackends : path.resolve(here, '..', 'src', 'backends');
 const loadBackend = (file) => import(pathToFileURL(path.join(backendsRoot, file)).href);
 
-const { listProviders, resolveProfile, listModels } = await loadBackend('providers.js');
+const { listProviders, resolveProfile, listModels, modelProfileKeyEnv } = await loadBackend('providers.js');
+const MODEL_PROVIDER_CATALOG = new Map(listProviders().map((provider) => [provider.id, provider]));
 const { streamChat } = await loadBackend('protocols.js');
 const { DRIVERS, UNVERIFIED } = await loadBackend('cli/drivers.js');
 const { resolveBin } = await loadBackend('cli/engine.js');
@@ -117,28 +120,66 @@ function migrateLegacyData() {
   if (path.resolve(from) === path.resolve(to)) return;
   const files = ['config.json', 'secrets.json', 'models.local.json', 'models.json', 'opencode.json', 'proxy.json', 'notify-hub.json'];
   const dirs = ['state', 'audio', 'roles', 'plugins', '.oc'];
-  let moved = 0;
+  let copied = 0;
   for (const f of files) {
     const src = path.join(from, f);
     const dst = path.join(to, f);
     if (fs.existsSync(src) && !fs.existsSync(dst)) {
-      try { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.renameSync(src, dst); moved++; } catch { /* 搬不动就算了，别挡启动 */ }
+      try {
+        if (copyPathIfMissing(src, dst)) copied++;
+      } catch (error) {
+        console.warn(`[data-root] 复制 ${src} 失败：${error?.message ?? error}`);
+      }
     }
   }
   for (const d of dirs) {
     const src = path.join(from, d);
     const dst = path.join(to, d);
-    if (fs.existsSync(src) && !fs.existsSync(dst)) {
-      try { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.renameSync(src, dst); moved++; } catch { /* 同上 */ }
+    if (!fs.existsSync(src)) continue;
+    if (!fs.existsSync(dst)) {
+      try {
+        if (copyPathIfMissing(src, dst)) copied++;
+      } catch (error) {
+        console.warn(`[data-root] 复制 ${src} 失败：${error?.message ?? error}`);
+      }
+    } else if (d === 'roles' || d === 'plugins') {
+      // Bundled defaults may gain new files between releases. Add only missing
+      // examples so updates reach existing installs without overwriting edits.
+      try {
+        fs.cpSync(src, dst, { recursive: true, force: false, errorOnExist: false });
+        copied++;
+      } catch (error) {
+        console.warn(`[data-root] 合并默认目录 ${src} 失败：${error?.message ?? error}`);
+      }
     }
   }
-  // 随包分发的示例插件：数据根没有 plugins 时从代码根补一份（不然插件页空空如也）。
-  const bundledPlugins = path.join(from, 'plugins');
-  const dataPlugins = path.join(to, 'plugins');
-  if (fs.existsSync(bundledPlugins) && !fs.existsSync(dataPlugins)) {
-    try { fs.cpSync(bundledPlugins, dataPlugins, { recursive: true }); moved++; } catch { /* 同上 */ }
+  if (copied) console.log(`[data-root] 已从代码根复制 ${copied} 项数据到 ${to}（原目录保留）`);
+}
+
+function copyPathIfMissing(src, dst) {
+  if (!fs.existsSync(src) || fs.existsSync(dst)) return false;
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  const temp = path.join(
+    path.dirname(dst),
+    `.${path.basename(dst)}.migration-${process.pid}-${randomBytes(8).toString('hex')}`
+  );
+  try {
+    if (fs.statSync(src).isDirectory()) fs.cpSync(src, temp, { recursive: true });
+    else fs.copyFileSync(src, temp);
+    if (fs.existsSync(dst)) {
+      fs.rmSync(temp, { recursive: true, force: true });
+      return false;
+    }
+    fs.renameSync(temp, dst);
+    return true;
+  } catch (error) {
+    try {
+      fs.rmSync(temp, { recursive: true, force: true });
+    } catch {
+      // Keep the copy/rename error as the actionable failure.
+    }
+    throw error;
   }
-  if (moved) console.log(`[data-root] 已从代码根迁移 ${moved} 项数据到 ${to}`);
 }
 
 let electronApp = null;
@@ -161,6 +202,26 @@ const codeRoot = () => getRoot();
 const configFile = () => path.join(dataRoot(), 'config.json');
 const secretsFile = () => path.join(dataRoot(), 'secrets.json');
 const exampleFile = () => path.join(codeRoot(), 'config.example.json');
+
+async function reloadRunningModelServiceForSecrets() {
+  const previousDataRoot = process.env.QQ_BRIDGE_DATA;
+  const previousStateDir = process.env.QQ_BRIDGE_STATE_DIR;
+  process.env.QQ_BRIDGE_DATA = dataRoot();
+  process.env.QQ_BRIDGE_STATE_DIR = matrixStateDir();
+  try {
+    const bridgeRoot = codeRoot();
+    const runtime = await import(pathToFileURL(path.join(bridgeRoot, 'src', 'oc-server.js')).href);
+    return await reloadSecretsInRunningServer({
+      serverStatus: runtime.serverStatus,
+      stopServer: runtime.stopServer
+    });
+  } finally {
+    if (previousDataRoot === undefined) delete process.env.QQ_BRIDGE_DATA;
+    else process.env.QQ_BRIDGE_DATA = previousDataRoot;
+    if (previousStateDir === undefined) delete process.env.QQ_BRIDGE_STATE_DIR;
+    else process.env.QQ_BRIDGE_STATE_DIR = previousStateDir;
+  }
+}
 
 
 const PORT = Number(process.env.DHM_DESKTOP_PORT ?? 3200);
@@ -407,6 +468,7 @@ const MODEL_PROFILE_FIELDS = [
   'protocol',
   'baseUrl',
   'model',
+  'apiKeyEnv',
   'temperature',
   'maxTokens',
   'maxHistory',
@@ -442,6 +504,11 @@ function sanitizeModelProfile(raw) {
       out[k] = v === true;
       continue;
     }
+    if (k === 'apiKeyEnv') {
+      const env = String(v).trim();
+      if (/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(env)) out[k] = env;
+      continue;
+    }
     if (MODEL_PROFILE_NUMBERS.has(k)) {
       const n = Number(v);
       if (Number.isFinite(n)) out[k] = n;
@@ -467,7 +534,7 @@ function readModelProfiles() {
       if (v) out[pf][slot] = v;
     }
   }
-  if (!out.qq.chat) {
+  if (!cfg.backend?.profiles) {
     const v = sanitizeModelProfile(cfg.backend?.modelApi);
     if (v) out.qq.chat = v;
   }
@@ -1105,6 +1172,11 @@ const modelsFile = () => {
   return path.join(dataRoot(), 'models.json');
 };
 
+function matrixStateDir(config = loadConfig()) {
+  const configured = String(config.matrix?.stateDir ?? '').trim();
+  return configured ? path.resolve(dataRoot(), configured) : path.join(dataRoot(), '.oc', 'state');
+}
+
 /**
  * 实例的注册文件：桥接把它起在哪、pid 多少，都写在这儿。只读，不碰它的生死。
  *
@@ -1113,7 +1185,7 @@ const modelsFile = () => {
  */
 function ocInstance() {
   const cfg = loadConfig();
-  const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(dataRoot(), '.oc', 'state');
+  const stateDir = matrixStateDir(cfg);
   const file = path.join(stateDir, 'opencode', 'service.json');
   const info = readJson(file, null);
   if (!info) return { alive: false, pid: null, url: null, port: null, version: null, file };
@@ -1156,7 +1228,7 @@ function loadPool() {
  */
 function chainStateFile() {
   const cfg = loadConfig();
-  const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(dataRoot(), '.oc', 'state');
+  const stateDir = matrixStateDir(cfg);
   return path.join(stateDir, 'model-chain.json');
 }
 
@@ -1191,7 +1263,7 @@ async function readModelUsage() {
     }
     if (!_sqliteCtor) return {};
     const cfg = loadConfig();
-    const stateDir = cfg.matrix?.stateDir ? path.resolve(cfg.matrix.stateDir) : path.join(dataRoot(), '.oc', 'state');
+    const stateDir = matrixStateDir(cfg);
     const candidates = [
       path.join(path.dirname(stateDir), 'data', 'opencode', 'opencode.db'),
       path.join(dataRoot(), '.oc', 'data', 'opencode', 'opencode.db')
@@ -2623,6 +2695,7 @@ function relay(stream, level, source) {
 function nodeRunner() {
   const isElectron = Boolean(process.versions.electron);
   const env = isElectron ? { ELECTRON_RUN_AS_NODE: '1' } : {};
+  env.QQ_BRIDGE_STATE_DIR = matrixStateDir();
   // 真实模型池在 models.local.json（公开仓只带空模板，个人池不进 git）。
   // 桥接、微信 bot、oc-config 重生成配置都从 QQ_BRIDGE_MODELS 拿池子——
   // 不注入的话，本机就一直在按空池跑，regen 还会报「模型池是空的」。
@@ -2706,6 +2779,7 @@ function startBridge() {
   child.on('close', (code) => {
     bridge = { child: null, startedAt: null, exitCode: code };
     onServiceExit('bridge');
+    if (!recentlyStopped('bridge')) void stopManagedModelService();
     pushLog(`桥接已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'bridge');
   });
 
@@ -2723,7 +2797,40 @@ function stopBridge() {
     return withDone({ ok: true, pid: externalPid }, killProcessTree(externalPid));
   }
   pushLog('正在停止桥接…', 'sys', 'bridge');
-  return withDone({ ok: true, pid: child.pid }, killProcessTree(child.pid));
+  const done = (async () => {
+    let onClose;
+    const closed = new Promise((resolve) => {
+      onClose = resolve;
+      child.once('close', onClose);
+    });
+    const killed = await killProcessTree(child.pid);
+    if (!killed && bridge.child === child && child.exitCode === null) {
+      child.off('close', onClose);
+      throw new Error('无法停止桥接进程');
+    }
+    let timeout;
+    try {
+      await Promise.race([
+        closed,
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('等待桥接退出超时')), 15_000);
+        })
+      ]);
+    } finally {
+      clearTimeout(timeout);
+      child.off('close', onClose);
+    }
+    await stopManagedModelService();
+    return { stopped: true };
+  })();
+  return withDone({ ok: true, pid: child.pid }, done);
+}
+
+async function restartBridge() {
+  const stopped = stopBridge();
+  if (!stopped.ok) return stopped;
+  if (stopped.done) await stopped.done;
+  return startBridge();
 }
 
 function bridgeState() {
@@ -4597,9 +4704,29 @@ const server = http.createServer(async (req, res) => {
       }
       const body = await readBody(req);
       const current = readJson(SETTINGS_FILE);
-      if ('bridgeRoot' in body) current.bridgeRoot = String(body.bridgeRoot ?? '').trim();
+      if ('bridgeRoot' in body) {
+        const bridgeRoot = String(body.bridgeRoot ?? '').trim();
+        const pathError = validateDirectoryPath(bridgeRoot, '桥接目录');
+        if (pathError) return sendJson(res, { ok: false, error: pathError });
+        current.bridgeRoot = bridgeRoot;
+      }
       if ('napcat' in body) {
         const napcat = { ...(current.napcat ?? {}), ...(body.napcat ?? {}) };
+        if (body.napcat && typeof body.napcat === 'object' && 'dir' in body.napcat) {
+          const pathError = validateDirectoryPath(napcat.dir, 'NapCat 目录');
+          if (pathError) return sendJson(res, { ok: false, error: pathError });
+        }
+        for (const key of ['wsPort', 'httpPort']) {
+          const raw = napcat[key];
+          if (raw === '' || raw == null) continue;
+          const port = Number(raw);
+          if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+            return sendJson(res, { ok: false, error: `${key === 'wsPort' ? 'WebSocket' : 'HTTP'} 端口要是 1024-65535 之间的整数` });
+          }
+        }
+        const wsPort = napcat.wsPort === '' || napcat.wsPort == null ? 3001 : Number(napcat.wsPort);
+        const httpPort = napcat.httpPort === '' || napcat.httpPort == null ? 3000 : Number(napcat.httpPort);
+        if (wsPort === httpPort) return sendJson(res, { ok: false, error: 'NapCat 的 WebSocket 与 HTTP 端口不能相同' });
         // 空串 = "用默认值"。删掉键而不是存空串 —— 否则 settings.json 里会留一堆
         // `"wsPort": ""` 这种键，看着像配了个空端口，实际又回落默认，很误导。
         for (const [k, v] of Object.entries(napcat)) {
@@ -4619,6 +4746,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     /* ── 模型 API 实例 / 会话设置 ─────────────────────── */
+
+    if (p === '/api/bots/apply') {
+      if (req.method !== 'POST') return sendJson(res, { ok: false, error: '只支持 POST' }, 405);
+      const platform = url.searchParams.get('platform') === 'wechat' ? 'wechat' : 'qq';
+      const applied = await restartBotsFor(platform);
+      return sendJson(res, { ok: true, platform, applied });
+    }
 
     if (p === '/api/matrix') {
       /* 「默认方案」和「会话标题」跟着平台走 —— 微信的会话不该叫「QQ 聊天」。
@@ -4644,14 +4778,25 @@ const server = http.createServer(async (req, res) => {
       }
       const body = await readBody(req);
       const cfg = loadConfig();
+      const stateDirInput = String(body.stateDir ?? '').trim();
+      const stateDir = stateDirInput ? path.resolve(dataRoot(), stateDirInput) : '';
+      const stateDirError = validateDirectoryPath(stateDir, '模型实例数据目录', { create: true });
+      if (stateDirError) return sendJson(res, { ok: false, error: stateDirError });
+      let sessionCwd = '';
+      if ('sessionCwd' in body) {
+        const sessionCwdInput = String(body.sessionCwd ?? '').trim();
+        sessionCwd = sessionCwdInput ? path.resolve(dataRoot(), sessionCwdInput) : '';
+        const sessionCwdError = validateDirectoryPath(sessionCwd, '会话工作目录');
+        if (sessionCwdError) return sendJson(res, { ok: false, error: sessionCwdError });
+      }
       const oldPreset = platform === 'wechat' ? cfg.platforms?.wechat?.agentPreset : cfg.agentPreset;
       cfg.matrix = {
         ...(cfg.matrix ?? {}),
         baseUrl: String(body.baseUrl ?? '').trim(),
-        stateDir: String(body.stateDir ?? '').trim(),
+        stateDir,
         deleteArchived: body.deleteArchived === true
       };
-      if ('sessionCwd' in body) cfg.sessionCwd = String(body.sessionCwd ?? '').trim();
+      if ('sessionCwd' in body) cfg.sessionCwd = sessionCwd;
 
       const preset = 'agentPreset' in body ? body.agentPreset : undefined;
       const title = 'workspaceTitle' in body ? String(body.workspaceTitle ?? '').trim() : undefined;
@@ -4672,7 +4817,7 @@ const server = http.createServer(async (req, res) => {
       const presetChanged = preset !== undefined && String(preset) !== String(oldPreset ?? '');
       let regenOk = true;
       if (presetChanged) regenOk = (await regenerateConfig()).ok;
-      const applied = await restartBotsFor(platform);
+      const applied = url.searchParams.get('deferRestart') === '1' ? false : await restartBotsFor(platform);
       return sendJson(res, { ok: true, platform, applied, configRegenerated: regenOk });
     }
 
@@ -4711,9 +4856,7 @@ const server = http.createServer(async (req, res) => {
         }
         let bridgeRestarted = false;
         if (removed > 0 && bridge.child) {
-          stopBridge();
-          await new Promise((r) => setTimeout(r, 1200));
-          bridgeRestarted = startBridge().ok === true;
+          bridgeRestarted = (await restartBridge()).ok === true;
         }
         return sendJson(res, {
           ok: true,
@@ -4731,7 +4874,7 @@ const server = http.createServer(async (req, res) => {
 
       pool.enabled = body.enabled !== false;
       pool.allowPaid = body.allowPaid === true;
-      pool.exhaustedNotice = String(body.exhaustedNotice ?? '').trim() || '我这会儿 API 连不上了，等会儿再聊吧。';
+      if (typeof body.exhaustedNotice === 'string') pool.exhaustedNotice = body.exhaustedNotice.trim();
       pool.free = clean(body.free);
       pool.paid = clean(body.paid);
 
@@ -4756,9 +4899,7 @@ const server = http.createServer(async (req, res) => {
       // 所以要真想"保存完就生效"，得顺手把桥接重启了。没在跑就跳过。
       let bridgeRestarted = false;
       if (bridge.child) {
-        stopBridge();
-        await new Promise((r) => setTimeout(r, 1200));
-        const started = startBridge();
+        const started = await restartBridge();
         bridgeRestarted = started.ok === true;
       }
 
@@ -4936,9 +5077,7 @@ const server = http.createServer(async (req, res) => {
       if (changedPaths.includes('socialV2.chatOnly')) {
         configRegenerated = await regenerateConfig();
         if (bridge.child) {
-          stopBridge();
-          await new Promise((r) => setTimeout(r, 1200));
-          bridgeRestarted = startBridge().ok === true;
+          bridgeRestarted = (await restartBridge()).ok === true;
         }
       }
 
@@ -5060,7 +5199,7 @@ const server = http.createServer(async (req, res) => {
         Object.assign(config, patch);
       }
       writeJson(configFile(), config);
-      const applied = await restartBotsFor(platform);
+      const applied = url.searchParams.get('deferRestart') === '1' ? false : await restartBotsFor(platform);
       return sendJson(res, { ok: true, platform, applied });
     }
 
@@ -5206,14 +5345,14 @@ const server = http.createServer(async (req, res) => {
           wechat: { ...(config.platforms?.wechat ?? {}), role }
         };
         writeJson(configFile(), config);
-        const applied = await restartBotsFor('wechat');
+        const applied = url.searchParams.get('deferRestart') === '1' ? false : await restartBotsFor('wechat');
         return sendJson(res, { ok: true, platform, role, applied });
       }
 
       const file = path.join(dataRoot(), 'state', 'current-role.json');
       fs.mkdirSync(path.dirname(file), { recursive: true });
       writeJson(file, { role: body.role || null, mode: body.mode === 'silent' ? 'silent' : 'active' });
-      const applied = await restartBotsFor('qq');
+      const applied = url.searchParams.get('deferRestart') === '1' ? false : await restartBotsFor('qq');
       return sendJson(res, { ok: true, platform, applied });
     }
 
@@ -5274,7 +5413,8 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      config.backend = next;
+      if (next) config.backend = { ...(config.backend ?? {}), ...next };
+      else config.backend = null;
       writeJson(configFile(), config);
       return sendJson(res, { ok: true });
     }
@@ -5287,26 +5427,65 @@ const server = http.createServer(async (req, res) => {
       }
 
       const body = await readBody(req);
-      const incoming = body.profiles ?? {};
       const cfg = loadConfig();
+      let incoming = body.profiles ?? {};
+      if (Array.isArray(body.updates)) {
+        incoming = readModelProfiles();
+        for (const update of body.updates) {
+          const pf = update?.platform;
+          const slot = update?.slot;
+          if (!MODEL_SLOTS[pf]?.includes(slot)) continue;
+          if (!incoming[pf]) incoming[pf] = {};
+          if (update.profile == null) delete incoming[pf][slot];
+          else incoming[pf][slot] = update.profile;
+        }
+      }
       const profiles = {};
+      const existingProfiles = cfg.backend?.profiles ?? {};
+      const secrets = readJson(secretsFile(), {});
+      let legacyKeyMigrated = false;
 
       for (const [pf, slots] of Object.entries(MODEL_SLOTS)) {
         profiles[pf] = {};
         for (const slot of slots) {
           const v = sanitizeModelProfile(incoming?.[pf]?.[slot]);
-          if (v) profiles[pf][slot] = v;
+          if (v) {
+            const preset = MODEL_PROVIDER_CATALOG.get(v.provider);
+            const customEndpoint = !preset || preset.id === 'custom' ||
+              (v.baseUrl && preset.baseUrl && v.baseUrl !== preset.baseUrl);
+            if (customEndpoint) {
+              v.apiKeyEnv = modelProfileKeyEnv(pf, slot);
+              const old = existingProfiles?.[pf]?.[slot];
+              const oldProvider = MODEL_PROVIDER_CATALOG.get(old?.provider);
+              const legacyEnv = oldProvider?.keyEnv;
+              if (!old?.apiKeyEnv && legacyEnv && secrets[legacyEnv] && !secrets[v.apiKeyEnv]) {
+                secrets[v.apiKeyEnv] = secrets[legacyEnv];
+                legacyKeyMigrated = true;
+              }
+            }
+            else delete v.apiKeyEnv;
+            profiles[pf][slot] = v;
+          }
         }
       }
+      if (legacyKeyMigrated) writeJson(secretsFile(), secrets);
 
       // 只写 profiles 就够；type 等其它字段原样保留，别把后端类型冲掉。
       const backend = { ...(cfg.backend ?? {}) };
       backend.profiles = profiles;
       // 回写旧字段：老版本桥接只认 modelApi，不同步过去会读不到配置。
       if (profiles.qq?.chat) backend.modelApi = profiles.qq.chat;
+      else delete backend.modelApi;
       cfg.backend = backend;
 
       writeJson(configFile(), cfg);
+      if (legacyKeyMigrated) {
+        try {
+          await reloadRunningModelServiceForSecrets();
+        } catch (error) {
+          pushLog(`自定义中转站旧密钥已迁移，但运行服务重载失败：${error?.message ?? error}`, 'err', 'app');
+        }
+      }
 
       // 用户预期：在「模型」面板填的模型直接进模型池首位（以后清掉档位也回落到它）。
       // 只在有 provider 名时做（自定义中转站构不成链路条目）；池里已有同款（含变体
@@ -5340,9 +5519,7 @@ const server = http.createServer(async (req, res) => {
       let botsRestarted = false;
       if (regen.ok) {
         if (bridge.child) {
-          stopBridge();
-          await new Promise((r) => setTimeout(r, 1200));
-          botsRestarted = startBridge().ok === true;
+          botsRestarted = (await restartBridge()).ok === true;
         }
         if (wechat.child) {
           stopWechat();
@@ -5356,6 +5533,7 @@ const server = http.createServer(async (req, res) => {
         profiles,
         botsRestarted,
         poolUpdated,
+        legacyKeyMigrated,
         regenerated: regen.ok,
         regenError: regen.ok ? undefined : (() => {
           const real = (regen.lines ?? []).filter((l) => l.trim() && !l.trim().startsWith('at ') && !l.includes('node:internal'));
@@ -5368,13 +5546,13 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/secrets') {
       if (req.method === 'GET') return sendJson(res, secretPresence());
       const body = await readBody(req);
-      const secrets = readJson(secretsFile());
-      for (const [k, v] of Object.entries(body ?? {})) {
-        if (v === null || v === '') delete secrets[k];
-        else secrets[k] = String(v);
-      }
-      writeJson(secretsFile(), secrets);
-      return sendJson(res, { ok: true, secrets: secretPresence() });
+      const result = await saveSecretsAndApply({
+        updates: body,
+        readSecrets: () => readJson(secretsFile()),
+        writeSecrets: (secrets) => writeJson(secretsFile(), secrets),
+        reload: reloadRunningModelServiceForSecrets
+      });
+      return sendJson(res, { ...result, secrets: secretPresence() });
     }
 
     if (p === '/api/models') {
@@ -6124,7 +6302,7 @@ const server = http.createServer(async (req, res) => {
           { group: '入站', method: 'POST', path: '/hook/notify/<口令>', auth: '口令（路径里）', desc: '推送文字到 QQ / 微信 / 推送渠道（ntfy、Server酱、Bark、PushPlus）', body: '{"text":"你好","platform":"qq","to":"123456"}' },
           { group: '入站', method: 'GET', path: '/hook/notify/<口令>?text=你好', auth: '口令（路径里）', desc: '一行调用版，浏览器地址栏就能发' },
           { group: '入站', method: 'POST', path: 'http://<局域网IP>:3210/hook/<口令>', auth: '口令（路径里）', desc: '手机页入口：SmsForwarder / message-mirror 把手机通知转发进来' },
-          { group: '出站', method: 'POST', path: '<你在扩展页配的推送地址>', auth: 'x-dhm-secret 头（选填）', desc: '机器人事件推送：收到消息 / 发出回复时主动 POST 给你', body: '{"event":"message","time":"…","data":{"platform":"qq","chatId":"group:123","text":"…"}}' },
+          { group: '出站', method: 'POST', path: '<你在扩展页配的推送地址>', auth: 'x-dhm-secret 头（选填）', desc: '机器人事件推送：收到消息 / 发出回复 / QQ 投递失败时主动 POST 给你；投递失败事件只带失败分段索引，不含正文', body: '{"event":"message","time":"…","data":{"platform":"qq","chatId":"group:123","text":"…"}}' },
           { group: '发送', method: 'POST', path: '/api/socialV2/sendMessage', auth: 'x-console-token 头', desc: '让机器人发一条文字到指定会话（走白名单/静默/限频闸门）', body: '{"key":"group:123456","text":"你好"}' },
           { group: '发送', method: 'POST', path: '/api/socialV2/send-image', auth: 'x-console-token 头', desc: '把图库里的图片发到指定会话', body: '{"key":"private:123456","file":"draw-xxx.jpg","caption":"看图"}' },
           { group: '发送', method: 'POST', path: '/api/socialV2/say', auth: 'agent token（reserved2 模式）', desc: '现场把一句话合成语音条发出（模型的 qq_say 通道）', body: '{"key":"group:123456","text":"这句话会变成语音","dryRun":true}' },
@@ -6723,10 +6901,12 @@ const server = http.createServer(async (req, res) => {
       const RAW_FILES = {
         config: configFile(),
         models: modelsFile(),
-        proxy: path.join(dataRoot(), 'proxy.json'),
-        secrets: secretsFile()
+        proxy: path.join(dataRoot(), 'proxy.json')
       };
       const which = String(url.searchParams.get('file') ?? 'config');
+      if (which === 'secrets') {
+        return sendJson(res, { ok: false, error: '密钥文件不能通过原始配置接口读取或写入' }, 403);
+      }
       const file = RAW_FILES[which];
       if (!file) return sendJson(res, { ok: false, error: `不认识的配置文件：${which}` });
       if (req.method === 'GET') {
@@ -6796,7 +6976,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/bridge/start') return sendJson(res, startBridge());
-    if (p === '/api/bridge/stop') return sendJson(res, stopBridge());
+    if (p === '/api/bridge/stop') {
+      const result = stopBridge();
+      if (result.done) await result.done;
+      return sendJson(res, result);
+    }
 
     if (p === '/api/napcat/panel') return sendJson(res, napcatPanel());
 
@@ -6871,9 +7055,7 @@ async function restartBotsFor(platform) {
         restarted = true;
       }
     } else if (bridge.child) {
-      stopBridge();
-      await new Promise((r) => setTimeout(r, 1200));
-      restarted = startBridge().ok === true;
+      restarted = (await restartBridge()).ok === true;
     }
   } catch { /* 重启失败不打断保存 */ }
   return restarted;
@@ -6934,19 +7116,19 @@ export async function startServer(preferred = PORT) {
 }
 
 /**
- * 关掉本窗口拉起来的全部后台服务。
+ * 关掉本窗口拉起来的全部后台服务，包括桥接管理的模型 API 服务。
  *
  * 这是「关软件」和「后台进程还在」之间的那道闸：Electron 自己退出**不会**带走
  * 子进程，必须显式收。顺序是先停服务、再关 HTTP —— 这样关停过程中的日志还能
  * 从日志页看到。返回的 Promise 会等 taskkill 和 NapCat 进程真正退出后才 resolve，
- * 主进程（desktop/shutdown.mjs）要 await 它，否则窗口先没了照样留孤儿。
+ * 主进程（desktop/shutdown.mjs）要 await 它，否则窗口先没了照样留孤儿进程。
  */
 let shutdownPromise = null;
 
 export function shutdownServer() {
   if (shutdownPromise) return shutdownPromise;
   shuttingDown = true;
-  pushLog('正在关闭后台服务（QQ 桥接 / 微信 / NapCat）…', 'sys');
+  pushLog('正在关闭后台服务（QQ 桥接 / 微信 / NapCat / 模型 API）…', 'sys');
 
   shutdownPromise = (async () => {
     stopPhoneListener();
@@ -6971,6 +7153,7 @@ export function shutdownServer() {
       settle(wechatResult),
       settle(napcatResult)
     ]);
+    const modelApiDone = await stopManagedModelService();
 
     // HTTP 服务最后关。keep-alive 连接会卡住 close 的回调，所以主动断开 + 兜底超时。
     await new Promise((resolve) => {
@@ -6996,10 +7179,32 @@ export function shutdownServer() {
     }
     logClients.clear();
 
-    return { ok: true, bridge: bridgeDone, wechat: wechatDone, napcat: napcatDone };
+    return { ok: true, bridge: bridgeDone, wechat: wechatDone, napcat: napcatDone, modelApi: modelApiDone };
   })();
 
   return shutdownPromise;
+}
+
+async function stopManagedModelService() {
+  const previousDataRoot = process.env.QQ_BRIDGE_DATA;
+  const previousStateDir = process.env.QQ_BRIDGE_STATE_DIR;
+  process.env.QQ_BRIDGE_DATA = dataRoot();
+  process.env.QQ_BRIDGE_STATE_DIR = matrixStateDir();
+  try {
+    const runtime = await import(pathToFileURL(path.join(codeRoot(), 'src', 'oc-server.js')).href);
+    return await runtime.stopServer({
+      log: (message) => pushLog(message, 'sys', 'bridge')
+    });
+  } catch (error) {
+    const message = `关闭模型 API 服务失败：${error?.message ?? error}`;
+    pushLog(message, 'err', 'bridge');
+    return { server: false, shim: false, error: message };
+  } finally {
+    if (previousDataRoot === undefined) delete process.env.QQ_BRIDGE_DATA;
+    else process.env.QQ_BRIDGE_DATA = previousDataRoot;
+    if (previousStateDir === undefined) delete process.env.QQ_BRIDGE_STATE_DIR;
+    else process.env.QQ_BRIDGE_STATE_DIR = previousStateDir;
+  }
 }
 
 /* 直接 `node server.mjs` 时自己起服务。

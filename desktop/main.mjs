@@ -234,12 +234,7 @@ globalThis.dhmOpenChildWindow = openChildWindow;
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
-    }
-  });
+  app.on('second-instance', showWindow);
 
   app.whenReady().then(() => {
     createWindow();

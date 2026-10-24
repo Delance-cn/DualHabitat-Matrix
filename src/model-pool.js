@@ -112,10 +112,9 @@ export function normalizePool(raw) {
     }
   }
 
-  const notice =
-    typeof source.exhaustedNotice === 'string' && source.exhaustedNotice.length > 0
-      ? source.exhaustedNotice
-      : DEFAULT_POOL.exhaustedNotice;
+  const notice = typeof source.exhaustedNotice === 'string'
+    ? source.exhaustedNotice.trim()
+    : DEFAULT_POOL.exhaustedNotice;
 
   const pool = {
     enabled: source.enabled !== false,

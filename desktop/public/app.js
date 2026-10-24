@@ -1395,6 +1395,7 @@ function bsCollect() {
     baseUrl: $('#bs-baseUrl').value.trim(),
     model: $('#bs-model').value.trim()
   };
+  if (usesCustomModelEndpoint(out, p)) out.apiKeyEnv = modelProfileKeyEnv(pf, 'chat');
   for (const k of Object.keys(out)) if (out[k] === undefined || out[k] === '') delete out[k];
   return out;
 }
@@ -1403,7 +1404,9 @@ function updateBsKeyHint() {
   const el = $('#bs-key-hint');
   if (!el) return;
   const p = providerById($('#bs-provider')?.value);
-  const env = p?.keyEnv;
+  const env = usesCustomModelEndpoint({ provider: p?.id, baseUrl: $('#bs-baseUrl')?.value.trim() }, p)
+    ? modelProfileKeyEnv(platform(), 'chat')
+    : p?.keyEnv;
   if (!env) {
     el.textContent = '自定义接入：key 会存进 secrets.json，界面上只显示有没有，不回显内容。';
     return;
@@ -1419,18 +1422,35 @@ async function bsSaveModel() {
   if (autoSavedSig.get(`bs-slot-${pf}`) === mark) return;
   const p = providerById($('#bs-provider').value);
   const key = $('#bs-apiKey').value.trim();
-  if (key && p?.keyEnv) {
-    const sr = await post('/api/secrets', { [p.keyEnv]: key });
+  const previousChat = modelProfiles[pf]?.chat;
+  const previousWork = modelProfiles[pf]?.work;
+  const workFollowsChat = !previousWork || sameModelRoute(previousChat, previousWork);
+  const secretUpdates = {};
+  if (key && data.apiKeyEnv) {
+    secretUpdates[data.apiKeyEnv] = key;
+    if (workFollowsChat) secretUpdates[modelProfileKeyEnv(pf, 'work')] = key;
+  } else if (key && p?.keyEnv) {
+    secretUpdates[p.keyEnv] = key;
+  }
+  if (Object.keys(secretUpdates).length) {
+    const sr = await post('/api/secrets', secretUpdates);
     if (sr.ok === false) return setResult('#bs-result-2', sr.error ?? '保存密钥失败', 'err');
+    if (sr.reloadError) return setResult('#bs-result-2', sr.reloadError, 'err');
   }
   data.allowTools = false; // 聊天档不给工具；工作档同款模型，能力差异在工具清单
   if (!modelProfiles[pf]) modelProfiles[pf] = {};
   modelProfiles[pf].chat = data;
-  modelProfiles[pf].work = { ...data, allowTools: true };
+  if (workFollowsChat) {
+    modelProfiles[pf].work = {
+      ...data,
+      ...(data.apiKeyEnv ? { apiKeyEnv: modelProfileKeyEnv(pf, 'work') } : {}),
+      allowTools: true
+    };
+  }
   const poolEntry = data.provider && data.model ? `${data.provider}/${data.model}` : '';
   const r = await post('/api/model-profiles', { profiles: modelProfiles, poolEntry });
-  $('#bs-apiKey').value = '';
   if (r.ok === false) return setResult('#bs-result-2', r.error ?? '保存失败', 'err');
+  $('#bs-apiKey').value = '';
   if (r.regenerated === false) return setResult('#bs-result-2', `已保存，但生成配置失败：${r.regenError ?? '看日志'}`, 'err');
   autoSavedSig.set(`bs-slot-${pf}`, mark);
   setResult('#bs-result-2', r.botsRestarted ? '已保存 ✓ 服务已重启生效' : '已保存 ✓ 下次服务启动生效', 'saved');
@@ -1764,6 +1784,21 @@ function secretSet(env) {
   return (S?.secrets ?? []).some((s) => s.env === env && s.set);
 }
 
+function modelProfileKeyEnv(pf, slot) {
+  return `DHM_MODEL_${String(pf).toUpperCase()}_${String(slot).toUpperCase()}_API_KEY`;
+}
+
+function usesCustomModelEndpoint(profile, preset = providerById(profile?.provider)) {
+  return !preset || preset.id === 'custom' ||
+    Boolean(profile?.baseUrl && preset.baseUrl && profile.baseUrl !== preset.baseUrl);
+}
+
+function sameModelRoute(left, right) {
+  return Boolean(left && right) &&
+    ['provider', 'protocol', 'baseUrl', 'model', 'apiKeyEnv']
+      .every((key) => String(left[key] ?? '') === String(right[key] ?? ''));
+}
+
 function renderProviders(s) {
   const sel = $(`#${s}-provider`);
   const list = S?.providers ?? [];
@@ -1775,16 +1810,20 @@ function renderProviders(s) {
 function applyProvider(s, id) {
   const p = providerById(id);
   $(`#${s}-provider-note`).textContent = p?.note ?? (p ? '' : '自己填地址：要填到 /v1 为止，例如 https://your-relay.com/v1');
-  if (!p) return;
+  if (!p) {
+    updateKeyHint(s);
+    return;
+  }
   if (p.protocol) $(`#${s}-protocol`).value = p.protocol;
-  if (p.baseUrl) $(`#${s}-baseUrl`).value = p.baseUrl;
+  if (p.baseUrl && !$(`#${s}-baseUrl`).value.trim()) $(`#${s}-baseUrl`).value = p.baseUrl;
   if (p.models?.length && !$(`#${s}-model`).value.trim()) $(`#${s}-model`).value = p.models[0];
   updateKeyHint(s);
 }
 
 function updateKeyHint(s) {
   const p = providerById($(`#${s}-provider`).value);
-  const env = p?.keyEnv;
+  const profile = { provider: p?.id, baseUrl: $(`#${s}-baseUrl`).value.trim() };
+  const env = usesCustomModelEndpoint(profile, p) ? modelProfileKeyEnv(platform(), s) : p?.keyEnv;
   if (!env) {
     $(`#${s}-key-hint`).textContent = '自定义接入：key 会存进 secrets.json，界面上只显示有没有，不回显内容。';
     return;
@@ -1827,10 +1866,25 @@ function renderLocalServers(s) {
 function collectSource(s) {
   const el = (name) => document.getElementById(`${s}-${name}`);
   const num = (name) => {
-    const raw = (el(name)?.value ?? '').trim();
-    if (raw === '') return undefined;
+    const input = el(name);
+    const raw = (input?.value ?? '').trim();
+    if (raw === '') {
+      if (input?.validity?.badInput) {
+        input.setCustomValidity('请输入有效数字，或清空此项');
+        input.reportValidity();
+        throw new Error(`${name} 必须是有效数字`);
+      }
+      input?.setCustomValidity('');
+      return undefined;
+    }
     const n = Number(raw);
-    return Number.isFinite(n) ? n : undefined;
+    if (!Number.isFinite(n)) {
+      input?.setCustomValidity('请输入有效数字，或清空此项');
+      input?.reportValidity();
+      throw new Error(`${name} 必须是有效数字`);
+    }
+    input?.setCustomValidity('');
+    return n;
   };
   const out = {
     provider: el('provider').value || undefined,
@@ -1847,6 +1901,7 @@ function collectSource(s) {
     maxToolRounds: num('maxToolRounds'),
     workspaceDir: el('workspaceDir')?.value.trim() || undefined
   };
+  if (usesCustomModelEndpoint(out)) out.apiKeyEnv = modelProfileKeyEnv(platform(), s);
   for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
   return out;
 }
@@ -2060,29 +2115,69 @@ function bindSlotEvents() {
     async function saveSlotAuto() {
       const data = collectSource(s);
       const key = el('apiKey').value.trim();
-      if (!data.baseUrl && !data.model) return; // 空配置不触发
       const mark = slotSig();
       if (autoSavedSig.get(`slot-${platform()}-${s}`) === mark) return;
+      const pf = platform();
+      if (!data.baseUrl && !data.model) {
+        const previousChat = modelProfiles[pf]?.chat;
+        const previousWork = modelProfiles[pf]?.work;
+        const workFollowsChat = !previousWork || sameModelRoute(previousChat, previousWork);
+        if (!modelProfiles[pf]?.[s]) return;
+        delete modelProfiles[pf][s];
+        if (s === 'chat' && workFollowsChat) delete modelProfiles[pf].work;
+        const updates = [{ platform: pf, slot: s, profile: null }];
+        if (s === 'chat' && workFollowsChat) updates.push({ platform: pf, slot: 'work', profile: null });
+        const cleared = await post('/api/model-profiles', { profiles: modelProfiles, updates });
+        if (cleared.ok === false) return setResult(res, cleared.error ?? '清除失败', 'err');
+        autoSavedSig.set(`slot-${pf}-${s}`, mark);
+        if (cleared.regenerated === false) return setResult(res, `已清除，但生成配置失败：${cleared.regenError ?? '看日志'}`, 'err');
+        setResult(res, cleared.botsRestarted ? '已清除 ✓ 服务已重启生效' : '已清除 ✓ 下次服务启动生效', 'saved');
+        await refreshState();
+        await loadModelProfiles();
+        return;
+      }
       const p = providerById(el('provider').value);
-      if (key && p?.keyEnv) {
-        const sr = await post('/api/secrets', { [p.keyEnv]: key });
+      const previousChat = modelProfiles[pf]?.[s];
+      const previousWork = modelProfiles[pf]?.work;
+      const workFollowsChat = !previousWork || sameModelRoute(previousChat, previousWork);
+      const secretUpdates = {};
+      if (key && data.apiKeyEnv) {
+        secretUpdates[data.apiKeyEnv] = key;
+        if (s === 'chat' && workFollowsChat) {
+          secretUpdates[modelProfileKeyEnv(pf, 'work')] = key;
+        }
+      } else if (key && p?.keyEnv) {
+        secretUpdates[p.keyEnv] = key;
+      }
+      if (Object.keys(secretUpdates).length) {
+        const sr = await post('/api/secrets', secretUpdates);
         if (sr.ok === false) return setResult(res, sr.error ?? '保存密钥失败', 'err');
+        if (sr.reloadError) return setResult(res, sr.reloadError, 'err');
       }
       if (s === 'chat') {
         data.allowTools = false;
         delete data.maxToolRounds;
         delete data.workspaceDir;
       }
-      const pf = platform();
       if (!modelProfiles[pf]) modelProfiles[pf] = {};
       modelProfiles[pf][s] = data;
-      // 工作档同款模型：能力差异全在工具清单（对话与人格页），不在这份配置里
-      modelProfiles[pf].work = { ...data, allowTools: true };
+      // 新安装默认让工作档跟随聊天档；已有独立工作档（尤其不同中转地址/key）不覆盖。
+      if (s === 'chat' && workFollowsChat) {
+        modelProfiles[pf].work = {
+          ...data,
+          ...(data.apiKeyEnv ? { apiKeyEnv: modelProfileKeyEnv(pf, 'work') } : {}),
+          allowTools: true
+        };
+      }
+      const updates = [{ platform: pf, slot: s, profile: data }];
+      if (s === 'chat' && workFollowsChat) {
+        updates.push({ platform: pf, slot: 'work', profile: modelProfiles[pf].work });
+      }
       // 用户预期：填的模型直接进模型池首位。自定义中转站（无 provider 名）不进池
       const poolEntry = data.provider && data.model ? `${data.provider}/${data.model}` : '';
-      const r = await post('/api/model-profiles', { profiles: modelProfiles, poolEntry });
-      el('apiKey').value = '';
+      const r = await post('/api/model-profiles', { profiles: modelProfiles, updates, poolEntry });
       if (r.ok === false) return setResult(res, r.error ?? '保存失败', 'err');
+      el('apiKey').value = '';
       if (r.regenerated === false) return setResult(res, `已自动保存，但生成配置失败：${r.regenError ?? '看日志'}`, 'err');
       autoSavedSig.set(`slot-${platform()}-${s}`, mark);
       setResult(res, r.botsRestarted ? '已自动保存 ✓ 服务已重启生效' : '已自动保存 ✓ 下次服务启动生效', 'saved');
@@ -2928,18 +3023,20 @@ function collectRolePayload() {
 async function saveChatAuto() {
   const mark = sig([collectChatPayload(), collectRolePayload(), $('#agentPreset').value, $('#workspaceTitle').value]);
   if (autoSavedSig.get(`chat-${platform()}`) === mark) return;
-  const rc = await post(`/api/chat?platform=${platform()}`, collectChatPayload());
+  const p = platform();
+  const rc = await post(`/api/chat?platform=${p}&deferRestart=1`, collectChatPayload());
   if (rc.ok === false) return setResult('#chat-result', rc.error, 'err');
-  const rr = await post(`/api/role?platform=${platform()}`, collectRolePayload());
+  const rr = await post(`/api/role?platform=${p}&deferRestart=1`, collectRolePayload());
   if (rr.ok === false) return setResult('#role-result', rr.error, 'err');
-  const rm = await post(`/api/matrix?platform=${platform()}`, {
+  const rm = await post(`/api/matrix?platform=${p}&deferRestart=1`, {
     agentPreset: $('#agentPreset').value,
     workspaceTitle: $('#workspaceTitle').value
   });
   if (rm.ok === false) return setResult('#role-result', rm.error, 'err');
+  const apply = await post(`/api/bots/apply?platform=${p}`, {});
+  if (apply.ok === false) return setResult('#chat-result', apply.error, 'err');
   autoSavedSig.set(`chat-${platform()}`, mark);
-  const applied = rc.applied || rr.applied || rm.applied;
-  setResult('#chat-result', applied ? '已自动保存 ✓ 服务已重启生效' : '已自动保存 ✓ 下次服务启动生效', 'saved');
+  setResult('#chat-result', apply.applied ? '已自动保存 ✓ 服务已重启生效' : '已自动保存 ✓ 下次服务启动生效', 'saved');
   setResult('#role-result', '已自动保存 ✓', 'saved');
   await loadChat();
 }

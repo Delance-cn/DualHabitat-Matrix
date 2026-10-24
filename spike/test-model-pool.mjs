@@ -101,8 +101,8 @@ console.log('\n=== 3. 配置写错要告警且能跑 ===');
   }
   {
     const { pool, warnings } = normalizePool({ exhaustedNotice: '' });
-    ok('空提示语回退默认（不然群里会发一条空消息）', pool.exhaustedNotice === DEFAULT_POOL.exhaustedNotice);
-    ok('没为此报警（回退是合理行为）', !warnings.some((w) => w.includes('exhaustedNotice')));
+    ok('空提示语保留为空（用户可关闭用尽提示）', pool.exhaustedNotice === '');
+    ok('没为此报警（清空是有效配置）', !warnings.some((w) => w.includes('exhaustedNotice')));
   }
   {
     const { pool, warnings } = normalizePool({ free: [], paid: [] });
@@ -197,12 +197,14 @@ console.log('\n=== 6. 目录里没有的候选要剔掉（否则链会卡住）=
   const chain2 = new ModelChain({ free: ['a/one', 'b/two'] });
   ok('空目录 = 什么都不做', chain2.restrictTo(new Set()).length === 0 && chain2.active.length === 2);
 
-  // 被剔掉的候选如果之前有健康记录，也要一起清掉（不然状态文件里留垃圾）
+  // 目录校验只临时隐藏候选，不应改写模型池或丢失熔断状态；重置后可恢复。
   const chain3 = new ModelChain({ free: ['a/one', 'b/two'] });
   chain3.markFailure(chain3.active[0], { kind: 'quota', fatal: true, detail: '1113' });
   ok('熔断记录进了快照', chain3.snapshot().health.length === 1);
   chain3.restrictTo(new Set(['b/two']));
-  ok('剔掉候选时连带清掉它的健康记录', chain3.snapshot().health.length === 0);
+  ok('目录限制不删池配置或熔断记录', chain3.free.length === 2 && chain3.snapshot().health.length === 1);
+  chain3.clearRestrictions();
+  ok('清除目录限制后恢复完整候选', chain3.active.length === 2);
 }
 
 function candidateKeys(chain) {

@@ -15,7 +15,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { replaceDirectoryAtomically } from './replace-directory.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(here, '..');
@@ -28,6 +30,7 @@ const fromLocal = path.resolve(desktopDir, '..', 'src', 'backends');
 
 const srcDir = fs.existsSync(path.join(fromBridge, 'index.js')) ? fromBridge : fromLocal;
 const vendorDir = path.join(desktopDir, 'vendor', 'backends');
+const stagingDir = path.join(desktopDir, 'vendor', `.backends-${process.pid}-${randomUUID()}.tmp`);
 
 if (!fs.existsSync(srcDir)) {
   console.error(`找不到源码目录：${srcDir}`);
@@ -35,11 +38,14 @@ if (!fs.existsSync(srcDir)) {
 }
 console.log(`后端源码取自：${srcDir}`);
 
-// 覆盖式复制，不先删目录，也不删任何东西。
-// 原因：本环境的批量删除保护会在 rm 时直接抛错（阈值 50，自测脚本也会被算进去），
-// 与其绕过不如干脆不删 —— selftest.mjs 留着只有几十 KB，无副作用。
-fs.mkdirSync(vendorDir, { recursive: true });
-fs.cpSync(srcDir, vendorDir, { recursive: true, force: true });
+fs.mkdirSync(path.dirname(vendorDir), { recursive: true });
+fs.mkdirSync(stagingDir, { recursive: true });
+fs.cpSync(srcDir, stagingDir, { recursive: true, force: true });
+if (!fs.existsSync(path.join(stagingDir, 'index.js'))) {
+  fs.rmSync(stagingDir, { recursive: true, force: true });
+  throw new Error(`后端复制不完整：${path.join(stagingDir, 'index.js')} 不存在`);
+}
+replaceDirectoryAtomically(stagingDir, vendorDir);
 
 const count = (dir) =>
   fs.readdirSync(dir, { withFileTypes: true }).reduce((n, e) => {

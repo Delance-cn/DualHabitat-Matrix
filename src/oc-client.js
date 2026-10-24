@@ -289,6 +289,7 @@ export class NodeApiClient {
    * @param {string} [auth.stateDir]       XDG state 根（找注册文件）
    * @param {string} [auth.serviceFile]    直接指定注册文件
    * @param {string} [auth.sessionDir]     会话数据的落盘目录（settings 兜底用）
+   * @param {string} [auth.modelDirectory] 模型目录校验所用的工作目录
    * @param {boolean} [auth.deleteArchived] true=archiveSession 真的删会话（默认只中断）
    * @param {(msg: string, err?: unknown) => void} [auth.log]
    */
@@ -338,6 +339,8 @@ export class NodeApiClient {
     // 正在重试的会话：下一个 execution.started 必须**沿用原来的 turn 号**，
     // 否则桥接的 collector 按 turn 分组，新 turn 的文本会被整段丢掉。
     this._retryTurns = new Map(); // sessionID → 原 turn
+    this._failoverTimers = new Map();
+    this._failoverStartTimeoutMs = 60_000;
     // 已经开始换模型、但新回合还没起来的会话。这期间旧执行的
     // retry.scheduled / execution.failed / interrupted 全部丢弃 ——
     // 否则旧执行失败一次，就会把我们刚换上去的新模型也熔掉。
@@ -417,7 +420,9 @@ export class NodeApiClient {
     if (!this._chain || this._chainValidated) return;
     this._chainValidated = true;
     try {
-      const listed = await client.model.list({ location: { directory: process.cwd() } });
+      const listed = await client.model.list({
+        location: { directory: this.auth.modelDirectory || process.cwd() }
+      });
       const known = new Set();
       for (const model of listed?.data ?? []) {
         if (model?.providerID && model?.modelID) known.add(`${model.providerID}/${model.modelID}`);
@@ -542,6 +547,11 @@ export class NodeApiClient {
     this._endpoint = null;
     // 重启后目录可能变了（新 key 上新 provider、自定义条目增删），重新校验
     this._chainValidated = false;
+    this._chain?.clearRestrictions();
+    for (const timer of this._failoverTimers.values()) clearTimeout(timer);
+    this._failoverTimers.clear();
+    this._retryTurns.clear();
+    this._failoverPending.clear();
   }
 
   get endpointUrl() {
@@ -947,6 +957,8 @@ export class NodeApiClient {
       this._turnHasText.set(sessionId, false);
       // 重试：沿用原 turn 号，且**不再发 turn/start**（桥接那边 collector 还开着）
       if (this._retryTurns.has(sessionId)) {
+        clearTimeout(this._failoverTimers.get(sessionId));
+        this._failoverTimers.delete(sessionId);
         const turn = this._retryTurns.get(sessionId);
         this._retryTurns.delete(sessionId);
         this._failoverPending.delete(sessionId);
@@ -992,7 +1004,7 @@ export class NodeApiClient {
       return [];
     }
 
-    if (type === 'session.execution.succeeded' || type === 'session.execution.interrupted') {
+    if (type === 'session.execution.succeeded') {
       const applied = this._appliedModel.get(sessionId);
       if (applied && this._chain.status().some((s) => s.key === candidateKey(applied) && !s.usable)) {
         this._chain.markSuccess(applied);
@@ -1000,6 +1012,7 @@ export class NodeApiClient {
       }
       return frames;
     }
+    if (type === 'session.execution.interrupted') return frames;
 
     // 失败信号有两种：
     //  · session.retry.scheduled：CLI 打算**原地**重试。不可用的模型（余额/无权/
@@ -1073,10 +1086,22 @@ export class NodeApiClient {
           text: promptText,
           ...(promptFiles.length ? { files: promptFiles } : {})
         });
+        if (this._retryTurns.has(sessionId) && this._failoverPending.has(sessionId)) {
+          const timer = setTimeout(() => {
+            this._failoverTimers.delete(sessionId);
+            this._retryTurns.delete(sessionId);
+            this._failoverPending.delete(sessionId);
+            this.log(`换模型重试启动超时，已清理待处理状态 ${sessionId}`);
+          }, this._failoverStartTimeoutMs);
+          timer.unref?.();
+          this._failoverTimers.set(sessionId, timer);
+        }
         return []; // 失败回合的帧全部吞掉
       } catch (error) {
         // 换模型这一步就没成功：**不要**谎报"全部用完了"，如实把这个失败交给上层。
         this.log(`换模型重试失败（按失败上报）：${error?.message ?? error}`);
+        clearTimeout(this._failoverTimers.get(sessionId));
+        this._failoverTimers.delete(sessionId);
         this._retryTurns.delete(sessionId);
         this._failoverPending.delete(sessionId);
         return frames;

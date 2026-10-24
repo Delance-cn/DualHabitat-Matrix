@@ -15,11 +15,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { replaceDirectoryAtomically } from './replace-directory.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const desktopRoot = path.resolve(here, '..');
-const outDir = path.join(desktopRoot, 'bridge-dist');
+const finalOutDir = path.join(desktopRoot, 'bridge-dist');
+const outDir = path.join(desktopRoot, `.bridge-dist-${process.pid}-${randomUUID()}.tmp`);
 
 // 兼容旧 env 名 QQBRIDGE_SRC：只在本文件这类「不进打包名单」的开发脚本里保留。
 const srcRootRaw = process.env.DHM_SRC || process.env.QQBRIDGE_SRC || `${process.env.USERPROFILE}\\DualHabitatMatrix`;
@@ -32,9 +35,8 @@ if (!fs.existsSync(path.join(srcRoot, 'src', 'bridge.js'))) {
 }
 
 console.log(`源目录：${srcRoot}`);
-console.log(`产物：${outDir}`);
+console.log(`产物：${finalOutDir}`);
 
-fs.rmSync(outDir, { recursive: true, force: true });
 fs.mkdirSync(outDir, { recursive: true });
 
 /** 备份文件、日志、运行期状态一律不带 —— 它们要么是垃圾，要么是别人的隐私。 */
@@ -138,12 +140,28 @@ const size = (dir) => {
   return total;
 };
 
-const must = ['src/bridge.js', 'src/wechat-bot.js', 'src/oc-server.js', 'src/openai-shell.js', 'src/agent-tools-core.js', 'src/mcp-agent-tools.js', 'config.example.json', 'package.json'];
+const must = [
+  'src/bridge.js',
+  'src/wechat-bot.js',
+  'src/oc-server.js',
+  'src/openai-shell.js',
+  'src/agent-tools-core.js',
+  'src/mcp-agent-tools.js',
+  'upstream/dsh/agent-presets/qq-chat/agent.cordis.yml',
+  'upstream/dsh/agent-presets/qq-chat-v2/agent.cordis.yml',
+  'config.example.json',
+  'package.json'
+];
+for (const dependency of Object.keys(pkg.dependencies ?? {})) {
+  must.push(path.join('node_modules', dependency, 'package.json'));
+}
 const missing = must.filter((f) => !fs.existsSync(path.join(outDir, f)));
 if (missing.length) {
   console.error('自检失败，缺：' + missing.join(', '));
+  fs.rmSync(outDir, { recursive: true, force: true });
   process.exit(1);
 }
 
+replaceDirectoryAtomically(outDir, finalOutDir);
 console.log('');
-console.log(`完成：${(size(outDir) / 1024 / 1024).toFixed(1)} MB`);
+console.log(`完成：${(size(finalOutDir) / 1024 / 1024).toFixed(1)} MB`);

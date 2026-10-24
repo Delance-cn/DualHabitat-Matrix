@@ -150,33 +150,33 @@ console.log('== 3. 审批往返：permission.asked → approval/requested → re
   check('frame 类型与关键字段齐全', () => {
     assert.equal(f.type, 'approval/requested');
     assert.equal(f.sessionId, SID);
-    assert.equal(f.clientId, 'opencode');
+    assert.equal(f.clientId, 'matrix');
     assert.equal(f.eventId, 'per_1');
     assert.equal(f.toolName, 'shell');
   });
   check('reason 可读', () => assert.match(f.reason, /shell/));
   check('pending 已登记（respond 才能找到）', () => {
-    assert.ok(api._pending.has('opencode:per_1'));
-    assert.equal(api._pending.get('opencode:per_1').requestID, 'per_1');
+    assert.ok(api._pending.has('matrix:per_1'));
+    assert.equal(api._pending.get('matrix:per_1').requestID, 'per_1');
   });
 
   // respond 的映射在真正回 HTTP，这里把 _ensureClient 换成桩，直接 await 断言。
   let replied = null;
   api._ensureClient = async () => ({ permission: { reply: async (x) => { replied = x; } } });
-  await api.respond({ clientId: 'opencode', eventId: 'per_1', outcome: { kind: 'result', value: 'rejected' } });
+  await api.respond({ clientId: 'matrix', eventId: 'per_1', outcome: { kind: 'result', value: 'rejected' } });
   check('rejected → decision:reject，并清理 pending', () => {
     assert.equal(replied.decision, 'reject');
-    assert.ok(!api._pending.has('opencode:per_1'));
+    assert.ok(!api._pending.has('matrix:per_1'));
   });
 
-  api._pending.set('opencode:per_2', { kind: 'approval', sessionID: SID, requestID: 'per_2' });
-  await api.respond({ clientId: 'opencode', eventId: 'per_2', outcome: { kind: 'result', value: 'allowed-once' } });
+  api._pending.set('matrix:per_2', { kind: 'approval', sessionID: SID, requestID: 'per_2' });
+  await api.respond({ clientId: 'matrix', eventId: 'per_2', outcome: { kind: 'result', value: 'allowed-once' } });
   check('allowed-once → decision:once', () => assert.equal(replied.decision, 'once'));
 
-  api._pending.set('opencode:form_1', { kind: 'question', sessionID: SID, formID: 'form_1' });
+  api._pending.set('matrix:form_1', { kind: 'question', sessionID: SID, formID: 'form_1' });
   api._ensureClient = async () => ({ form: { reply: async (x) => { replied = x; } } });
   await api.respond({
-    clientId: 'opencode',
+    clientId: 'matrix',
     eventId: 'form_1',
     outcome: { kind: 'result', value: { answers: [{ id: 'colors', selected: ['蓝'] }] } }
   });

@@ -23,7 +23,7 @@
 ; node 子进程一并清掉）。杀完等半秒让文件句柄释放。
 ; 卸载器同理（系统设置里的卸载也走这里）
 !macro customUnInit
-  nsExec::Exec 'taskkill /F /IM "DualHabitat Matrix.exe" /T'
+  nsExec::Exec 'cmd /c taskkill /F /FI "USERNAME eq %USERNAME%" /IM "DualHabitat Matrix.exe" /T'
   Pop $0
   Sleep 500
 !macroend
@@ -133,7 +133,7 @@
   ; 循环杀 8 轮（每轮间隔 400ms）：防「刚杀完又被拉起 / 进程退出慢」。
   StrCpy $R9 0
   dhm_kill_loop:
-    nsExec::Exec 'taskkill /F /IM "DualHabitat Matrix.exe" /T'
+    nsExec::Exec 'cmd /c taskkill /F /FI "USERNAME eq %USERNAME%" /IM "DualHabitat Matrix.exe" /T'
     Pop $0
     IntOp $R9 $R9 + 1
     ${If} $R9 >= 8
@@ -170,7 +170,7 @@
 
 !macro customInstall
   ; 文件复制前再杀一次：安装中途应用可能被重新拉起（Windows 重启应用 / 手动）
-  nsExec::Exec 'taskkill /F /IM "DualHabitat Matrix.exe" /T'
+  nsExec::Exec 'cmd /c taskkill /F /FI "USERNAME eq %USERNAME%" /IM "DualHabitat Matrix.exe" /T'
   Pop $0
   Sleep 300
 
@@ -200,6 +200,5 @@
 !macroend
 
 !macro customUnInstall
-  ; 自带的 NapCat 是安装时解出来的，卸载器不知道这些文件，需要自己删
-  RMDir /r "$INSTDIR\resources\app\napcat"
+  ; NapCat 的运行目录可能含用户配置、OneBot 配置与登录缓存；保留该目录避免卸载时丢失数据。
 !macroend

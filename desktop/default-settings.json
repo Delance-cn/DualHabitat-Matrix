@@ -1,0 +1,8 @@
+{
+  "_comment": "首次启动自动生成。bridgeRoot 留空 = 用软件自带的桥接；napcat.dir 留空 = 用自带的 NapCat。",
+  "bridgeRoot": "",
+  "napcat": {
+    "dir": "",
+    "qq": ""
+  }
+}

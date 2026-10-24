@@ -205,6 +205,7 @@ export class ModelChain {
     this.allowPaid = allowPaid === true;
     this.cooldownMs = { ...DEFAULT_COOLDOWN_MS, ...cooldownMs };
     this.now = now;
+    this._knownModels = null;
     /** key -> { kind, until, detail, count, firstAt, lastAt } */
     this.health = new Map();
     /** 上一次成功过的候选 key（粘性首选，见 pick()）。 */
@@ -214,7 +215,10 @@ export class ModelChain {
 
   /** 当前生效的候选（付费开关关着时，付费档根本不在列表里）。 */
   get active() {
-    return this.allowPaid ? [...this.free, ...this.paid] : [...this.free];
+    const candidates = this.allowPaid ? [...this.free, ...this.paid] : [...this.free];
+    return this._knownModels
+      ? candidates.filter((candidate) => this._knownModels.has(`${candidate.providerID}/${candidate.id}`))
+      : candidates;
   }
 
   /** 某候选此刻是否可用（冷却到期即恢复，无需外部干预）。 */
@@ -255,7 +259,7 @@ export class ModelChain {
   }
 
   /**
-   * 用真实模型目录过一遍候选，丢掉"目录里根本没有"的项。
+   * 用真实模型目录临时隐藏"目录里根本没有"的项；不改写模型池本身。
    *
    * 为什么必须做：链里写了目录里不存在的东西（最典型的是 `glm-4-flash` ——
    * 它确实免费，但**不在 模型 API 目录里**，要靠配置生成器写一条自定义模型条目），
@@ -264,22 +268,22 @@ export class ModelChain {
    * 传空集合时**什么都不做**（宁可保留候选，也别因为目录读不到就把链清空）。
    *
    * @param {Set<string>|Array<string>} knownKeys 形如 `provider/model` 的集合
-   * @returns {Array<string>} 被丢掉的候选 key（调用方负责打日志）
+   * @returns {Array<string>} 当前目录不可用的候选 key（调用方负责打日志）
    */
   restrictTo(knownKeys) {
     const known = knownKeys instanceof Set ? knownKeys : new Set(knownKeys ?? []);
     if (known.size === 0) return [];
     const dropped = [];
-    const keep = (candidate) => {
-      if (known.has(`${candidate.providerID}/${candidate.id}`)) return true;
-      const key = candidateKey(candidate);
-      dropped.push(key);
-      this.health.delete(key);
-      return false;
-    };
-    this.free = this.free.filter(keep);
-    this.paid = this.paid.filter(keep);
+    this._knownModels = known;
+    for (const candidate of [...this.free, ...this.paid]) {
+      if (!known.has(`${candidate.providerID}/${candidate.id}`)) dropped.push(candidateKey(candidate));
+    }
     return dropped;
+  }
+
+  /** 目录可能因实例重启而变化；清除临时限制并恢复完整模型池。 */
+  clearRestrictions() {
+    this._knownModels = null;
   }
 
   /** 标记健康（成功一次就清掉熔断记录），并记住它作为“粘性首选”。 */

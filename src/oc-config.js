@@ -21,10 +21,14 @@
 //   node src/oc-config.js          写入 opencode.json
 //   node src/oc-config.js --check  只读回校验（不写文件）
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { PROVIDERS as UI_PROVIDERS, modelProfileKeyEnv } from './backends/providers.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
-import { CODE_ROOT, CONFIG_FILE, ROOT, SHIM_BASE_URL } from './oc-env.js';
+import { OpenCode } from '@opencode/client';
+import { Service } from '@opencode/client/service';
+import { CODE_ROOT, CONFIG_FILE, PATHS, ROOT, SHIM_BASE_URL } from './oc-env.js';
 import { loadModelPool } from './model-pool.js';
 
 // agent 预置随包分发，属于代码不是数据 —— 必须跟代码根走，
@@ -197,13 +201,37 @@ const PRESETS = [
  */
 const WORK_TOOL_ACTIONS = ['read', 'write', 'edit', 'grep', 'glob', 'shell'];
 
-function readJsonSafe(file, fallback) {
+export function readJsonSafe(file, fallback) {
+  let text;
   try {
-    let text = fs.readFileSync(file, 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return fallback;
+    throw error;
+  }
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  try {
     return JSON.parse(text);
-  } catch {
-    return fallback;
+  } catch (error) {
+    throw new Error(`JSON 文件无法解析：${file}（${error?.message ?? error}）`, { cause: error });
+  }
+}
+
+export function writeJsonAtomically(file, content) {
+  const temp = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`
+  );
+  try {
+    fs.writeFileSync(temp, content, { encoding: 'utf8', flag: 'wx' });
+    fs.renameSync(temp, file);
+  } catch (error) {
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {
+      // Preserve the original write or rename error.
+    }
+    throw error;
   }
 }
 
@@ -240,10 +268,9 @@ export function renderPersona({ prefix, suffix }, { model, cwd }) {
 function poolHeadModel(pool) {
   const first = [...(pool.free ?? []), ...(pool.paid ?? [])][0];
   if (!first) return null;
-  const key = typeof first === 'string' ? first : first.key;
-  if (!key) return null;
-  const [provider, rest = ''] = String(key).split('/');
-  return { provider, model: rest.split('#')[0] };
+  const { provider, model } = candidateParts(first);
+  if (!provider || !model) return null;
+  return { provider, model };
 }
 
 /**
@@ -262,7 +289,12 @@ export function readSlotProfiles(platform = 'qq') {
     const provider = String(v.provider ?? '').trim();
     const model = String(v.model ?? '').trim();
     if (!provider || !model) return null;
-    return { provider, model, baseUrl: String(v.baseUrl ?? '').trim() };
+    return {
+      provider,
+      model,
+      baseUrl: String(v.baseUrl ?? '').trim(),
+      apiKeyEnv: String(v.apiKeyEnv ?? '').trim()
+    };
   };
   return { chat: pick(slots.chat), work: pick(slots.work) };
 }
@@ -283,6 +315,13 @@ const BUILTIN_PROVIDERS = new Set([
   'moonshot',
   'siliconflow'
 ]);
+
+const PROVIDER_ALIASES = {
+  zhipu: 'zhipuai',
+  gemini: 'google'
+};
+
+const COMPATIBLE_PROVIDER_IDS = new Set(['minimax', 'volcengine']);
 
 /**
  * 本地 OpenAI 兼容服务商：opencode 的模型目录里**没有**它们，必须由生成器
@@ -359,8 +398,7 @@ function localProviderPlan({ pool, slots }) {
 /** 模型池里有没有某个 provider（决定要不要把 CF 指到 shim 上）。 */
 function poolUsesProvider(pool, provider) {
   return [...(pool.free ?? []), ...(pool.paid ?? [])].some((candidate) => {
-    const key = typeof candidate === 'string' ? candidate : candidate?.key ?? '';
-    return String(key).split('/')[0] === provider;
+    return candidateParts(candidate).provider === provider;
   });
 }
 
@@ -578,6 +616,7 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   // 0.4.1 起桌面端只有一份模型配置，同一份模型同时写进 chat / work 两个槽——
   // chat 管聊天档 agent，work 管主人档；能力差异全在工具清单，不在模型。
   // 没配的档一个字都不动 —— 保持原来的模型池行为。
+  const provider = { ...(base.provider ?? {}) };
   const slotPlan = [
     { slot: 'chat', ids: PRESETS.map((p) => p.id), label: '模型' },
     { slot: 'work', ids: ['qq-work'], label: '模型（工作档同款）' }
@@ -585,11 +624,52 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   for (const { slot, ids, label } of slotPlan) {
     const s = slots?.[slot];
     if (!s) continue;
-    if (!BUILTIN_PROVIDERS.has(s.provider) && !LOCAL_PROVIDERS[s.provider]) {
-      notes.push(`「${label}」是自定义服务商 ${s.provider}，暂不接到 agent（要往配置里写 apiKey，暂不自动做）`);
+    const providerId = PROVIDER_ALIASES[s.provider] ?? s.provider;
+    const presetId = UI_PROVIDERS[s.provider]
+      ? s.provider
+      : Object.keys(PROVIDER_ALIASES).find((id) => PROVIDER_ALIASES[id] === providerId);
+    const preset = UI_PROVIDERS[presetId];
+    const customEndpoint = !BUILTIN_PROVIDERS.has(providerId) &&
+      !LOCAL_PROVIDERS[providerId] &&
+      !COMPATIBLE_PROVIDER_IDS.has(providerId) ||
+      Boolean(s.baseUrl && preset?.baseUrl && s.baseUrl !== preset.baseUrl);
+    if (customEndpoint) {
+      if (!s.baseUrl || (s.protocol && s.protocol !== 'openai')) {
+        notes.push(`「${label}」是自定义服务商，需提供 OpenAI 兼容协议的 baseUrl 才能接到 agent`);
+        continue;
+      }
+      const relayId = `dhm-${slot}-relay`;
+      const model = String(s.model).split('#')[0];
+      const before = provider[relayId] ?? {};
+      provider[relayId] = {
+        ...before,
+        npm: before.npm ?? '@ai-sdk/openai-compatible',
+        name: before.name ?? `自定义中转站（${slot}）`,
+        options: {
+          ...(before.options ?? {}),
+          baseURL: s.baseUrl,
+          apiKey: `{env:${s.apiKeyEnv || modelProfileKeyEnv('qq', slot)}}`
+        },
+        models: {
+          ...(before.models ?? {}),
+          ...(model ? { [model]: before.models?.[model] ?? { name: model } } : {})
+        }
+      };
+      for (const id of ids) {
+        if (config.agents[id]) config.agents[id].model = `${relayId}/${model}`;
+      }
+      notes.push(`「${label}」使用独立中转站 ${s.baseUrl}（${relayId}）`);
       continue;
     }
-    const target = `${s.provider}/${s.model}`;
+    if (
+      !BUILTIN_PROVIDERS.has(providerId) &&
+      !LOCAL_PROVIDERS[providerId] &&
+      !COMPATIBLE_PROVIDER_IDS.has(providerId)
+    ) {
+      notes.push(`「${label}」的服务商 ${s.provider} 不是 OpenCode 内置项，无法接到 agent`);
+      continue;
+    }
+    const target = `${providerId}/${String(s.model).split('#')[0]}`;
     let hit = 0;
     for (const id of ids) {
       if (!config.agents[id]) continue;
@@ -603,8 +683,6 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
   // 1. 用户手写的 provider 定义必须原样保留。以前只有池里有 CF 时才写 provider，
   //    没 CF 时整段被生成器吃掉 —— 手写的自定义服务商（deepseek-official 之类）
   //    每重生成一次就丢一次。
-  const provider = { ...(base.provider ?? {}) };
-
   // 2. 本地服务商：opencode 目录里没有，生成器必须补定义，否则模型目录为空。
   const localPlan = localProviderPlan({ pool, slots });
   for (const [id, item] of localPlan) {
@@ -630,6 +708,33 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
         [...item.models].join('、') || '未指定'
       }）`
     );
+  }
+
+  // MiniMax / 火山方舟 aren't OpenCode built-ins. Register their OpenAI-compatible
+  // endpoints from the same provider catalog used by the desktop UI.
+  for (const id of COMPATIBLE_PROVIDER_IDS) {
+    const preset = UI_PROVIDERS[id];
+    if (!preset) continue;
+    const selected = ['chat', 'work']
+      .map((slot) => slots?.[slot])
+      .find((slot) => slot && (PROVIDER_ALIASES[slot.provider] ?? slot.provider) === id);
+    if (!selected) continue;
+    const before = provider[id] ?? {};
+    const model = String(selected.model ?? '').split('#')[0];
+    provider[id] = {
+      ...before,
+      npm: before.npm ?? '@ai-sdk/openai-compatible',
+      name: before.name ?? preset.label,
+      options: {
+        ...(before.options ?? {}),
+        baseURL: selected.baseUrl || before.options?.baseURL || preset.baseUrl,
+        apiKey: before.options?.apiKey || (preset.keyEnv ? `{env:${preset.keyEnv}}` : undefined)
+      },
+      models: {
+        ...(before.models ?? {}),
+        ...(model ? { [model]: before.models?.[model] ?? { name: model } } : {})
+      }
+    };
   }
 
   // 3. CF 兼容代理：池里有 CF 才把 baseURL 指到 cf-shim，别的一律不动。
@@ -669,22 +774,76 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
 }
 
 /**
- * 读回断言：生成的配置必须真的生效，否则桥接会以"预设不在清单里"为由拒绝建会话，
- * 而那条报错看不出是配置没生效。这里把关键不变量逐条验一遍。
+ * 配置读回断言：代理成实例返回的 agents / permissions 形状后，校验关键不变量。
  *
  * @param {object} config 期望的配置
  * @param {{agents: string[], permissions: object[]}} live 从实例读回的结果
  */
 export function assertConfig(config, live) {
   const problems = [];
+  const liveAgents = Array.isArray(live.agents) ? live.agents : [];
   for (const id of Object.keys(config.agents ?? {})) {
-    if (!live.agents.includes(id)) problems.push(`agent "${id}" 没出现在实例的 agent 列表里`);
+    if (!liveAgents.includes(id)) problems.push(`agent "${id}" 没出现在实例的 agent 列表里`);
+  }
+  const expectedPermissions = config.permissions ?? [];
+  const livePermissions = live.permissions ?? [];
+  if (livePermissions.length < expectedPermissions.length) {
+    problems.push(`实例只读到 ${livePermissions.length} 条权限规则，预期至少 ${expectedPermissions.length} 条`);
+  } else {
+    for (let index = 0; index < expectedPermissions.length; index += 1) {
+      const expected = expectedPermissions[index];
+      const actual = livePermissions[index];
+      if (
+        actual?.action !== expected.action ||
+        actual?.resource !== expected.resource ||
+        actual?.effect !== expected.effect
+      ) {
+        problems.push(`实例权限规则第 ${index + 1} 条与生成配置不一致`);
+        break;
+      }
+    }
+  }
+  for (const [id, agent] of Object.entries(config.agents ?? {})) {
+    const active = live.agentConfigs?.[id];
+    if (active && agent.model && active.model !== agent.model) {
+      problems.push(`agent "${id}" 的实例模型与生成配置不一致`);
+    }
   }
   const first = live.permissions?.[0];
   if (!first || first.action !== '*' || first.effect !== 'deny') {
     problems.push('生效规则集的第一条不是 `* → deny`（兜底不在最前面 = 实际上全放行）');
   }
   return problems;
+}
+
+export function extractLiveConfig(entries, configFile = CONFIG_FILE) {
+  if (!Array.isArray(entries)) return null;
+  const normalize = (file) => {
+    const resolved = path.resolve(file);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  const expectedPath = normalize(configFile);
+  const entry = entries.find((item) =>
+    item?.type === 'document' &&
+    typeof item.path === 'string' &&
+    normalize(item.path) === expectedPath
+  );
+  return entry?.info && typeof entry.info === 'object' ? entry.info : null;
+}
+
+async function readLiveConfig(workdir) {
+  const serviceFile = process.env.QQ_BRIDGE_SERVICE_FILE ||
+    path.join(PATHS.state, 'opencode', 'service.json');
+  if (!fs.existsSync(serviceFile)) return null;
+  const endpoint = await Service.discover({ file: serviceFile });
+  if (!endpoint?.url) return null;
+  const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) });
+  const entries = await client.config.get({ location: { directory: workdir } });
+  const liveConfig = extractLiveConfig(entries);
+  if (!liveConfig) {
+    throw new Error(`运行中实例未返回生成配置文件：${CONFIG_FILE}`);
+  }
+  return liveConfig;
 }
 
 async function main() {
@@ -733,11 +892,38 @@ async function main() {
   if (checkOnly) {
     const live = readJsonSafe(CONFIG_FILE, {});
     log(`现有配置的 agents: ${Object.keys(live.agents ?? {}).join(', ') || '(空)'}`);
+    const problems = assertConfig(config, {
+      agents: Object.keys(live.agents ?? {}),
+      permissions: live.permissions ?? []
+    });
+    if (problems.length) throw new Error(`现有配置校验失败：${problems.join('；')}`);
+    log('现有配置读回校验通过');
     return;
   }
 
-  fs.writeFileSync(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  writeJsonAtomically(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`);
+  const saved = readJsonSafe(CONFIG_FILE, {});
+  const problems = assertConfig(config, {
+    agents: Object.keys(saved.agents ?? {}),
+    permissions: saved.permissions ?? []
+  });
+  if (problems.length) throw new Error(`生成配置读回校验失败：${problems.join('；')}`);
   log(`已写入 ${CONFIG_FILE}`);
+  log('生成配置文件读回校验通过');
+  const live = await readLiveConfig(workdir);
+  if (live) {
+    const liveConfig = live;
+    const agentConfigs = liveConfig.agents && !Array.isArray(liveConfig.agents) ? liveConfig.agents : {};
+    const liveProblems = assertConfig(config, {
+      agents: Array.isArray(liveConfig.agents) ? liveConfig.agents.map((agent) => agent.id ?? agent.name) : Object.keys(agentConfigs),
+      agentConfigs,
+      permissions: liveConfig.permission ?? liveConfig.permissions ?? []
+    });
+    if (liveProblems.length) throw new Error(`运行中实例配置校验失败：${liveProblems.join('；')}`);
+    log('运行中模型 API 实例配置读回校验通过');
+  } else {
+    log('当前没有可查询的运行中模型 API 实例；仅完成文件读回校验');
+  }
 }
 
 /**

@@ -3,7 +3,7 @@
 // 与微信侧既有的 fireHook('message.received') 互不相干：那是微信通道自己的老钩子（指向通知枢纽），
 // 这是 QQ + 微信统一的事件流（扩展页配置，鉴权走 x-dhm-secret 头）。
 //
-// 事件体：{ event: 'message'|'reply', time: ISO, data: { platform, chatId, text, … } }
+// 事件体还会包含 delivery_failed（含失败分段索引，不含回复正文）。
 // 开关：config.events = { enabled, url, secret, onMessage, onReply }（桥接侧白名单归一化，微信侧读原文件）。
 
 export function emitEvent(cfg, type, data) {

@@ -25,6 +25,26 @@ export const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url
  */
 export const ROOT = resolveDataRoot(CODE_ROOT);
 
+export function resolveStateDirectory(root, configuredPath = '') {
+  const configured = String(configuredPath ?? '').trim();
+  return configured ? path.resolve(root, configured) : path.join(root, '.oc', 'state');
+}
+
+export function resolveConfiguredStateDirectory(root, envPath = '') {
+  const override = String(envPath ?? '').trim();
+  if (override) return path.resolve(root, override);
+
+  const configFile = path.join(root, 'config.json');
+  if (!fs.existsSync(configFile)) return resolveStateDirectory(root);
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(configFile, 'utf8').replace(/^\uFEFF/, ''));
+  } catch (error) {
+    throw new Error(`无法读取模型实例数据目录设置：${configFile}（${error?.message ?? error}）`, { cause: error });
+  }
+  return resolveStateDirectory(root, config?.matrix?.stateDir);
+}
+
 /** 固定端口：不跟桌面端的随机端口混，也不会撞 3080/3000/3001/3100。 */
 export const PORT = 4599;
 
@@ -36,10 +56,9 @@ export const PATHS = {
   data: path.join(ROOT, '.oc', 'data'),
   config: path.join(ROOT, '.oc', 'config'),
   cache: path.join(ROOT, '.oc', 'cache'),
-  state: path.join(ROOT, '.oc', 'state'),
+  state: resolveConfiguredStateDirectory(ROOT, process.env.QQ_BRIDGE_STATE_DIR),
   work: path.join(ROOT, '.oc', 'work'),
   logs: path.join(ROOT, '.oc', 'logs'),
-  pid: path.join(ROOT, '.oc', 'server.pid'),
   shimPid: path.join(ROOT, '.oc', 'cf-shim.pid'),
   shimLog: path.join(ROOT, '.oc', 'logs', 'cf-shim.jsonl')
 };

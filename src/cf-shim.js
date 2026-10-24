@@ -26,6 +26,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { PATHS, SHIM_PORT } from './oc-env.js';
+import { rotateLogFile } from './log-rotate.js';
 
 /** CF 的 OpenAI 兼容端点。 */
 export function cloudflareUpstream(accountId) {
@@ -83,6 +84,7 @@ export function startShim(options = {}) {
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
   const record = (entry) => {
     try {
+      rotateLogFile(logFile);
       fs.appendFileSync(logFile, `${JSON.stringify(entry)}\n`);
     } catch {
       /* 取证日志写不进去不该影响转发 */

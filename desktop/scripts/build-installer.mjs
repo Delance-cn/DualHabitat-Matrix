@@ -33,6 +33,18 @@ if (!fs.existsSync(path.join(root, 'bridge-dist', 'src', 'bridge.js'))) {
   console.error('缺 bridge-dist，先跑：npm run prepare:bridge');
   process.exit(1);
 }
+const requiredBridgeDependencies = [
+  'node_modules/@opencode/client/package.json',
+  'node_modules/effect/package.json',
+  'node_modules/@snowluma/sdk/package.json'
+];
+const missingBridgeDependencies = requiredBridgeDependencies.filter(
+  (file) => !fs.existsSync(path.join(root, 'bridge-dist', file))
+);
+if (missingBridgeDependencies.length) {
+  console.error(`bridge-dist 缺少运行依赖：${missingBridgeDependencies.join(', ')}。请重新运行 npm run prepare:bridge`);
+  process.exit(1);
+}
 if (!fs.existsSync(path.join(root, 'vendor', 'backends', 'providers.js'))) {
   console.error('缺 vendor/backends，先跑：npm run prepare:vendor');
   process.exit(1);
@@ -353,6 +365,7 @@ const config = {
   appId: 'cn.delance.dualhabitat-matrix',
   productName: 'DualHabitat Matrix',
   copyright: 'DualHabitat Matrix',
+  publish: [{ provider: 'github', owner: 'Delance-cn', repo: 'DualHabitat-Matrix' }],
   directories: { output: 'dist', buildResources: 'build' },
   // 直接用 node_modules 里已经解好的 Electron。让它自己去下载的话，
   // 在受限网络下会卡在半路不动（实测：卡在 electron zip 下载 12MB 处 10 分钟没反应）。
@@ -360,7 +373,7 @@ const config = {
   // asar 关掉：napcat 里是可执行的 .exe/.dll，塞进 asar 里跑不起来；
   // 而且本项目的界面本来就是明文 js，压成 asar 只是碍事。
   asar: false,
-  files: ['main.mjs', 'shutdown.mjs', 'server.mjs', 'public/**/*', 'vendor/**/*', 'package.json'],
+  files: ['main.mjs', 'shutdown.mjs', 'server.mjs', 'secrets-reload.mjs', 'path-validation.mjs', 'default-settings.json', 'public/**/*', 'vendor/**/*', 'package.json'],
   extraResources,
   compression: 'normal',
   win: {

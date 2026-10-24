@@ -111,8 +111,11 @@ async function main() {
 
   const ended = await done;
   console.log('✅ 回合结束 reason =', ended.reason?.kind);
+  if (ended.reason?.kind !== 'completed' || !ended.text.trim()) {
+    throw new Error(`模型 API 自测回合未成功完成（reason=${ended.reason?.kind ?? 'unknown'}，有文本=${Boolean(ended.text.trim())}）`);
+  }
   console.log('🤖 agent 回复:');
-  console.log(ended.text || '（无文本）');
+  console.log(ended.text);
   await cleanupSelfTestSession();
   console.log('🎉 自测通过 —— 模型 API 链路可用');
   process.exit(0);

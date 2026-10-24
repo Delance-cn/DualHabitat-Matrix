@@ -20,6 +20,8 @@ import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport,
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './oc-client.js';
+import { createInboundDeduper } from './inbound-dedupe.js';
+import { createKeyedSerialQueue } from './keyed-serial-queue.js';
 import { createBackend, TYPE_LABELS } from './backends/index.js';
 import { ensureServer, serverStatus } from './oc-server.js';
 import { PATHS } from './oc-env.js';
@@ -2546,6 +2548,8 @@ async function main() {
       stateDir,
       // oc-settings.json / model-chain.json 落在同一个 state 目录，跟原来一致。
       sessionDir: stateDir,
+      // 模型目录校验必须与 sessions.create 使用同一个 workspace 根目录。
+      modelDirectory: path.resolve(cfg.sessionCwd ? String(cfg.sessionCwd) : path.join(STATE_DIR, 'agents')),
       // true 时 archiveSession 真的删会话；默认只 interrupt，怕丢历史账。
       deleteArchived: cfg.matrix.deleteArchived === true,
       log
@@ -2808,17 +2812,15 @@ async function main() {
   const queueRetries = new Map(); // key -> 连续补投失败次数（用于退避/暂停恢复）
 
   // reset 竞态导致 ensureSession 抛「会话创建期间已重置」时，把消息放回队列稍后重试。
-  // 已在队列中的相同文本不重复入队。
+  // 文本相同不代表同一条消息；入站事件的 message_id 去重已在 handleIncoming 处理。
   const enqueueForRetry = (key, promptText, opts = {}) => {
     const items = queued.get(key) ?? [];
-    if (!items.some((it) => it.promptText === promptText)) {
-      if (items.length >= QUEUE_MAX) {
-        items.shift();
-        log(`队列满（${QUEUE_MAX}），丢弃最旧消息 (${key})`);
-      }
-      items.push({ promptText, farewell: !!opts.farewell, silent: !!opts.silent, media: opts.media ?? [], wakeReason: opts.wakeReason });
-      queued.set(key, items);
+    if (items.length >= QUEUE_MAX) {
+      items.shift();
+      log(`队列满（${QUEUE_MAX}），丢弃最旧消息 (${key})`);
     }
+    items.push({ promptText, farewell: !!opts.farewell, silent: !!opts.silent, media: opts.media ?? [], wakeReason: opts.wakeReason });
+    queued.set(key, items);
     queueRetries.delete(key); // 新消息入队视为新的机会，重置退避计数
     setTimeout(() => { flushQueue(); }, 3000);
   };
@@ -3072,6 +3074,7 @@ async function main() {
     forgetConversationCaches(key);
     if (!sessionId) return;
     reverse.delete(sessionId);
+    sessionRequesters.delete(sessionId);
     collectors.delete(sessionId);
     sessionModels.delete(sessionId);
     modelAppliedSessions.delete(sessionId);
@@ -7515,12 +7518,12 @@ async function main() {
     server.listen(port, '127.0.0.1', () => {
       log(`本地控制台已启动：http://127.0.0.1:${port}`);
     });
-    // 端口被占用说明已有实例在跑：以 exit 2 退出，守护脚本会识别为"已有实例"而不是无限重启
+    // 单实例锁已在控制台启动前获取；因此端口冲突不能证明已有桥接实例在跑。
     server.on('error', (error) => {
       log(`控制台服务错误: ${error?.message ?? error}`);
       if (error?.code === 'EADDRINUSE') {
-        console.error(`[bridge] 控制台端口 ${port} 已被占用（可能已有实例在运行），退出。`);
-        process.exit(2);
+        console.error(`[bridge] 控制台端口 ${port} 已被其他进程占用；请在配置中修改 consolePort 后重启。`);
+        process.exit(1);
       }
       process.exit(1);
     });
@@ -7532,9 +7535,10 @@ async function main() {
 
   // 待应答的提问/审批：convKey -> pending
   const pending = new Map(); // key -> { kind, rpcId, sessionId, ... }
+  const sessionRequesters = new Map(); // sessionId -> user id for the last user-triggered prompt
 
-  // QQ 发送队列（顺序发送 + 间隔，避免触发频率限制）
-  let sendChain = Promise.resolve();
+  // 每个会话独立串行发送，单个群的慢请求不阻塞其它会话。
+  const enqueueSend = createKeyedSerialQueue();
   function redactKnownTokensOnly(text) {
     let s = String(text ?? '');
     for (const token of KNOWN_AGENT_TOKENS) {
@@ -7553,33 +7557,56 @@ async function main() {
     const safeMsg = redactKnownTokensOnly(msg);
     const [kind, id] = key.split(':');
     const parts = splitForQQ(safeMsg);
-    lastSendFailed.delete(key);
-    for (const part of parts) {
-      sendChain = sendChain
-        .then(async () => {
-          assertSendAllowed();
-          if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
-          else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
-        })
-        .catch((error) => {
-          lastSendFailed.set(key, true);
-          log(`QQ 发送失败 (${key}):`, error?.message ?? error);
-        })
-        .then(() => sleep(cfg.sendDelayMs));
-    }
-    // 插件事件：onBotReply（进发送队列后触发一次；分条细节不暴露）
-    sendChain = sendChain.then(() => {
-      firePluginHook('onBotReply', { platform: 'qq', chatId: key, text: safeMsg });
-      emitEvent(cfg, 'reply', { platform: 'qq', chatId: key, text: safeMsg });
-      // 每日记忆日志：机器人发出去的也记（按当前角色）
-      try {
-        appendMemory({
-          root: ROOT, channel: 'qq', role: readRoleState().role,
-          conv: key, who: 'bridge', self: true, text: safeMsg
+    return enqueueSend(key, async () => {
+      let allSent = true;
+      const failedParts = [];
+      for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+        const part = parts[partIndex];
+        let sent = false;
+        for (let attempt = 1; attempt <= 2 && !sent; attempt += 1) {
+          try {
+            assertSendAllowed();
+            const send = kind === 'private'
+              ? bot.sendPrivateMessage(Number(id), text(escapeCqText(part)))
+              : bot.sendGroupMessage(Number(id), text(escapeCqText(part)));
+            await withTimeout(send, SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+            sent = true;
+          } catch (error) {
+            if (attempt < 2) {
+              log(`QQ 发送失败，准备重试 (${key}, ${attempt}/1):`, error?.message ?? error);
+              await sleep(Math.max(500, Number(cfg.sendDelayMs) || 0));
+            } else {
+              allSent = false;
+              lastSendFailed.set(key, true);
+              log(`QQ 发送最终失败 (${key})，该段未送达:`, error?.message ?? error);
+              failedParts.push({ part: partIndex + 1 });
+            }
+          }
+        }
+        await sleep(cfg.sendDelayMs);
+      }
+      if (allSent) lastSendFailed.delete(key);
+      if (allSent) {
+        // 插件事件：onBotReply（分条细节不暴露）
+        firePluginHook('onBotReply', { platform: 'qq', chatId: key, text: safeMsg });
+        emitEvent(cfg, 'reply', { platform: 'qq', chatId: key, text: safeMsg });
+        // 每日记忆日志：机器人发出去的也记（按当前角色）
+        try {
+          appendMemory({
+            root: ROOT, channel: 'qq', role: readRoleState().role,
+            conv: key, who: 'bridge', self: true, text: safeMsg
+          });
+        } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }
+      } else {
+        emitEvent(cfg, 'delivery_failed', {
+          platform: 'qq',
+          chatId: key,
+          failedParts,
+          messageParts: parts.length
         });
-      } catch (error) { log(`记忆日志写入失败：${error?.message ?? error}`); }
-    }).catch(() => { });
-    return sendChain;
+      }
+      return allSent;
+    });
   }
 
   /** 上一批发往该会话的消息是否全部成功。 */
@@ -8513,6 +8540,7 @@ async function main() {
   // 一代/普通模式的图片/表情元数据存储：key -> Map<messageId/seq, media[]>
   // 二代模式则直接存在 socialV2 会话的 recentMessages/unread 消息对象上。
   const messageMediaStore = new Map();
+  const isDuplicateInboundMessage = createInboundDeduper();
   // 二代会话见过的 forward id（有界，避免 recentMessages 滚动淘汰后无法读取刚见过的转发）
   const seenForwardIds = new Map(); // key -> Set<string>
 
@@ -9299,6 +9327,7 @@ async function main() {
     // 等待期间会话可能被重置/切模式，投递前再确认一次。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     if (opts.farewell) social.exitingSessions.add(sessionId);
+    if (opts.requesterId != null) sessionRequesters.set(sessionId, String(opts.requesterId));
     let accepted;
     try {
       accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content });
@@ -9347,13 +9376,17 @@ async function main() {
         saveSocialV2State();
       }
     }
+    const command = Boolean(accepted.result.value.command);
     if (accepted.result.value.command?.text && !opts.silent && currentMode !== 'reserved2') {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
       await auditAndSend(key, mdToPlain(accepted.result.value.command.text));
     } else if (accepted.result.value.command?.text && opts.silent && opts.farewell) {
       social.exitingSessions.delete(sessionId);
     }
-    return { ok: true };
+    if (!command && opts.ackMessage && !opts.silent && currentMode !== 'reserved2') {
+      await sendToQQ(key, opts.ackMessage);
+    }
+    return { ok: true, command };
   }
 
   // 每个 QQ 会话串行投递 DSH prompt，保证 turn 完成顺序与提交顺序一致，
@@ -9393,7 +9426,7 @@ async function main() {
     }
   }
 
-  function scheduleSocialReply(key, promptText, minDelay, maxDelay, label, farewell = false, media = null) {
+  function scheduleSocialReply(key, promptText, minDelay, maxDelay, label, farewell = false, media = null, requesterId = null) {
     const delay = randInt(minDelay, maxDelay);
     log(`社交模式：${label} ${key}，延迟 ${Math.round(delay / 1000)}s 后投递`);
     const timer = setTimeout(() => {
@@ -9402,7 +9435,7 @@ async function main() {
         timers.delete(timer);
         if (timers.size === 0) social.pendingTimers.delete(key);
       }
-      deliverPrompt(key, promptText, { farewell, media: media ?? [] }).catch((error) => log(`社交投递异常 ${key}: ${error?.message ?? error}`));
+      deliverPrompt(key, promptText, { farewell, media: media ?? [], requesterId }).catch((error) => log(`社交投递异常 ${key}: ${error?.message ?? error}`));
     }, delay);
     const timers = social.pendingTimers.get(key) ?? new Set();
     timers.add(timer);
@@ -10668,7 +10701,7 @@ async function main() {
    * 甚至把另一段对话的上下文串进来（实测 16:17:09 / 16:32:26 / 16:34:09）。
    *
    * 这里在提交前等上一回合的 turn/end（collectors 被清空），把「串行提交」
-   * 升级成「串行回合」。超时兜底：真遇到挂死回合也不能把队列永久卡住。
+   * 升级成「串行回合」。超时后拒绝当前排队消息，绝不把它并入仍在运行的旧回合。
    * ──────────────────────────────────────────────────────────────────────── */
 
   async function waitTurnIdle(sessionId) {
@@ -10679,8 +10712,7 @@ async function main() {
       const busy = collectors.has(sessionId) || acceptedAgo < TURN_BARRIER_GRACE_MS;
       if (!busy) return true;
       if (Date.now() - startedAt >= TURN_BARRIER_TIMEOUT_MS) {
-        log(`等待上一回合结束超时（${Math.round(TURN_BARRIER_TIMEOUT_MS / 1000)}s），本次照常投递`);
-        return false;
+        throw new Error(`上一回合超过 ${Math.round(TURN_BARRIER_TIMEOUT_MS / 1000)} 秒仍未结束，已拒绝并发投递以避免混合回合`);
       }
       await sleep(150);
     }
@@ -10899,7 +10931,12 @@ async function main() {
     const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
     const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
     const mediaList = extractMediaFromSegments(event.message ?? []);
-    const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
+    const messageId = event.message_id ?? event.msg_id ?? event.message_seq;
+    if (isDuplicateInboundMessage(key, messageId)) {
+      log(`忽略重复入站消息 (${key}, message=${messageId})`);
+      return;
+    }
+    const messageRef = String(messageId ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
     const refsToStore = [...new Set([messageRef, seqRef].filter(Boolean))];
     if (refsToStore.length > 0 && mediaList.length > 0) {
@@ -10927,7 +10964,10 @@ async function main() {
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
     // 审批只有管理员消息会被消费；群友消息不能因为“审批挂起”而被吞掉，应继续走正常处理。
     const p = pending.get(key);
-    if (p && (p.kind === 'question' || isOwner)) {
+    const mayAnswerQuestion = p?.kind === 'question'
+      && p.requesterId != null
+      && String(event.user_id) === String(p.requesterId);
+    if (p && (mayAnswerQuestion || (p.kind === 'approval' && isOwner))) {
       await handlePendingAnswer(p, plainContent, key, isOwner);
       return;
     }
@@ -10983,6 +11023,7 @@ async function main() {
           delete state.sessionPolicies[key];
           if (state.sessionStats) delete state.sessionStats[key];
           reverse.delete(old);
+          sessionRequesters.delete(old);
           collectors.delete(old);
           sendToolSucceededSessions.delete(old);
           pendingSendToolCalls.delete(old);
@@ -11020,9 +11061,22 @@ async function main() {
           saveSocialV2State();
           saveState();
           // 与 retireSession 一致：先终止 DSH 侧排队的工作，再归档（归档只隐藏会话）。
-          try { await api.stopSessionWork(old); }
-          catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 模型 API 检查旧任务`); }
-          try { await api.workspace.archiveSession({ sessionId: old }); } catch {}
+          let stopped = false;
+          try {
+            await withTimeout(api.stopSessionWork(old), 5000, `停止旧会话 ${key}`);
+            stopped = true;
+          } catch (error) {
+            log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在模型 API 检查旧任务`);
+          }
+          if (stopped) {
+            try {
+              await withTimeout(api.workspace.archiveSession({ sessionId: old }), 5000, `归档旧会话 ${key}`);
+            } catch (error) {
+              log(`⚠️ 归档旧会话失败 ${key}：${error?.message ?? error}`);
+            }
+          } else {
+            log(`⚠️ 未归档旧会话 ${key}：停止操作未确认完成`);
+          }
           // 前台客户端后端：让客户端窗口也开一个新对话（没有该方法的后端原样跳过）
           if (typeof api.newThread === 'function') {
             try {
@@ -11194,7 +11248,8 @@ async function main() {
             Number(cfg.social?.activeReplyDelayMaxMs ?? 8000),
             '私聊即时回应',
             false,
-            mediaList
+            mediaList,
+            event.user_id
           );
           log(`社交模式：${key} 私聊活跃中收到消息，即时投递`);
           return;
@@ -11232,7 +11287,8 @@ async function main() {
           Number(cfg.social?.activeReplyDelayMaxMs ?? 8000),
           '触发进入活跃',
           false,
-          mediaList
+          mediaList,
+          event.user_id
         );
       }
       return;
@@ -11256,40 +11312,19 @@ async function main() {
       return;
     }
 
-    let sessionId;
+    let result;
     try {
-      sessionId = await ensureSession(key);
+      result = await deliverPrompt(key, promptText, {
+        media: mediaList,
+        requesterId: event.user_id,
+        ackMessage: currentMode !== 'reserved2' ? cfg.ackMessage : ''
+      });
     } catch (error) {
-      if (String(error?.message ?? error).includes('会话创建期间已重置')) {
-        enqueueForRetry(key, promptText, { media: mediaList });
-        return;
-      }
-      throw error;
-    }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
-    if (Array.isArray(mediaList) && mediaList.length > 0) {
-      const imageParts = await resolveMediaList(mediaList, { canSeeImages: sessionSeesImages(sessionId) });
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
-    }
-    if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
-    const accepted = await api.sessions.prompt({
-      sessionId,
-      mode: 'queue',
-      content
-    });
-    if (!accepted.result.ok) {
-      const errText = `${accepted.result.error.code}: ${accepted.result.error.message}`;
-      const safeErrText = shouldAuditKey(key) && SENSITIVE_RE.test(errText) ? '（含敏感信息，已隐藏）' : errText;
-      await sendToQQ(key, `⚠️ 消息未被接受：${safeErrText}`);
+      log(`聊天投递失败 (${key}): ${error?.message ?? error}`);
+      await sendToQQ(key, '⚠️ 当前无法创建对话，请稍后重试；管理员请检查后端配置和服务日志。');
       return;
     }
-    if (accepted.result.value.command) {
-      // 斜杠命令直接有结果，不走模型
-      if (accepted.result.value.command.text) await auditAndSend(key, mdToPlain(accepted.result.value.command.text));
-      return;
-    }
-    noteSessionTurn(key);
-    if (cfg.ackMessage && currentMode !== 'reserved2') await sendToQQ(key, cfg.ackMessage);
+    if (!result.ok || result.command || result.queued || result.retried) return;
     log(`已投递 ${key}: ${promptText.slice(0, 80)}${promptText.length > 80 ? '…' : ''}`);
   }
 
@@ -11817,8 +11852,9 @@ async function main() {
                   appendActivity(`${key} agent 回复：${plain.slice(0, 80)}${plain.length > 80 ? '…' : ''}`);
                   await sendToQQ(key, plain);
                 }
-              } else if (ended.reason.kind === 'error') {
-                const msg = ended.reason.error?.message ?? '未知错误';
+              } else if (ended.reason.kind === 'error' || ended.reason.kind === 'failed') {
+                const rawError = ended.reason.error;
+                const msg = typeof rawError === 'string' ? rawError : rawError?.message ?? '未知错误';
                 const safeMsg = shouldAuditKey(key) && SENSITIVE_RE.test(msg) ? '（含敏感信息，已隐藏）' : msg.slice(0, 500);
                 await sendToQQ(key, `⚠️ agent 处理出错：${safeMsg}`);
                 if (isFarewell) {
@@ -11830,7 +11866,7 @@ async function main() {
                     log(`社交模式：${key} 退场发言出错，回到观望`);
                   }
                 }
-              } else if (ended.reason.kind === 'aborted') {
+              } else if (ended.reason.kind === 'aborted' || ended.reason.kind === 'interrupted') {
                 await sendToQQ(key, '⏹️ 已停止');
                 if (isFarewell) {
                   const st = socialState(key);
@@ -11897,7 +11933,15 @@ async function main() {
               return s;
             });
             await sendToQQ(key, '❓ agent 需要你回答：\n' + lines.join('\n') + '\n（直接回复选项文字或输入你的回答）');
-            await registerPending(key, { kind: 'question', rpcId: envelope.rpcId, sessionId: frame.sessionId, clientId: frame.clientId, eventId: frame.eventId, questions: frame.questions });
+            await registerPending(key, {
+              kind: 'question',
+              rpcId: envelope.rpcId,
+              sessionId: frame.sessionId,
+              clientId: frame.clientId,
+              eventId: frame.eventId,
+              questions: frame.questions,
+              requesterId: sessionRequesters.get(frame.sessionId) ?? null
+            });
           } else if (frame.type === 'approval/requested') {
             const key = reverse.get(frame.sessionId);
             if (!key) continue;
@@ -11933,6 +11977,11 @@ async function main() {
               api.invalidate();
               log('模型 API 服务已重拉，事件流将自动重连');
             }
+          } else {
+            // 运行实例可能已由桌面端轮换密钥后重启；服务活着但注册凭据已变，
+            // 丢弃旧客户端，让下一轮从新的 service.json 重新发现凭据。
+            api.invalidate();
+            log('模型 API 服务仍在运行，刷新客户端凭据后重连事件流');
           }
         } catch (reviveError) {
           log(`⚠️ 自动重拉模型 API 服务失败（30 秒后再试）：${reviveError?.message ?? reviveError}`);

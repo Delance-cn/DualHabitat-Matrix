@@ -34,6 +34,8 @@
       "main.mjs",
       "shutdown.mjs",
       "server.mjs",
+      "secrets-reload.mjs",
+      "path-validation.mjs",
       "public/**/*",
       "vendor/**/*",
       "package.json"
