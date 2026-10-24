@@ -184,6 +184,6 @@ bailian/qwen3.8-max → bailian/kimi-k3 → bailian/MiniMax-M2.5 → bailian/qwe
 
 ## 许可证
 
-本项目采用 [MIT](LICENSE) 许可证发布：**欢迎任何商业使用与闭源分发**，但请务必在副本中保留原作者（杜继承）的版权声明。
+本项目采用 [MIT](LICENSE) 许可证发布：**欢迎任何商业使用与闭源分发**，但请务必在副本中保留原作者的版权声明。
 
 > 沿袭上游 [Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge)（MIT），感谢原作者。
