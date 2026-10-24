@@ -51,6 +51,9 @@ const loadBackend = (file) => import(pathToFileURL(path.join(backendsRoot, file)
 
 const { listProviders, resolveProfile, listModels, modelProfileKeyEnv } = await loadBackend('providers.js');
 const MODEL_PROVIDER_CATALOG = new Map(listProviders().map((provider) => [provider.id, provider]));
+// 这些 provider 由配置生成器按自己的 id 写定义（本地端口可覆盖，MiniMax/方舟是兼容端点），
+// 不需要再套 dhm-<slot>-relay，也不应该给它们写按档位独立的 keyEnv。
+const NON_RELAY_PROVIDER_IDS = new Set(['lmstudio', 'ollama', 'vllm', 'llamacpp', 'jan', 'minimax', 'volcengine']);
 const { streamChat } = await loadBackend('protocols.js');
 const { DRIVERS, UNVERIFIED } = await loadBackend('cli/drivers.js');
 const { resolveBin } = await loadBackend('cli/engine.js');
@@ -5452,7 +5455,8 @@ const server = http.createServer(async (req, res) => {
           if (v) {
             const preset = MODEL_PROVIDER_CATALOG.get(v.provider);
             const customEndpoint = !preset || preset.id === 'custom' ||
-              (v.baseUrl && preset.baseUrl && v.baseUrl !== preset.baseUrl);
+              (!NON_RELAY_PROVIDER_IDS.has(preset.id) &&
+                Boolean(v.baseUrl && preset.baseUrl && v.baseUrl !== preset.baseUrl));
             if (customEndpoint) {
               v.apiKeyEnv = modelProfileKeyEnv(pf, slot);
               const old = existingProfiles?.[pf]?.[slot];

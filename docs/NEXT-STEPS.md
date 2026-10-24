@@ -1,9 +1,13 @@
 # DualHabitat Matrix · 下一步计划（2026-10-23 整理）
 
 > 配套文档：[AGENT-EXTENSIONS.md](./AGENT-EXTENSIONS.md)（给 AI agent 读的扩展开发指南）。
-> 现状基线：v0.5.3 已发布（**本地服务商覆盖补齐 vLLM / llama.cpp / Jan + 自定义 baseUrl 接入**，
+> 现状基线：v0.5.4 已构建（2026-10-24，安装包与隔离数据根 Electron E2E 已过；GitHub 网络当前不可达，
+> `origin` / `test` 推送和 release 待网络恢复后补）。
+> v0.5.4 = 0.5.3 的本地服务商扩展（vLLM / llama.cpp / Jan + 自定义 baseUrl）+
+> GitHub Copilot 缺陷修复批次（保存档位不互相覆盖、密钥按平台/档位隔离、模型链限制可恢复、
+> 失败回合上报、`/api/raw` 不泄露 secrets、退出时收掉模型服务、日志轮转、入站去重与按会话串行）。
 > 空 provider 的手填地址档不再被静默丢弃，provider 段与 agent 的 model 都能落盘；
-> 另修 `prepare-vendor/prepare-bridge` 在 junction + 中文真实路径下静默中断（exit 127）的坑）。
+> 另修 `prepare-vendor/prepare-bridge` 在 junction + 中文真实路径下静默中断（exit 127）的坑。
 > v0.5.2：关软件时真正收掉 NapCat / 桥接 / 微信；本地 LM Studio / Ollama 会写 provider 定义 + 模型清单，4599 目录不再为空。
 > v0.5.1：本地 Agent 工具 + TTS 慧慧兜底/字数上限/自定义引擎/自定义出图；v0.5.0：OpenAI 兼容壳 4610。
 > 详细史志见工作区「DualHabitat-桌面端重做-交接记录-2026-10-19.md」（三十二节止）。
