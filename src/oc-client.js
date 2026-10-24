@@ -42,7 +42,7 @@ import { pathToFileURL } from 'node:url';
 // 桥接连启动都做不到 —— 改名时踩过一次，别再改回去。
 import { OpenCode as Sdk } from '@opencode/client';
 import { Service } from '@opencode/client/service';
-import { KIND, ModelChain, candidateKey, classifyFailure } from './model-chain.js';
+import { KIND, ModelChain, candidateKey, classifyFailure, parseCandidate } from './model-chain.js';
 import { describePool, loadModelPool } from './model-pool.js';
 
 const HR = '────';
@@ -329,6 +329,11 @@ export class NodeApiClient {
      * 失败的回合不产出文本，桥接就不会发消息，换模型重试是在同一个 turn 内完成的。
      */
     this._chain = null;
+    // 裸模型名（没有 provider/ 前缀）：先留在这里，等模型目录就绪后再按真实
+    // 模型 id 反查 provider。0.5.5 的实机配置里就有一份这样的 models.json，
+    // 以前会直接在 ModelChain 构造时抛错，把桥接整个带崩。
+    this._bareCandidates = [];
+    this._chainConfig = { allowPaid: false, cooldownMs: {}, exhaustedNotice: '我这会儿 API 连不上了，等会儿再聊吧。' };
     this._chainNotice = '我这会儿 API 连不上了，等会儿再聊吧。';
     this._chainStateFile = path.join(
       auth.sessionDir || process.env.QQ_BRIDGE_STATE_DIR || path.join(process.cwd(), '.oc', 'state'),
@@ -383,10 +388,60 @@ export class NodeApiClient {
    * @param {string}  [models.exhaustedNotice]     全部用完时回给 QQ 的那句话
    */
   configureModelChain(models) {
-    if (!models || (!models.free?.length && !models.paid?.length)) {
+    this._bareCandidates = [];
+    const unresolvedFree = Array.isArray(models?.unresolved?.free) ? models.unresolved.free : [];
+    const unresolvedPaid = Array.isArray(models?.unresolved?.paid) ? models.unresolved.paid : [];
+    for (const spec of unresolvedFree) {
+      if (String(spec).trim()) this._bareCandidates.push({ spec: String(spec).trim(), tier: 'free' });
+    }
+    for (const spec of unresolvedPaid) {
+      if (String(spec).trim()) this._bareCandidates.push({ spec: String(spec).trim(), tier: 'paid' });
+    }
+    if (!models || (!models.free?.length && !models.paid?.length && !this._bareCandidates.length)) {
       this._chain = null;
       return;
     }
+    this._chainConfig = {
+      allowPaid: models.allowPaid === true,
+      cooldownMs: models.cooldownMs ?? {},
+      exhaustedNotice: String(models.exhaustedNotice ?? '我这会儿 API 连不上了，等会儿再聊吧。')
+    };
+
+    // 只把能解析的候选交给 ModelChain。坏条目记一条日志后跳过，
+    // 绝不能因为运维手滑写了一个裸模型名就让桥接 exit 1。
+    const pick = (list, tier) => {
+      const kept = [];
+      for (const item of Array.isArray(list) ? list : []) {
+        try {
+          const parsed = parseCandidate(item);
+          if (!String(parsed.providerID ?? '').trim() || !String(parsed.id ?? '').trim()) {
+            throw new Error('缺少 provider 或模型名');
+          }
+          kept.push(item);
+        } catch (error) {
+          const text = typeof item === 'string' ? item.trim() : '';
+          if (text && !text.includes('/')) {
+            // 裸模型名：先记下来，等拿到真实模型目录后再反查 provider。
+            this._bareCandidates.push({ spec: text, tier });
+            this.log(`⚠️ 模型池${tier === 'paid' ? '付费档' : '免费档'}里的「${text}」缺少 provider 前缀，等模型目录就绪后再匹配`);
+          } else {
+            this.log(`⚠️ 模型池${tier === 'paid' ? '付费档' : '免费档'}里的候选写法不对，已跳过：${error?.message ?? error}`);
+          }
+        }
+      }
+      return kept;
+    };
+
+    const free = pick(models.free, 'free');
+    const paid = pick(models.paid, 'paid');
+    if (!free.length && !paid.length) {
+      this._chain = null;
+      if (this._bareCandidates.length) {
+        this.log('模型池暂时没有可直接使用的候选；裸模型名会在连接上模型目录后自动补全');
+      }
+      return;
+    }
+
     this._chainNotice = String(models.exhaustedNotice ?? '我这会儿 API 连不上了，等会儿再聊吧。');
     let health = null;
     try {
@@ -397,15 +452,15 @@ export class NodeApiClient {
       this.log(`模型链状态文件读不动，忽略：${error?.message ?? error}`);
     }
     this._chain = new ModelChain({
-      free: models.free ?? [],
-      paid: models.paid ?? [],
+      free,
+      paid,
       allowPaid: models.allowPaid === true,
       cooldownMs: models.cooldownMs ?? {},
       health
     });
     this._chainValidated = false;
     this.log(`模型链已启用：${this._chain.status().map((s) => `${s.key}${s.usable ? '' : '(熔断中)'}`).join(' → ')}`);
-    this.log(`模型池策略：${describePool({ ...models, exhaustedNotice: this._chainNotice })}`);
+    this.log(`模型池策略：${describePool({ ...models, free, paid, exhaustedNotice: this._chainNotice })}`);
   }
 
   /**
@@ -417,7 +472,7 @@ export class NodeApiClient {
    * 启动时按目录清一遍，比跑到一半才发现好得多。
    */
   async _validateChainCandidates(client) {
-    if (!this._chain || this._chainValidated) return;
+    if (this._chainValidated) return;
     this._chainValidated = true;
     try {
       const listed = await client.model.list({
@@ -431,6 +486,41 @@ export class NodeApiClient {
         this.log('⚠️ 模型目录是空的，跳过候选校验（候选原样保留）');
         return;
       }
+
+      // 裸模型名 → 按真实模型 id 反查 provider。
+      // 只在「唯一命中」时补全，避免同一个模型在多家 provider 下时猜错路由。
+      if (this._bareCandidates.length) {
+        const knownModels = [...known];
+        const resolved = [];
+        for (const bare of this._bareCandidates) {
+          const hits = knownModels.filter((key) => key.slice(key.indexOf('/') + 1) === bare.spec);
+          if (hits.length === 1) {
+            resolved.push({ ...bare, key: hits[0] });
+            this.log(`模型池裸模型名「${bare.spec}」已按目录补成 ${hits[0]}`);
+          } else if (hits.length > 1) {
+            this.log(`⚠️ 模型池裸模型名「${bare.spec}」匹配到多个 provider，先跳过：${hits.join('、')}`);
+          } else {
+            this.log(`⚠️ 模型池裸模型名「${bare.spec}」在模型目录里找不到，已跳过`);
+          }
+        }
+        this._bareCandidates = [];
+        if (resolved.length) {
+          const currentFree = (this._chain?.free ?? []).map(candidateKey);
+          const currentPaid = (this._chain?.paid ?? []).map(candidateKey);
+          const free = [...new Set([...currentFree, ...resolved.filter((x) => x.tier === 'free').map((x) => x.key)])];
+          const paid = [...new Set([...currentPaid, ...resolved.filter((x) => x.tier === 'paid').map((x) => x.key)])];
+          this.configureModelChain({
+            free,
+            paid,
+            allowPaid: this._chain?.allowPaid ?? this._chainConfig.allowPaid,
+            cooldownMs: this._chainConfig.cooldownMs,
+            exhaustedNotice: this._chainNotice
+          });
+          this._chainValidated = true;
+        }
+      }
+
+      if (!this._chain) return;
       const dropped = this._chain.restrictTo(known);
       if (dropped.length) {
         this.log(`⚠️ 目录里没有这些候选，已从链里剔除：${dropped.join('、')}`);

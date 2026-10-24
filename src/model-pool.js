@@ -64,10 +64,40 @@ export const DEFAULT_POOL = {
  */
 const KNOWN_KEYS = new Set(['enabled', 'allowPaid', 'exhaustedNotice', 'free', 'paid', 'cooldownMs']);
 
-/** 一个候选是否合法：字符串 `provider/model[#variant]`，或等价的显式对象。 */
+/**
+ * 一个候选是否合法：字符串 `provider/model[#variant]`，或等价的显式对象。
+ *
+ * 0.5.5 实机事故：`free: ["qwen3.5-4b-..."]` 这种**裸模型名**被当成合法候选，
+ * 一路传到 `new ModelChain()` 才在 `parseCandidate()` 里抛错，桥接直接 exit 1。
+ * 这里必须提前拦住 —— 配置写错只应该少一个候选，不应该让整个桥接起不来。
+ */
+function candidateError(value) {
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return '空字符串';
+    const slash = text.indexOf('/');
+    if (slash <= 0) return `「${text}」缺少 provider/ 前缀`;
+    if (slash === text.length - 1) return `「${text}」缺少模型名`;
+    return null;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '不是字符串或对象';
+  if (!String(value.provider ?? '').trim()) return '对象缺少 provider';
+  if (!String(value.model ?? '').trim()) return '对象缺少 model';
+  return null;
+}
+
 function isCandidate(value) {
-  if (typeof value === 'string') return value.trim().length > 0;
-  return Boolean(value && typeof value === 'object' && value.provider && value.model);
+  return candidateError(value) === null;
+}
+
+/** 日志里展示一项坏配置，别把整份文件打出来。 */
+function candidatePreview(value) {
+  if (typeof value === 'string') return `「${value.trim().slice(0, 80)}」`;
+  try {
+    return `「${JSON.stringify(value).slice(0, 80)}」`;
+  } catch {
+    return '「<无法序列化>」';
+  }
 }
 
 /**
@@ -86,7 +116,10 @@ export function normalizePool(raw) {
     if (!KNOWN_KEYS.has(key)) warnings.push(`未知键「${key}」已忽略（是不是拼错了？）`);
   }
 
-  const list = (value, label, fallback) => {
+  // 裸模型名（`qwen3.5-...`）单独留下来：不能进 ModelChain，但可以等模型目录
+  // 就绪后按真实模型 id 反查 provider。以前直接丢掉，用户就只剩一句「模型链是空的」。
+  const unresolved = { free: [], paid: [] };
+  const list = (value, label, fallback, key) => {
     if (value === undefined) return [...fallback];
     if (!Array.isArray(value)) {
       warnings.push(`${label} 必须是数组，已回退默认值`);
@@ -94,7 +127,17 @@ export function normalizePool(raw) {
     }
     const kept = value.filter(isCandidate);
     if (kept.length !== value.length) {
-      warnings.push(`${label} 里有 ${value.length - kept.length} 项不是合法的模型写法，已丢弃`);
+      const bad = value.filter((item) => !isCandidate(item));
+      for (const item of bad) {
+        if (typeof item === 'string' && item.trim() && !item.trim().includes('/')) {
+          unresolved[key].push(item.trim());
+        }
+      }
+      const reasons = bad.slice(0, 3).map((item) => `${candidatePreview(item)} ${candidateError(item)}`).join('；');
+      warnings.push(
+        `${label} 里有 ${bad.length} 项不是合法的模型写法，已跳过（${reasons}${bad.length > 3 ? '…' : ''}）。` +
+          '裸模型名会等模型目录就绪后再按真实模型匹配；正确写法仍是 provider/model，例如 lmstudio/qwen2.5-7b-instruct'
+      );
     }
     return kept;
   };
@@ -120,10 +163,11 @@ export function normalizePool(raw) {
     enabled: source.enabled !== false,
     allowPaid: source.allowPaid === true,
     exhaustedNotice: notice,
-    free: list(source.free, 'free', DEFAULT_POOL.free),
-    paid: list(source.paid, 'paid', DEFAULT_POOL.paid),
+    free: list(source.free, 'free', DEFAULT_POOL.free, 'free'),
+    paid: list(source.paid, 'paid', DEFAULT_POOL.paid, 'paid'),
     cooldownMs
   };
+  if (unresolved.free.length || unresolved.paid.length) pool.unresolved = unresolved;
 
   if (pool.enabled && pool.free.length === 0 && pool.paid.length === 0) {
     warnings.push('免费档和付费档都是空的 —— 模型链等于没有，会直接回提示语');

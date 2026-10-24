@@ -501,6 +501,8 @@ function applyPlatform(value, opts = {}) {
   // 模型配置按平台分开存，切完要重新填一遍表单
   if (modelProfilesLoaded && prev !== next) {
     fillAllSlots();
+    for (const def of SLOT_DEFS) refreshModelSuggestions(def.key);
+    renderModelHero();
     for (const k of [...autoSavedSig.keys()]) if (k.startsWith('slot-') || k.startsWith('chat-')) autoSavedSig.delete(k);
   }
 
@@ -1792,6 +1794,57 @@ function providerById(id) {
   return (S?.providers ?? []).find((p) => p.id === id) ?? null;
 }
 
+/** 本机探测到的某个本地服务（可能没在跑）。 */
+function localServerFor(id) {
+  return (S?.localModelServers ?? []).find((x) => x.id === id) ?? null;
+}
+
+/** 本机服务里能拿去聊天的模型：过滤掉 embedding。 */
+function localChatModels(id) {
+  const models = localServerFor(id)?.models ?? [];
+  const chat = models.filter((m) => !/embed|bge|gte|(^|[-_/])e5([-_/]|$)/i.test(String(m)));
+  return chat.length ? chat : models;
+}
+
+/** 切厂商时优先用真实探测到的模型，而不是厂商表里的示例占位。 */
+function preferredModelFor(id) {
+  const local = localChatModels(id);
+  if (local.length) return local[0];
+  const preset = providerById(id);
+  return preset?.models?.[0] ?? '';
+}
+
+/** 模型输入框的候选：本机真实模型 + 厂商示例 + 当前已保存的值。 */
+function refreshModelSuggestions(s) {
+  const list = document.getElementById(`${s}-model-suggest`);
+  if (!list) return;
+  list.innerHTML = '';
+  const seen = new Set();
+  const add = (value) => {
+    const v = String(value ?? '').trim();
+    if (!v || seen.has(v)) return;
+    seen.add(v);
+    const opt = document.createElement('option');
+    opt.value = v;
+    list.appendChild(opt);
+  };
+  for (const server of S?.localModelServers ?? []) {
+    // 聊天输入框只推荐能聊的模型；embedding 模型留在服务按钮的 title 里。
+    for (const model of localChatModels(server.id)) add(model);
+  }
+  const provider = providerById(document.getElementById(`${s}-provider`)?.value);
+  for (const model of provider?.models ?? []) add(model);
+  add(document.getElementById(`${s}-model`)?.value);
+
+  const hint = document.getElementById(`${s}-model-source-hint`);
+  if (hint) {
+    const running = (S?.localModelServers ?? []).filter((x) => x.running && x.models?.length);
+    hint.textContent = running.length
+      ? `本机已探测到：${running.map((x) => `${x.label} ${x.models.length} 个`).join(' · ')}。输入框里可以直接选。`
+      : '没探测到正在运行的本机模型服务；也可以手填模型名。';
+  }
+}
+
 function secretSet(env) {
   if (!env) return false;
   return (S?.secrets ?? []).some((s) => s.env === env && s.set);
@@ -1826,17 +1879,43 @@ function renderProviders(s) {
     list.map((p) => `<option value="${esc(p.id)}">${esc(p.label)}${p.needsKey ? '' : '（无需 key）'}</option>`).join('');
 }
 
-function applyProvider(s, id) {
+/**
+ * 厂商切换。
+ *
+ * force=true 是「用户真的换了一家」：地址、协议、模型都必须跟着换，
+ * 不能因为输入框里还留着上一家的值就什么都不做（0.5.5 的回归）。
+ * force=false 是「把已保存的配置填回表单」：用户手填的地址/模型要保留。
+ */
+function applyProvider(s, id, { force = false } = {}) {
   const p = providerById(id);
-  $(`#${s}-provider-note`).textContent = p?.note ?? (p ? '' : '自己填地址：要填到 /v1 为止，例如 https://your-relay.com/v1');
+  const note = document.getElementById(`${s}-provider-note`);
+  if (note) note.textContent = p?.note ?? (p ? '' : '自己填地址：要填到 /v1 为止，例如 https://your-relay.com/v1');
+  const protocol = document.getElementById(`${s}-protocol`);
+  const baseUrl = document.getElementById(`${s}-baseUrl`);
+  const model = document.getElementById(`${s}-model`);
   if (!p) {
     updateKeyHint(s);
     return;
   }
-  if (p.protocol) $(`#${s}-protocol`).value = p.protocol;
-  if (p.baseUrl && !$(`#${s}-baseUrl`).value.trim()) $(`#${s}-baseUrl`).value = p.baseUrl;
-  if (p.models?.length && !$(`#${s}-model`).value.trim()) $(`#${s}-model`).value = p.models[0];
+
+  if (force) {
+    if (id === 'custom') {
+      // 切到自定义时清掉上一家的地址和模型，避免把 A 家的模型发到 B 家。
+      if (protocol) protocol.value = 'openai';
+      if (baseUrl) baseUrl.value = '';
+      if (model) model.value = '';
+    } else {
+      if (protocol && p.protocol) protocol.value = p.protocol;
+      if (baseUrl) baseUrl.value = p.baseUrl ?? '';
+      if (model) model.value = preferredModelFor(id);
+    }
+  } else {
+    if (protocol && p.protocol && !protocol.value) protocol.value = p.protocol;
+    if (baseUrl && p.baseUrl && !baseUrl.value.trim()) baseUrl.value = p.baseUrl;
+    if (model && !model.value.trim()) model.value = preferredModelFor(id);
+  }
   updateKeyHint(s);
+  refreshModelSuggestions(s);
 }
 
 function updateKeyHint(s) {
@@ -1861,28 +1940,42 @@ function renderLocalServers(s) {
     return;
   }
   box.innerHTML = list
-    .map(
-      (x) => `<button class="btn btn-sm ${x.running ? '' : 'btn-ghost'}" data-local="${esc(x.id)}" ${x.running ? '' : 'disabled'}>
-        <span class="led ${x.running ? 'on' : ''}" style="margin-right:2px"></span>${esc(x.label)}${x.running ? ` · ${x.models.length} 个模型` : x.installed ? ' · 没在跑' : ' · 没装'}
-      </button>`
-    )
+    .map((x) => {
+      const models = x.models ?? [];
+      const chatModels = localChatModels(x.id);
+      const first = chatModels[0] ?? '';
+      const title = models.length ? models.slice(0, 12).join('\n') + (models.length > 12 ? `\n…共 ${models.length} 个` : '') : '';
+      return `<button class="btn btn-sm ${x.running ? '' : 'btn-ghost'}" data-local="${esc(x.id)}" ${x.running ? '' : 'disabled'} title="${esc(title)}">
+        <span class="led ${x.running ? 'on' : ''}" style="margin-right:2px"></span>${esc(x.label)}${
+          x.running
+            ? ` · ${chatModels.length ? `${chatModels.length} 个模型${first ? `（${esc(first)}）` : ''}` : '已连上'}`
+            : x.installed ? ' · 没在跑' : ' · 没装'
+        }
+      </button>`;
+    })
     .join('');
   $$(`#${s}-local-servers [data-local]`).forEach((b) => {
     b.addEventListener('click', () => {
       const x = list.find((y) => y.id === b.dataset.local);
       if (!x) return;
-      $(`#${s}-protocol`).value = 'openai';
-      $(`#${s}-baseUrl`).value = x.baseUrl;
       // 以前这里把 provider 清成空串。空 provider 在配置生成器那边等于"没配"，
       // 整档被静默丢掉 —— 界面显示填好了，opencode.json 里一个字都没有。
-      // 本地探测项的 id 和厂商表是同一套（ollama / lmstudio / vllm / jan），直接选上。
+      // 本地探测项的 id 和厂商表是同一套（ollama / lmstudio / vllm / llamacpp / jan），直接选上。
       const sel = $(`#${s}-provider`);
       const has = Array.from(sel.options).some((o) => o.value === x.id);
       sel.value = has ? x.id : 'custom';
-      if (x.models[0]) $(`#${s}-model`).value = x.models[0];
+      applyProvider(s, sel.value, { force: true });
+      $(`#${s}-baseUrl`).value = x.baseUrl;
+      const picked = localChatModels(x.id)[0] ?? x.models?.[0] ?? '';
+      if (picked) $(`#${s}-model`).value = picked;
       if (!$(`#${s}-apiKey`).value) $(`#${s}-apiKey`).value = 'local';
-      toast(`已填入 ${x.label} 的地址`);
-      updateKeyHint(s);
+      refreshModelSuggestions(s);
+      toast(picked ? `已填入 ${x.label} · ${picked}` : `已填入 ${x.label} 的地址，模型还没选`);
+      // 程序化改值不会触发 change，手动发一次，让自动保存/重启链路跑起来。
+      // 只发地址/模型：再发 provider 会走一遍 force 覆盖，反而把刚填的值洗掉。
+      for (const name of ['baseUrl', 'model']) {
+        document.getElementById(`${s}-${name}`)?.dispatchEvent(new Event('change', { bubbles: true }));
+      }
     });
   });
 }
@@ -1962,6 +2055,7 @@ function fillSource(s, ma) {
   if (el('model-tools-warn')) el('model-tools-warn').hidden = m.allowTools !== true;
   applyProvider(s, el('provider').value);
   updateKeyHint(s);
+  refreshModelSuggestions(s);
 }
 
 /* ── 模型配置（单一一份）──────────────────────────────────────────────
@@ -2042,6 +2136,11 @@ function buildSlotPanels() {
       const f = el.getAttribute('for');
       if (f) el.setAttribute('for', `${def.key}-${f}`);
     });
+    // datalist 的 list= 属性也要跟着加前缀，否则会指向模板里不存在的全局 id。
+    panel.querySelectorAll('[list]').forEach((el) => {
+      const l = el.getAttribute('list');
+      if (l) el.setAttribute('list', `${def.key}-${l}`);
+    });
 
     // 普通聊天不给工具：整块拿掉，不留一个配了也不生效的开关
     if (!def.tools) panel.querySelector(`#${def.key}-tools-block`)?.remove();
@@ -2049,7 +2148,10 @@ function buildSlotPanels() {
     panel.querySelector(`#${def.key}-chat-slot-note`)?.remove();
 
     const save = panel.querySelector(`#${def.key}-btn-save-model`);
-    if (save) save.hidden = true; // 自动保存，不再单独点保存
+    if (save) {
+      save.hidden = false;
+      save.textContent = '保存并应用';
+    }
 
     // 默认选中第一块，让人一眼看出这是两块独立配置
     if (def.key === SLOT_DEFS[0].key) panel.classList.add('is-active');
@@ -2096,7 +2198,11 @@ function bindSlotEvents() {
     const el = (n) => document.getElementById(`${s}-${n}`);
     const res = `#${s}-test-result`;
 
-    el('provider')?.addEventListener('change', (e) => applyProvider(s, e.target.value));
+    el('provider')?.addEventListener('change', (e) => {
+      applyProvider(s, e.target.value, { force: true });
+      refreshModelSuggestions(s);
+      renderModelHero();
+    });
 
     el('modelAllowTools')?.addEventListener('change', (e) => {
       const w = el('model-tools-warn');
@@ -2127,6 +2233,8 @@ function bindSlotEvents() {
         });
         if (pick) {
           el('model').value = pick;
+          refreshModelSuggestions(s);
+          renderModelHero();
           toast(`已选 ${pick}`);
         }
         setResult(res, `拉到 ${models.length} 个模型`, 'ok');
@@ -2148,11 +2256,11 @@ function bindSlotEvents() {
     // 自动保存：厂商/地址/模型/密钥改了就存，存完立刻生效（跑着的服务自动重启）。
     // 旧的「保存」按钮已隐藏 —— 不再需要单独点保存。
     const slotSig = () => sig(collectSource(s)) + '|' + el('apiKey').value;
-    async function saveSlotAuto() {
+    async function saveSlotAuto({ force = false } = {}) {
       const data = collectSource(s);
       const key = el('apiKey').value.trim();
       const mark = slotSig();
-      if (autoSavedSig.get(`slot-${platform()}-${s}`) === mark) return;
+      if (!force && autoSavedSig.get(`slot-${platform()}-${s}`) === mark) return;
       const pf = platform();
       if (!data.baseUrl && !data.model) {
         const previousChat = modelProfiles[pf]?.chat;
@@ -2170,6 +2278,7 @@ function bindSlotEvents() {
         setResult(res, cleared.botsRestarted ? '已清除 ✓ 服务已重启生效' : '已清除 ✓ 下次服务启动生效', 'saved');
         await refreshState();
         await loadModelProfiles();
+        renderModelHero();
         return;
       }
       const p = providerById(el('provider').value);
@@ -2219,16 +2328,27 @@ function bindSlotEvents() {
       el('apiKey').value = '';
       if (r.regenerated === false) return setResult(res, `已自动保存，但生成配置失败：${r.regenError ?? '看日志'}`, 'err');
       autoSavedSig.set(`slot-${platform()}-${s}`, mark);
-      setResult(res, r.botsRestarted ? '已自动保存 ✓ 服务已重启生效' : '已自动保存 ✓ 下次服务启动生效', 'saved');
+      setResult(res, r.botsRestarted ? '已保存 ✓ 服务已重启生效' : '已保存 ✓ 下次服务启动生效', 'saved');
       await refreshState();
       await loadModelProfiles();
+      renderModelHero();
     }
+    el('btn-save-model')?.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button');
+      await busy(btn, '保存中…', async () => {
+        await saveSlotAuto({ force: true });
+      });
+    });
+
+    // 只在 change（失焦/选完）时保存。以前绑 input，用户每敲一个字符就
+    // 触发一次自动保存 + 重启服务，模型名还没输完桥接已经被重启好几轮。
     for (const f of ['provider', 'baseUrl', 'model', 'apiKey']) {
       const node = el(f);
       if (!node) continue;
-      const kick = () => scheduleAutoSave(`slot-${s}`, () => saveSlotAuto());
-      node.addEventListener('change', kick);
-      node.addEventListener('input', kick);
+      node.addEventListener('change', () => scheduleAutoSave(`slot-${s}`, () => saveSlotAuto()));
+      // 摘要跟着输入实时更新，不用等 900ms 的自动保存。
+      node.addEventListener('input', renderModelHero);
+      node.addEventListener('change', renderModelHero);
     }
   }
 
@@ -2243,15 +2363,55 @@ function bindSlotEvents() {
 }
 
 /* 模型池 */
+function refreshPoolSuggestions() {
+  const list = document.getElementById('pool-model-suggest');
+  if (!list) return;
+  list.innerHTML = '';
+  const seen = new Set();
+  const add = (value) => {
+    const v = String(value ?? '').trim();
+    if (!v || !v.includes('/') || seen.has(v)) return;
+    seen.add(v);
+    const opt = document.createElement('option');
+    opt.value = v;
+    list.appendChild(opt);
+  };
+  for (const server of S?.localModelServers ?? []) {
+    for (const model of localChatModels(server.id)) add(`${server.id}/${model}`);
+  }
+  for (const provider of S?.providers ?? []) {
+    for (const model of provider.models ?? []) add(`${provider.id}/${model}`);
+  }
+  for (const slots of Object.values(modelProfiles ?? {})) {
+    for (const slot of ['chat', 'work']) {
+      const p = slots?.[slot];
+      if (p?.provider && p?.model) add(`${p.provider}/${p.model}`);
+    }
+  }
+  for (const id of [...(poolDraft?.free ?? []), ...(poolDraft?.paid ?? [])]) add(id);
+}
+
+/** 模型池条目必须是 `provider/model`，不能是裸模型名、`/model` 或 `provider/`。 */
+function poolEntryBad(id) {
+  const text = String(id ?? '').trim();
+  const slash = text.indexOf('/');
+  return slash <= 0 || slash === text.length - 1;
+}
+
 function renderPool() {
   if (!poolDraft) return;
-  const row = (id, list) => `
-    <div class="pool-item" data-id="${esc(id)}" data-list="${list}">
+  refreshPoolSuggestions();
+  const row = (id, list) => {
+    const bad = poolEntryBad(id);
+    return `
+    <div class="pool-item ${bad ? 'is-invalid' : ''}" data-id="${esc(id)}" data-list="${list}" title="${bad ? '写法不对：要写成 厂商/模型' : ''}">
       <span class="pool-name">${esc(id)}</span>
+      ${bad ? '<span class="pool-tag">写法不对</span>' : ''}
       <button class="btn btn-sm btn-ghost" data-move="up" title="上移">↑</button>
       <button class="btn btn-sm btn-ghost" data-move="down" title="下移">↓</button>
       <button class="btn btn-sm btn-ghost" data-remove="1" title="移出">✕</button>
     </div>`;
+  };
 
   const draw = (listName) => {
     const box = $(`#pool-${listName}`);
@@ -2260,6 +2420,21 @@ function renderPool() {
   };
   draw('free');
   draw('paid');
+
+  const invalid = [
+    ...(poolDraft.invalid?.free ?? []),
+    ...(poolDraft.invalid?.paid ?? []),
+    ...(poolDraft.free ?? []).filter(poolEntryBad),
+    ...(poolDraft.paid ?? []).filter(poolEntryBad)
+  ];
+  const warning = document.getElementById('pool-warning');
+  if (warning) {
+    const unique = [...new Set(invalid)];
+    warning.hidden = unique.length === 0;
+    warning.textContent = unique.length
+      ? `有 ${unique.length} 条写法不对：${unique.slice(0, 3).join('、')}${unique.length > 3 ? '…' : ''}。模型池只认「厂商/模型」，保存时会自动丢弃这些条目。`
+      : '';
+  }
 
   // 后端给的是 [{id, until, kind, detail}]，老版本可能直接给字符串
   const spent = (poolDraft.spent ?? []).map((s) => (typeof s === 'string' ? { id: s } : s));
@@ -2331,7 +2506,13 @@ async function savePoolAuto() {
   });
   if (r.ok === false) return setResult('#pool-result', r.error ?? '保存失败', 'err');
   autoSavedSig.set('pool', mark);
-  setResult('#pool-result', r.bridgeRestarted ? '已自动保存 ✓ 桥接已重启生效' : '已自动保存 ✓ 下次桥接启动生效', 'saved');
+  if (r.warnings?.length) {
+    setResult('#pool-result', r.warnings.join('；'), 'err');
+    await loadModels();
+    return;
+  }
+  setResult('#pool-result', r.bridgeRestarted ? '已保存 ✓ 桥接已重启生效' : '已保存 ✓ 下次桥接启动生效', 'saved');
+  renderModelHero();
 }
 
 $$('[data-add]').forEach((b) => {
@@ -2340,11 +2521,35 @@ $$('[data-add]').forEach((b) => {
     const input = $(`#pool-add-${listName}`);
     const id = input.value.trim();
     if (!id) return;
+    // 裸模型名会让 ModelChain 解析失败（0.5.5 桥接崩溃的直接原因）。
+    // 在入口就拦住，并给出正确写法，不要等保存后再丢。
+    if (poolEntryBad(id)) {
+      setResult('#pool-result', `「${id}」写法不对：要写成 厂商/模型，例如 lmstudio/qwen2.5-7b-instruct`, 'err');
+      input.focus();
+      return;
+    }
     if (!poolDraft[listName].includes(id)) poolDraft[listName].push(id);
     input.value = '';
     renderPool();
     scheduleAutoSave('pool', savePoolAuto);
   });
+});
+
+document.getElementById('btn-pool-current')?.addEventListener('click', () => {
+  const pf = platform();
+  const chat = modelProfiles?.[pf]?.chat;
+  const provider = document.getElementById('chat-provider')?.value || chat?.provider || '';
+  const model = document.getElementById('chat-model')?.value.trim() || String(chat?.model ?? '').trim();
+  if (!provider || !model) {
+    setResult('#pool-result', '当前还没有选厂商和模型，先把上面的连接填好', 'err');
+    return;
+  }
+  const id = `${provider}/${model}`;
+  if (!poolDraft) poolDraft = { free: [], paid: [], invalid: {} };
+  poolDraft.free = [id, ...(poolDraft.free ?? []).filter((x) => x !== id)];
+  renderPool();
+  scheduleAutoSave('pool', savePoolAuto);
+  setResult('#pool-result', `已把 ${id} 放到免费档首位`, 'saved');
 });
 
 $('#btn-save-pool').addEventListener('click', async (e) => {
@@ -2358,8 +2563,14 @@ $('#btn-save-pool').addEventListener('click', async (e) => {
       paid: poolDraft.paid
     });
     if (r.ok === false) return setResult('#pool-result', r.error ?? '保存失败', 'err');
+    if (r.warnings?.length) {
+      setResult('#pool-result', r.warnings.join('；'), 'err');
+      await loadModels();
+      return;
+    }
     const extra = r.bridgeRestarted ? '，桥接已重启' : '，下次桥接启动生效';
     setResult('#pool-result', `已保存${extra}`, 'saved');
+    renderModelHero();
   });
 });
 
@@ -2458,6 +2669,53 @@ async function loadModels() {
   }
 
   await loadPrice();
+  renderModelHero();
+}
+
+/** 模型页顶部的一行“现在到底在用谁”，省得用户在长表单里自己拼。 */
+function renderModelHero() {
+  const box = document.getElementById('model-hero');
+  if (!box) return;
+  const pf = platform();
+  const wx = pf === 'wechat';
+  const chat = modelProfiles?.[pf]?.chat ?? null;
+  const formProvider = document.getElementById('chat-provider')?.value || chat?.provider || '';
+  const formModel = document.getElementById('chat-model')?.value.trim() || String(chat?.model ?? '').trim();
+  const formBaseUrl = document.getElementById('chat-baseUrl')?.value.trim() || '';
+  const preset = providerById(formProvider);
+  const providerLabel = formProvider ? (preset?.label ?? formProvider) : '未选择厂商';
+  const model = formModel;
+  const baseUrl = formBaseUrl || preset?.baseUrl || '';
+  const keyEnv = formProvider ? (usesCustomModelEndpoint({ provider: formProvider, baseUrl }, preset) ? modelProfileKeyEnv(pf, 'chat') : preset?.keyEnv) : null;
+  const keyState = !keyEnv ? '无需 key' : secretSet(keyEnv) ? 'key 已保存' : 'key 未保存';
+
+  const title = document.getElementById('mh-title');
+  const sub = document.getElementById('mh-sub');
+  const platformEl = document.getElementById('mh-platform');
+  if (platformEl) platformEl.textContent = wx ? '微信' : 'QQ';
+  if (title) title.textContent = model ? `${providerLabel} · ${model}` : '还没有选模型';
+  if (sub) {
+    sub.textContent = model
+      ? `${baseUrl || '地址未填'} · ${keyState}`
+      : '在下面选厂商，或点本机服务按钮；模型和地址会自动填好。';
+  }
+
+  const pool = document.getElementById('mh-pool');
+  if (pool) {
+    const free = poolDraft?.free?.length ?? 0;
+    const paid = poolDraft?.paid?.length ?? 0;
+    const invalid = (poolDraft?.invalid?.free?.length ?? 0) + (poolDraft?.invalid?.paid?.length ?? 0);
+    pool.textContent = poolDraft?.enabled === false ? '模型池已关闭' : `模型池 ${free} 免费 / ${paid} 付费${invalid ? ` · ${invalid} 条待修` : ''}`;
+    pool.className = `badge ${poolDraft?.enabled === false ? 'warn' : invalid ? 'err' : free + paid ? 'ok' : 'warn'}`;
+  }
+
+  const bridge = document.getElementById('mh-bridge');
+  if (bridge) {
+    const running = wx ? Boolean(S?.wechat?.running || S?.wechat?.externalPid) : Boolean(S?.bridge?.running || S?.bridge?.externalPid);
+    const exit = wx ? S?.wechat?.exitCode : S?.bridge?.exitCode;
+    bridge.textContent = running ? '服务运行中' : exit != null ? `服务已退出（${exit}）` : '服务未启动';
+    bridge.className = `badge ${running ? 'ok' : exit != null ? 'err' : 'warn'}`;
+  }
 }
 
 /* ── 价目表 ─────────────────────────────────────────── */

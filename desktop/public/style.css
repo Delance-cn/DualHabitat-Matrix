@@ -678,6 +678,60 @@ table.table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .pool-item.is-spent { border-color: var(--err-soft); }
 .pool-item .btn { font-family: "Segoe UI", system-ui, sans-serif; }
 
+.pool-item.is-invalid {
+  border-color: var(--err);
+  background: color-mix(in srgb, var(--err) 7%, var(--panel-2));
+}
+.pool-item.is-invalid .pool-name { color: var(--err); }
+
+/* ── 模型页顶部摘要 ───────────────────────────────────── */
+.model-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  flex-wrap: wrap;
+  border-color: var(--accent-soft);
+  background: linear-gradient(135deg, var(--panel), var(--panel-2));
+}
+.model-hero-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.model-hero-kicker { font-size: 11.5px; color: var(--text-3); letter-spacing: .02em; }
+.model-hero-kicker b { color: var(--accent); }
+.model-hero-title {
+  font-size: 18px;
+  line-height: 1.35;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: min(760px, 72vw);
+}
+.model-hero-sub { font-size: 12.5px; color: var(--text-3); font-family: var(--mono); word-break: break-all; }
+.model-hero-side { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }
+
+/* details 当面板用：标题就是可点的 summary */
+details.panel > summary.panel-head {
+  cursor: pointer;
+  list-style: none;
+  margin-bottom: 0;
+}
+details.panel > summary.panel-head::-webkit-details-marker { display: none; }
+details.panel > summary.panel-head h2::before {
+  content: "▸";
+  display: inline-block;
+  width: 14px;
+  color: var(--text-3);
+  transition: transform .16s ease;
+}
+details.panel[open] > summary.panel-head h2::before { transform: rotate(90deg); }
+details.panel[open] > summary.panel-head { margin-bottom: 14px; }
+details.panel.model-advanced[open] > summary.panel-head { margin-bottom: 14px; }
+
+@media (max-width: 720px) {
+  .model-hero-title { white-space: normal; max-width: 100%; }
+  .model-hero-side { width: 100%; }
+}
+
 .empty {
   padding: 22px 10px;
   text-align: center;

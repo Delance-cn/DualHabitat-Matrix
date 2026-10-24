@@ -781,6 +781,10 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
         continue;
       }
       const { relayId, model } = plan;
+      if (!model) {
+        notes.push(`「${label}」是自定义服务商，但还没选模型；先选一个模型再保存`);
+        continue;
+      }
       const before = provider[relayId] ?? {};
       const keyEnv = String(s.apiKeyEnv ?? '').trim() || modelProfileKeyEnv(platform, slot);
       provider[relayId] = {
@@ -808,6 +812,13 @@ export function buildConfig({ base = {}, pool, persona, workPersona, chatOnly = 
       continue;
     }
     const { providerId, local, compatible, builtin } = plan;
+    // 模型名是空的就别写 agent.model。以前这里会拼出 `lmstudio/` 这种
+    // 无效目标，opencode 启动校验直接把它当坏配置 —— 界面只选了厂商、
+    // 还没选模型时不该把整份配置带坏。
+    if (!plan.model) {
+      notes.push(`「${label}」选了服务商 ${s.provider}，但还没选模型；先选一个模型再保存`);
+      continue;
+    }
     // 内置 / 本地 / 兼容厂商保留 #variant（opencode 的变体语法），但 #none
     // 表示不选变体，不能原样写进 agent.model。provider 的 models 清单仍用
     // 去掉变体的模型名；自定义中转站没有变体定义，走上面的 relay 分支。

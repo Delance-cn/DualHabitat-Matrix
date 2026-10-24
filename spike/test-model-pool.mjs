@@ -95,6 +95,15 @@ console.log('\n=== 3. 配置写错要告警且能跑 ===');
     );
   }
   {
+    // 0.5.5 实机回归：裸模型名以前被当成合法候选，最后在 ModelChain 里抛错，
+    // 桥接直接 exit 1。这里必须提前丢掉，并且告警里要给出正确写法。
+    const { pool, warnings } = normalizePool({
+      free: ['qwen3.5-4b-uncensored-hauhaucs-aggressive', 'lmstudio/real-model', { provider: 'x' }, 'x/']
+    });
+    ok('裸模型名/缺模型名的对象被丢弃', JSON.stringify(pool.free) === JSON.stringify(['lmstudio/real-model']), JSON.stringify(pool.free));
+    ok('告警里说明了正确写法', warnings.some((w) => w.includes('provider/model')), JSON.stringify(warnings));
+  }
+  {
     const { pool, warnings } = normalizePool({ cooldownMs: { rate: 'abc', quota: 1000 } });
     ok('冷却非数字被忽略并告警', warnings.some((w) => w.includes('cooldownMs.rate')), JSON.stringify(warnings));
     ok('合法的那个留下', pool.cooldownMs.quota === 1000 && pool.cooldownMs.rate === undefined);

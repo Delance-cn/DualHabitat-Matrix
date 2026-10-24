@@ -2588,6 +2588,14 @@ async function bringUp(scope = 'all') {
     }
   }
 
+  // 拉起任何一条线之前，先把 0.5.5 留下的「本地厂商没模型 / 模型池裸模型名」修好。
+  // 这一步是幂等的；本机没有模型服务时什么也不写。
+  try {
+    await repairModelConfiguration();
+  } catch (error) {
+    pushLog(`模型配置自动修复失败（继续启动）：${error?.message ?? error}`, 'err', 'models');
+  }
+
   // 0.5.5 起微信有自己的 4601 实例，不再借 QQ 桥接的 4599；只开微信时不拉桥接。
   const bridgeResult = wantQq
     ? bridge.child
@@ -2885,6 +2893,11 @@ async function restartBridge() {
   const stopped = stopBridge();
   if (!stopped.ok) return stopped;
   if (stopped.done) await stopped.done;
+  try {
+    await repairModelConfiguration();
+  } catch (error) {
+    pushLog(`模型配置自动修复失败（继续重启）：${error?.message ?? error}`, 'err', 'models');
+  }
   return startBridge();
 }
 
@@ -4597,7 +4610,10 @@ function serveStatic(req, res, urlPath) {
 const LOCAL_MODEL_SERVERS = [
   { id: 'ollama', label: 'Ollama', port: 11434 },
   { id: 'lmstudio', label: 'LM Studio', port: 1234 },
-  { id: 'vllm', label: 'vLLM / llama.cpp', port: 8000 },
+  { id: 'vllm', label: 'vLLM', port: 8000 },
+  // llama-server 的默认端口是 8080，和 vLLM 的 8000 不是一回事。
+  // 0.5.5 之前只有 8000 一项，装 llama.cpp 的用户永远探测不到自己的模型。
+  { id: 'llamacpp', label: 'llama.cpp', port: 8080 },
   { id: 'jan', label: 'Jan', port: 1337 }
 ];
 
@@ -4665,6 +4681,124 @@ async function detectLocalModelServers() {
   }
   localCache = { at: Date.now(), value };
   return value;
+}
+
+/** 本机模型列表里混着的 embedding 模型不能拿去聊天。 */
+function looksLikeEmbeddingModel(id) {
+  const text = String(id ?? '').toLowerCase();
+  return text.includes('embed') || /(^|[-_/])(bge|gte|e5)([-_/]|$)/.test(text);
+}
+
+function pickChatModel(models) {
+  const list = (Array.isArray(models) ? models : []).map(String).filter(Boolean);
+  return list.find((m) => !looksLikeEmbeddingModel(m)) ?? list[0] ?? '';
+}
+
+let repairModelConfigInFlight = null;
+
+/**
+ * 0.5.6 迁移：把「选了本地厂商但没选模型」和「模型池里只有裸模型名」修好。
+ *
+ * 0.5.5 的真实事故：
+ *   - config.json 里 chat 只写了 provider=lmstudio，没有 model；
+ *   - models.json 的 free 只有 `qwen3.5-4b-...`，没有 `lmstudio/` 前缀；
+ *   - 桥接在 ModelChain 构造时抛错，exit 1，桌面端每 5 秒重启一次。
+ *
+ * 这里在拉起桥接/微信之前做一次幂等修复：只补空值、只给裸模型名加前缀，
+ * 不动用户已经写好的 provider/model，也不碰密钥。
+ */
+async function repairModelConfiguration() {
+  if (repairModelConfigInFlight) return repairModelConfigInFlight;
+  repairModelConfigInFlight = (async () => {
+    const changes = [];
+    const servers = await detectLocalModelServers();
+    const running = servers.filter((s) => s.running && s.models?.length);
+    if (!running.length) return { changed: false, changes };
+
+    const cfg = loadConfig();
+    const profiles = cfg?.backend?.profiles ?? {};
+    let configChanged = false;
+
+    for (const [platform, slots] of Object.entries(profiles)) {
+      if (!slots || typeof slots !== 'object') continue;
+      for (const slot of ['chat', 'work']) {
+        const profile = slots[slot];
+        if (!profile || typeof profile !== 'object') continue;
+        const provider = String(profile.provider ?? '').trim();
+        if (!provider) continue;
+        const server = running.find((s) => s.id === provider);
+        if (!server) continue;
+        if (String(profile.model ?? '').trim()) continue;
+        const baseUrl = String(profile.baseUrl ?? '').trim();
+        // 用户把本地厂商指到了别的端口/地址时不猜，避免把模型填到错的实例上。
+        if (baseUrl && !baseUrl.includes(`:${server.port}`)) continue;
+        const model = pickChatModel(server.models);
+        if (!model) continue;
+        profile.model = model;
+        if (!baseUrl) profile.baseUrl = server.baseUrl;
+        configChanged = true;
+        changes.push(`${platform}.${slot} 补上模型 ${provider}/${model}`);
+      }
+    }
+
+    if (configChanged) {
+      writeJson(configFile(), cfg);
+      pushLog(`已自动补全本地模型：${changes.join('；')}`, 'sys', 'models');
+    }
+
+    // 模型池里的裸模型名：优先按 profile 里的同款模型补 provider，
+    // 其次按本机实际模型列表反查。补不了的留给桥接跳过并告警，不再崩。
+    const pool = loadPool();
+    const providerByModel = new Map();
+    for (const server of running) {
+      for (const model of server.models) {
+        if (!providerByModel.has(model)) providerByModel.set(model, server.id);
+      }
+    }
+    let poolChanged = false;
+    const fixList = (list) =>
+      (Array.isArray(list) ? list : []).map((entry) => {
+        if (typeof entry !== 'string') return entry;
+        const id = entry.trim();
+        if (!id || id.includes('/')) return entry;
+        let provider = '';
+        for (const slots of Object.values(profiles)) {
+          for (const slot of ['chat', 'work']) {
+            const profile = slots?.[slot];
+            if (profile && String(profile.provider ?? '').trim() && String(profile.model ?? '').trim() === id) {
+              provider = String(profile.provider).trim();
+              break;
+            }
+          }
+          if (provider) break;
+        }
+        provider = provider || providerByModel.get(id) || '';
+        if (!provider) return entry;
+        poolChanged = true;
+        changes.push(`模型池 ${id} → ${provider}/${id}`);
+        return `${provider}/${id}`;
+      });
+
+    pool.free = fixList(pool.free);
+    pool.paid = fixList(pool.paid);
+    if (poolChanged) {
+      writeJson(modelsFile(), pool);
+      pushLog(`已自动补全模型池：${changes.filter((x) => x.startsWith('模型池')).join('；')}`, 'sys', 'models');
+    }
+
+    if (configChanged || poolChanged) {
+      const regen = await regenerateConfig();
+      if (!regen.ok) {
+        pushLog(`⚠️ 自动补全后重新生成 opencode.json 失败：${regen.lines.slice(-3).join(' / ') || '看日志'}`, 'err', 'models');
+      }
+    }
+    return { changed: configChanged || poolChanged, changes };
+  })();
+  try {
+    return await repairModelConfigInFlight;
+  } finally {
+    repairModelConfigInFlight = null;
+  }
 }
 
 /** 这个 driver 现在能不能直接 spawn（PATH 或 driver 自带的常见路径）。 */
@@ -4901,12 +5035,24 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/model-pool' || p === '/api/model-pool/restore') {
       if (p === '/api/model-pool' && req.method === 'GET') {
         const pool = loadPool();
+        // 只读接口不偷偷改文件：把坏条目原样带出去，前端标红提示；
+        // 真正保存时再清理（见下面 POST）。
+        const invalid = (list) =>
+          (Array.isArray(list) ? list : [])
+            .map(String)
+            .map((x) => x.trim())
+            .filter((x) => {
+              if (!x) return false;
+              const slash = x.indexOf('/');
+              return slash <= 0 || slash === x.length - 1;
+            });
         return sendJson(res, {
           enabled: pool.enabled !== false,
           allowPaid: pool.allowPaid === true,
           exhaustedNotice: pool.exhaustedNotice ?? '',
           free: (pool.free ?? []).map(String),
           paid: (pool.paid ?? []).map(String),
+          invalid: { free: invalid(pool.free), paid: invalid(pool.paid) },
           spent: spentInPool(pool),
           usage: await readModelUsage(),
           path: modelsFile(),
@@ -4963,13 +5109,32 @@ const server = http.createServer(async (req, res) => {
 
       const body = await readBody(req);
       const pool = loadPool();
-      const clean = (v) => [...new Set((Array.isArray(v) ? v : []).map((x) => String(x).trim()).filter(Boolean))];
+      const dropped = [];
+      const clean = (v, label) => {
+        const out = [];
+        const seen = new Set();
+        for (const raw of Array.isArray(v) ? v : []) {
+          const id = String(raw ?? '').trim();
+          if (!id) continue;
+          // 模型池只认 provider/model。裸模型名传进 ModelChain 会抛错，
+          // 0.5.5 的桥接就是被这一条带崩的 —— 保存时直接拒绝，别留到运行时。
+          const slash = id.indexOf('/');
+          if (slash <= 0 || slash === id.length - 1) {
+            dropped.push(`${label}: ${id}`);
+            continue;
+          }
+          if (seen.has(id)) continue;
+          seen.add(id);
+          out.push(id);
+        }
+        return out;
+      };
 
       pool.enabled = body.enabled !== false;
       pool.allowPaid = body.allowPaid === true;
       if (typeof body.exhaustedNotice === 'string') pool.exhaustedNotice = body.exhaustedNotice.trim();
-      pool.free = clean(body.free);
-      pool.paid = clean(body.paid);
+      pool.free = clean(body.free, '免费档');
+      pool.paid = clean(body.paid, '付费档');
 
       const wrapped = {
         _comment: pool._comment ?? '模型池：QQ 机器人按什么顺序试模型、能不能花钱、全用完了回什么话。改这个文件不用改代码。密钥在 secrets.json（那是凭据，这是策略）。',
@@ -5002,6 +5167,10 @@ const server = http.createServer(async (req, res) => {
         configRegenerated: regen.ok,
         bridgeRestarted,
         wechatRestarted,
+        dropped,
+        warnings: dropped.length
+          ? [`已丢弃 ${dropped.length} 条不合法的模型池条目（要写成 厂商/模型）：${dropped.slice(0, 3).join('、')}${dropped.length > 3 ? '…' : ''}`]
+          : [],
         lines: regen.lines.slice(-8)
       });
     }
@@ -5193,7 +5362,14 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       return sendJson(res, bringDown(body.scope));
     }
-    if (p === '/api/wechat/start') return sendJson(res, startWechat());
+    if (p === '/api/wechat/start') {
+      try {
+        await repairModelConfiguration();
+      } catch (error) {
+        pushLog(`模型配置自动修复失败（继续启动微信）：${error?.message ?? error}`, 'err', 'models');
+      }
+      return sendJson(res, startWechat());
+    }
     if (p === '/api/bots/start') {
       const body = await readBody(req);
       return sendJson(res, await startBotFlow(body?.platform === 'wechat' ? 'wechat' : 'qq'));
@@ -7071,7 +7247,14 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, importProviders(body));
     }
 
-    if (p === '/api/bridge/start') return sendJson(res, startBridge());
+    if (p === '/api/bridge/start') {
+      try {
+        await repairModelConfiguration();
+      } catch (error) {
+        pushLog(`模型配置自动修复失败（继续启动桥接）：${error?.message ?? error}`, 'err', 'models');
+      }
+      return sendJson(res, startBridge());
+    }
     if (p === '/api/bridge/stop') {
       const result = stopBridge();
       if (result.done) await result.done;

@@ -114,7 +114,11 @@ export const PROVIDERS = {
     baseUrl: 'http://127.0.0.1:1234/v1',
     keyEnv: null,
     apiKey: 'lm-studio',
-    models: ['local-model']
+    // 以前这里是占位 `local-model`，但 LM Studio 的真实模型名由 /v1/models 决定。
+    // 占位名一旦被自动写进配置，模型链就会去切一个不存在的模型。宁可留空，
+    // 让界面用探测到的真实模型列表补全。
+    models: [],
+    note: '启动 LM Studio 并加载模型后，点上面的本机服务按钮，会自动填入真实模型名'
   },
   // 下面三家是 0.5.3 补的：服务端早就在探测 8000 / 1337（LOCAL_MODEL_SERVERS），
   // 但厂商表里没有它们 —— 下拉框选不到，用户只能点「本地服务」按钮，而那个按钮

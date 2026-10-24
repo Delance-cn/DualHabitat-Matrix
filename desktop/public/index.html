@@ -424,8 +424,20 @@
     <section class="page" id="page-models" hidden>
       <header class="page-head">
         <h1 data-i18n="API 与模型">API 与模型</h1>
-        <p data-i18n="这里管理模型供应商、密钥与切换顺序。批量粘贴多个 key，程序会自动识别厂商并分类，确认后即可保存。">这里管理模型供应商、密钥与切换顺序。批量粘贴多个 key，程序会自动识别厂商并分类，确认后即可保存。</p>
+        <p data-i18n="先看当前在用什么，再改连接。改完自动保存；需要时也可以点「保存并应用」。">先看当前在用什么，再改连接。改完自动保存；需要时也可以点「保存并应用」。</p>
       </header>
+
+      <div class="panel model-hero" id="model-hero">
+        <div class="model-hero-main">
+          <span class="model-hero-kicker">当前平台 <b id="mh-platform">QQ</b></span>
+          <strong class="model-hero-title" id="mh-title">还没有选模型</strong>
+          <span class="model-hero-sub" id="mh-sub">在下面选厂商，或点本机服务按钮。</span>
+        </div>
+        <div class="model-hero-side">
+          <span class="badge warn" id="mh-pool">模型池 —</span>
+          <span class="badge warn" id="mh-bridge">服务未启动</span>
+        </div>
+      </div>
 
       <div class="panel">
         <div class="panel-head">
@@ -447,11 +459,11 @@
       <div id="slot-panels"></div>
 
       <!-- 批量导入 -->
-      <div class="panel">
-        <div class="panel-head">
+      <details class="panel model-advanced">
+        <summary class="panel-head">
           <h2>批量导入 API Key</h2>
           <span class="hint">一行一条，认不出的会标「存疑」等你改</span>
-        </div>
+        </summary>
         <div class="field">
           <label for="imp-text">粘贴内容</label>
           <textarea id="imp-text" rows="6" spellcheck="false" placeholder="sk-xxxxxxxxxxxxxxxx&#10;https://api.deepseek.com/v1  sk-xxxxxxxx&#10;openrouter = sk-or-v1-xxxx&#10;# 以 # 开头的行会被跳过"></textarea>
@@ -466,7 +478,7 @@
           <span class="result" id="imp-result"></span>
         </div>
         <div id="imp-report"></div>
-      </div>
+      </details>
 
       <!-- 模型来源模板：脚本克隆两份，分别渲染成「纯聊天」和「聊天 + 指令」 -->
       <template id="tpl-source-panel">
@@ -500,9 +512,11 @@
           <div class="field">
             <label for="model">模型</label>
             <div class="input-with-action">
-              <input id="model" placeholder="例如 deepseek-chat" spellcheck="false" />
+              <input id="model" placeholder="例如 deepseek-chat，或点本机服务自动填" spellcheck="false" list="model-suggest" />
               <button class="btn btn-ghost" id="btn-models" title="问服务端要真实列表">拉取</button>
             </div>
+            <datalist id="model-suggest"></datalist>
+            <span class="hint" id="model-source-hint"></span>
           </div>
         </div>
 
@@ -521,38 +535,36 @@
           <span class="hint" id="key-hint"></span>
         </div>
 
-        <div class="panel-head sub"><h2>生成参数</h2><span class="hint">原样转给模型</span></div>
-
-        <div class="field-row">
-          <div class="field">
-            <label for="temperature">温度</label>
-            <input id="temperature" type="number" step="0.1" min="0" max="2" placeholder="0.8" />
-            <span class="hint">越高越放得开，群聊别开太高</span>
-          </div>
-          <div class="field">
-            <label for="maxTokens">单次最多出多少 token</label>
-            <input id="maxTokens" type="number" min="1" step="64" placeholder="1024" />
-            <span class="hint">太小会说话说一半</span>
-          </div>
-        </div>
-
-        <div class="field-row">
-          <div class="field">
-            <label for="maxHistory">保留几条上下文</label>
-            <input id="maxHistory" type="number" min="0" step="2" placeholder="12" />
-            <span class="hint">不含本轮</span>
-          </div>
-          <div class="field">
-            <label for="timeoutMs">单轮超时（毫秒）</label>
-            <input id="timeoutMs" type="number" min="0" step="1000" placeholder="90000" />
-            <span class="hint">超时直接判定失败，避免群内等待</span>
-          </div>
-        </div>
-
-        <details class="help" data-adv>
-          <summary>更多参数</summary>
+        <details class="help model-advanced">
+          <summary>生成参数（一般不用改）</summary>
           <div class="help-body">
-            <div class="field" style="margin-top:6px">
+            <div class="field-row" style="margin-top:6px">
+              <div class="field">
+                <label for="temperature">温度</label>
+                <input id="temperature" type="number" step="0.1" min="0" max="2" placeholder="0.8" />
+                <span class="hint">越高越放得开，群聊别开太高</span>
+              </div>
+              <div class="field">
+                <label for="maxTokens">单次最多出多少 token</label>
+                <input id="maxTokens" type="number" min="1" step="64" placeholder="1024" />
+                <span class="hint">太小会说话说一半</span>
+              </div>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="maxHistory">保留几条上下文</label>
+                <input id="maxHistory" type="number" min="0" step="2" placeholder="12" />
+                <span class="hint">不含本轮</span>
+              </div>
+              <div class="field">
+                <label for="timeoutMs">单轮超时（毫秒）</label>
+                <input id="timeoutMs" type="number" min="0" step="1000" placeholder="90000" />
+                <span class="hint">超时直接判定失败，避免群内等待</span>
+              </div>
+            </div>
+
+            <div class="field">
               <label for="maxContextChars">上下文字符上限</label>
               <input id="maxContextChars" type="number" min="0" step="1000" placeholder="24000" />
               <span class="hint">粗估上限，超了从最早的消息开始丢</span>
@@ -613,6 +625,8 @@
           <span class="hint">从上往下依次试，一个用光了换下一个</span>
         </div>
 
+        <div class="note" id="pool-warning" hidden></div>
+
         <label class="switch-row">
           <input type="checkbox" id="poolEnabled" />
           <span>
@@ -639,7 +653,7 @@
           <label>免费档</label>
           <div id="pool-free"></div>
           <div class="input-with-action" style="margin-top:7px">
-            <input id="pool-add-free" placeholder="厂商/模型，例如 bailian/qwen3.8-max" spellcheck="false" />
+            <input id="pool-add-free" placeholder="厂商/模型，例如 lmstudio/qwen2.5-7b-instruct" spellcheck="false" list="pool-model-suggest" />
             <button class="btn btn-ghost" data-add="free">添加</button>
           </div>
         </div>
@@ -648,10 +662,11 @@
           <label>付费档</label>
           <div id="pool-paid"></div>
           <div class="input-with-action" style="margin-top:7px">
-            <input id="pool-add-paid" placeholder="厂商/模型" spellcheck="false" />
+            <input id="pool-add-paid" placeholder="厂商/模型" spellcheck="false" list="pool-model-suggest" />
             <button class="btn btn-ghost" data-add="paid">添加</button>
           </div>
         </div>
+        <datalist id="pool-model-suggest"></datalist>
 
         <div class="field" id="pool-spent-group" hidden>
           <label>废池</label>
@@ -660,7 +675,8 @@
         </div>
 
         <div class="actions">
-          <button class="btn btn-primary" id="btn-save-pool" hidden>保存并重建配置</button>
+          <button class="btn" id="btn-pool-current">把当前模型放到池首</button>
+          <button class="btn btn-primary" id="btn-save-pool">保存模型池</button>
           <span class="result" id="pool-result"></span>
         </div>
 
@@ -671,11 +687,11 @@
       </div>
 
       <!-- 模型价格 -->
-      <div class="panel">
-        <div class="panel-head">
+      <details class="panel model-advanced">
+        <summary class="panel-head">
           <h2>模型价格</h2>
-          <span class="hint">元 / 百万 token</span>
-        </div>
+          <span class="hint">元 / 百万 token · 只在算花费时用</span>
+        </summary>
 
         <div id="price-rows"></div>
 
@@ -706,7 +722,7 @@
           <summary>为什么要填这个</summary>
           <div class="help-body">花费统计不联网查价，只按这张表乘 token 数。换了中转模型、又没在这里加一条的话，会按兜底价算 —— 数字照样出得来，但不对。</div>
         </details>
-      </div>
+      </details>
     </section>
 
     <!-- ══════════════════ 后端 ══════════════════ -->
