@@ -54,11 +54,17 @@ const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const ROOT = resolveDataRoot(CODE_ROOT);
 const MODEL_INSTANCE = resolveModelInstance('qq');
 const STATE_DIR = path.join(ROOT, 'state');
-const TOKEN_FILE = path.join(STATE_DIR, 'qq-official-token.json');
-const SESS_FILE = path.join(STATE_DIR, 'qq-official-sessions.json');
-const STATUS_FILE = path.join(STATE_DIR, 'qq-official-status.json');
-// 单实例锁。文件名和桌面端 server.mjs externalQqOfficialPid() 约定死，改一边要改两边。
-const LOCK_FILE = path.join(STATE_DIR, 'qq-official.lock');
+
+/* 多号：每个官方机器人（一个 AppID = 一份凭证 = 一个独立进程）各带一套状态文件，
+   文件名带 AppID 后缀，桌面端 externalQqOfficialPid(appId) 读的锁也是这套名字。
+   单号时代（0.6.0 之前只有一个）没有这些后缀文件 —— 老状态不迁移，重登一次就都有了。 */
+const APP_ID = (() => {
+  const at = process.argv.indexOf('--app');
+  const v = at > 0 ? String(process.argv[at + 1] ?? '').trim() : '';
+  return /^\d{6,15}$/.test(v) ? v : '';
+})();
+const stateFile = (kind) => path.join(STATE_DIR, `qq-official-${APP_ID}-${kind}.json`);
+const LOCK_FILE = path.join(STATE_DIR, `qq-official-${APP_ID}.lock`);
 
 const TOKEN_API = 'https://api.bot.qq.com/app/getAppAccessToken';
 const API_BASE = 'https://api.sgroup.qq.com';
@@ -89,7 +95,8 @@ function writeJson(file, value) {
 }
 
 function log(...args) {
-  console.log(`[官方QQ] ${new Date().toLocaleTimeString('zh-CN')} ${args.map((x) => (typeof x === 'string' ? x : String(x?.message ?? x))).join(' ')}`);
+  const tag = APP_ID ? `官方QQ:${APP_ID.slice(0, 4)}…` : '官方QQ';
+  console.log(`[${tag}] ${new Date().toLocaleTimeString('zh-CN')} ${args.map((x) => (typeof x === 'string' ? x : String(x?.message ?? x))).join(' ')}`);
 }
 
 /** 把长回复拆成官方接口吃得下的段：先按段落，段落本身太长再硬切。导出给测试用。 */
@@ -150,25 +157,47 @@ function readConfig() {
   return readJson(path.join(ROOT, 'config.json'), {});
 }
 
+/** 全量账号清单（配置迁移/桌面端展示用）：bots 数组 + 旧单号字段兜底。 */
+export function officialBotList(cfgJson) {
+  const cfg = cfgJson ?? readConfig();
+  const o = cfg.qqOfficial ?? {};
+  const bots = Array.isArray(o.bots)
+    ? o.bots.map((b, i) => ({
+        appId: String(b?.appId ?? '').trim(),
+        appSecret: String(b?.appSecret ?? '').trim(),
+        enabled: b?.enabled !== false,
+        name: String(b?.name ?? '').trim() || `机器人 ${i + 1}`
+      })).filter((b) => b.appId)
+    : [];
+  // 旧单号（0.6.0 前）：顶层 appId/appSecret，没进过 bots 数组就临时当第 1 号
+  if (!bots.length && String(o.appId ?? '').trim()) {
+    bots.push({ appId: String(o.appId).trim(), appSecret: String(o.appSecret ?? '').trim(), enabled: o.enabled === true, name: '机器人 1' });
+  }
+  return bots;
+}
+
 function officialConfig() {
   const cfg = readConfig();
   const o = cfg.qqOfficial ?? {};
+  // 多号：按 --app 传进来的 AppID 从 bots 里挑自己这份
+  const mine = APP_ID ? officialBotList(cfg).find((b) => b.appId === APP_ID) : officialBotList(cfg)[0];
   const list = (v) => (Array.isArray(v) ? v.map(String).map((x) => x.trim()).filter(Boolean) : []);
-  const allow = o.allow ?? {};
+  const allow = (mine ? (o.bots?.find((b) => String(b?.appId ?? '').trim() === mine.appId)?.allow ?? o.allow) : o.allow) ?? {};
   const allowPrivate = list(allow.private);
   const allowGroups = list(allow.groups);
   const configured = Boolean(cfg.qqOfficial) && (allowPrivate.length > 0 || allowGroups.length > 0 || o.allowAllWhenEmpty === false);
   return {
-    enabled: o.enabled === true,
-    appId: String(o.appId ?? '').trim(),
-    appSecret: String(o.appSecret ?? '').trim(),
+    enabled: mine ? mine.enabled === true : false,
+    appId: mine?.appId ?? '',
+    appSecret: mine?.appSecret ?? '',
+    name: mine?.name ?? '',
     allowPrivate,
     allowGroups,
     allowAllWhenEmpty: configured ? o.allowAllWhenEmpty === true : true,
     // 人设/方案沿用 QQ 那条的（roles/ 目录、后端页的默认方案），改一处两边一起变
     role: String(cfg.role ?? '').trim(),
     agentPreset: String(cfg.agentPreset ?? '').trim(),
-    workspaceTitle: String(o.workspaceTitle ?? cfg.workspaceTitle ?? 'QQ 官方机器人').trim()
+    workspaceTitle: String(o.workspaceTitle ?? cfg.workspaceTitle ?? `QQ 官方机器人${mine?.name ? ` · ${mine.name}` : ''}`).trim()
   };
 }
 
@@ -210,13 +239,13 @@ async function accessToken(force = false) {
     accessToken._inflight = (async () => {
       // 重启后先吃落盘缓存（还新鲜就不用打接口），过期才真换
       if (!force && (!tokenCache.token || Date.now() >= tokenCache.expiresAt)) {
-        const saved = readJson(TOKEN_FILE, null);
+        const saved = readJson(stateFile('token'), null);
         if (saved?.token && Date.now() < Number(saved.expiresAt ?? 0) - margin) tokenCache = saved;
       }
       if (!force && tokenCache.token && Date.now() < tokenCache.expiresAt - margin) return tokenCache.token;
       const got = await fetchAccessToken(conf.appId, conf.appSecret);
       tokenCache = { token: got.token, expiresAt: Date.now() + got.expiresIn * 1000 };
-      writeJson(TOKEN_FILE, tokenCache);
+      writeJson(stateFile('token'), tokenCache);
       return tokenCache.token;
     })().finally(() => { accessToken._inflight = null; });
   }
@@ -330,7 +359,7 @@ async function initAi() {
     await api.workspace.rename({ workspaceId, title: conf.workspaceTitle });
   } catch { /* 改标题失败不影响干活 */ }
 
-  for (const [k, v] of Object.entries(readJson(SESS_FILE, {}) ?? {})) sessions.set(k, v);
+  for (const [k, v] of Object.entries(readJson(stateFile('sessions'), {}) ?? {})) sessions.set(k, v);
 
   if (!pumpStarted) {
     pumpStarted = true;
@@ -408,7 +437,7 @@ async function loadRoleText(name) {
 }
 
 function saveSessions() {
-  writeJson(SESS_FILE, Object.fromEntries(sessions));
+  writeJson(stateFile('sessions'), Object.fromEntries(sessions));
 }
 
 async function ensureSession(chatKey) {
@@ -454,7 +483,7 @@ async function ensureSession(chatKey) {
 
 const status = { connected: false, gateway: '', botName: '', startedAt: 0, lastEventAt: 0, received: 0, replied: 0, errors: 0, lastError: '' };
 function saveStatus() {
-  try { writeJson(STATUS_FILE, { ...status, pid: process.pid, at: Date.now() }); } catch { /* 状态写不进不影响主流程 */ }
+  try { writeJson(stateFile('status'), { ...status, appId: APP_ID, pid: process.pid, at: Date.now() }); } catch { /* 状态写不进不影响主流程 */ }
 }
 
 /* ── WebSocket 网关 ─────────────────────────────────── */
@@ -675,14 +704,20 @@ function acquireLock() {
 }
 
 async function main() {
-  const cmd = process.argv[2] ?? 'start';
+  const cmd = process.argv[2] === 'status' ? 'status' : 'start';
+  // 多号：必须 --app 指明自己是哪个机器人（单号时代不传也能跑，取列表第一个）
+  const bots = officialBotList();
+  if (!APP_ID && bots.length > 1) {
+    console.error(`配了 ${bots.length} 个官方机器人，启动要用 --app <AppID> 指明：${bots.map((b) => b.appId).join('、')}`);
+    process.exit(4);
+  }
   const conf = officialConfig();
   if (cmd === 'status') {
-    const st = readJson(STATUS_FILE, {});
+    const st = readJson(stateFile('status'), {});
     console.log(JSON.stringify({ config: { enabled: conf.enabled, appId: conf.appId ? conf.appId.slice(0, 4) + '…' : '' }, status: st }, null, 2));
     return;
   }
-  if (!conf.enabled) { log('未启用（config.json qqOfficial.enabled 不是 true），退出'); process.exit(0); }
+  if (!conf.enabled) { log('未启用（这个 AppID 在配置里没开），退出'); process.exit(0); }
   if (!conf.appId || !conf.appSecret) { log('缺 AppID/AppSecret，退出'); process.exit(1); }
   if (!acquireLock()) { log('已有官方 Bot 在跑（锁被占），这个进程退出'); process.exit(2); }
 

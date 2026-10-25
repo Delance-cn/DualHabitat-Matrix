@@ -28,6 +28,17 @@
 
 ## 二、中期大件（已规划，按价值排序）
 
+0. **NapCat 多号**（2026-10-25 立项，多号管理三件套的最后一块；官方机器人/微信已完成）：
+   难点在 bridge.js（12k 行）假设单 QQ 身份（单 OneBot 连接、self/ownerQQ/白名单/会话键 `private:<qq>`）。
+   设计方向（分四步走，每步独立可发）：
+   a. **NapCat 多实例**：桌面端按账号拉多个 NapCat（每号独立数据目录 + 错开的 WS/HTTP 端口 3001/3011/3021…），
+      config 迁 `platforms.qq.accounts: [{id:'qq1', qq, wsPort, httpPort, dir}]`（qq1 沿用现字段兼容旧配置）。
+   b. **桥接多连接**：bridge.js 把「一个 OneBot WS 客户端」抽成 Map<accountId, client>；入站消息打账号标签，
+      会话键改 `<account>:private:<qq>` / `<account>:group:<gid>`（qq1 无前缀，旧会话不丢）；
+      出站回复路由回来源账号的客户端。socialV2 群状态按 (account, gid) 复合键。
+   c. **人设/白名单按号**：roles 与 allow/deny 支持 per-account 覆盖（不配则全号共用，现行为）。
+   d. **桌面端多号面板**：每号一张服务卡（登录/启停/看护），复用官方机器人面板的列表交互。
+   风险：b 是主战场，bridge.js 改动集中在 OneBot 连接管理与消息路由两处，其余（socialV2/工具/记忆）吃复合键即可。
 1. ~~**OpenAI 兼容壳**~~ ✅ **0.5.0 已交付**（`src/openai-shell.js`，默认 4610，Bearer 鉴权，非流式 + 假流式）。
    二期：真增量 SSE（接 assistant/chunk 逐块 flush）、`tools` / function calling 转发、
    每会话复用（现在每条请求建一个新会话）、`/v1/embeddings`。

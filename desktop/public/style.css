@@ -2005,3 +2005,7 @@ html[data-view="home"] .app { grid-template-columns: minmax(0, 1fr); }
 .ext-m-post { background: rgba(59, 130, 246, .18); }
 .ext-m-get { background: rgba(34, 197, 94, .18); }
 #ext-hub-path { word-break: break-all; }
+
+/* 微信多账号选择条：账号芯片 + 添加/删除 */
+.wx-accounts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+.wx-accounts .btn-sm { display: inline-flex; align-items: center; }

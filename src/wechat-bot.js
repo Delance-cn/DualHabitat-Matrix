@@ -48,12 +48,20 @@ const ROOT = resolveDataRoot(CODE_ROOT);
 // 是两套目录：拆实例不会动 wechat-token.json / wechat-sessions.json。
 const MODEL_INSTANCE = resolveModelInstance('wechat');
 const STATE_DIR = path.join(ROOT, 'state');
-const TOKEN_FILE = path.join(STATE_DIR, 'wechat-token.json');
-const SESS_FILE = path.join(STATE_DIR, 'wechat-sessions.json');
-const QR_FILE = path.join(STATE_DIR, 'wechat-qr.json');
-// 单实例锁。桌面端也用这个文件判断「微信这条线是不是已经跑着了」，
-// 所以文件名不要随手改（server.mjs 里 externalWechatPid 读的就是它）。
-const LOCK_FILE = path.join(STATE_DIR, 'wechat.lock');
+/* 多账号：--account <id> 区分（wx1..wx10）。wx1 是默认号，**沿用单账号时代的
+   文件名**（wechat-token.json 等）—— 已登录的号升级后不用重新扫码；
+   wx2 起文件名带账号后缀，各号独立登录态/会话/二维码/单实例锁。 */
+const ACCOUNT = (() => {
+  const at = process.argv.indexOf('--account');
+  const v = at > 0 ? String(process.argv[at + 1] ?? '').trim() : '';
+  return /^[a-z0-9_-]{1,12}$/i.test(v) ? v : 'wx1';
+})();
+const _SUF = ACCOUNT === 'wx1' ? '' : `-${ACCOUNT}`;
+const TOKEN_FILE = path.join(STATE_DIR, `wechat${_SUF}-token.json`);
+const SESS_FILE = path.join(STATE_DIR, `wechat${_SUF}-sessions.json`);
+const QR_FILE = path.join(STATE_DIR, `wechat${_SUF}-qr.json`);
+// 单实例锁（每号一把）。wx1 的文件名是历史约定，server.mjs externalWechatPid 读它。
+const LOCK_FILE = path.join(STATE_DIR, `wechat${_SUF}.lock`);
 
 const ILINK_BASE = 'https://ilinkai.weixin.qq.com';
 const CHANNEL_VERSION = '1.0.2';
@@ -67,7 +75,8 @@ const MAX_REPLY_CHARS = 1200;
 function log(...args) {
   // 不打时间戳：桌面端把 stdout 转进日志页时会统一加 `[时:分:秒]`，
   // 这里再打一遍就成了 `[12:07:34] [12:07:34] …`。
-  console.log('[微信]', ...args);
+  // 多账号时带账号后缀（wx1 是默认号，保持原样不吵）。
+  console.log(ACCOUNT === 'wx1' ? '[微信]' : `[微信:${ACCOUNT}]`, ...args);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -402,7 +411,10 @@ async function initAi() {
   // 微信的会话目录必须和它自己的 opencode.json 在一起（`.oc/wechat`），
   // 否则引擎会把根目录 QQ 的 opencode.json 合并进来。用户配的子目录只接受
   // `.oc/wechat` 内的路径，由 sessionWorkdir 统一判断。
-  const dir = sessionWorkdir('wechat', MODEL_INSTANCE);
+  // 多账号：wx1 沿用原目录（workspace 不换，会话不丢）；wx2 起各自子目录。
+  const dir = ACCOUNT === 'wx1'
+    ? sessionWorkdir('wechat', MODEL_INSTANCE)
+    : path.join(sessionWorkdir('wechat', MODEL_INSTANCE), `bot-${ACCOUNT}`);
   fs.mkdirSync(dir, { recursive: true });
   const ws = unwrap(await api.workspace.create({ path: dir }), 'workspace.create');
   workspaceId = ws.workspace.workspaceId;

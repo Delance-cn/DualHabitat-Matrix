@@ -2833,11 +2833,18 @@ async function bringUp(scope = 'all') {
       : startBridge()
     : { ok: true, skipped: true };
   // 微信那条不依赖 NapCat，也不依赖桥接；自己的模型实例由 wechat-bot 幂等拉起。
-  const wechatResult = wantWx
-    ? wechat.child
-      ? { ok: true, skipped: true }
-      : startWechat()
-    : { ok: true, skipped: true };
+  // 多账号：wx1（默认号）照旧；其他号只在「已登录过」（有 token）时顺手拉起，
+  // 没登录的不自动起 —— 免得一键全开炸出九张二维码。
+  let wechatResult = { ok: true, skipped: true };
+  if (wantWx && !wechat.child) wechatResult = startWechat();
+  else if (wantWx && wechat.child) wechatResult = { ok: true, skipped: true };
+  if (wantWx) {
+    for (const acc of wechatAccountsList()) {
+      if (acc === 'wx1') continue;
+      const hasToken = fs.existsSync(wechatFiles(acc).token);
+      if (hasToken && !wechatProcs.get(acc)?.child && !externalWechatPid(acc)) startWechat(acc);
+    }
+  }
 
   return {
     ok: Boolean(bridgeResult.ok) || bridgeResult.error === '桥接已在运行',
@@ -3019,13 +3026,15 @@ function externalBridgePid() {
  * 同理，读微信接入的单实例锁（`state/wechat.lock`，由 wechat-bot.js 写）。
  * 文件名是和 wechat-bot.js 约定死的，改一边就要改另一边。
  */
-function externalWechatPid() {
-  return pidFromLockFile(path.join('state', 'wechat.lock'));
+/** 读微信接入的单实例锁（state/wechat[-<account>].lock，由 wechat-bot.js 写）。 */
+function externalWechatPid(account = 'wx1') {
+  const suf = account === 'wx1' ? '' : `-${account}`;
+  return pidFromLockFile(path.join('state', `wechat${suf}.lock`));
 }
 
-/** 官方 QQ 机器人的单实例锁（state/qq-official.lock，由 qq-official-bot.js 写）。 */
-function externalQqOfficialPid() {
-  return pidFromLockFile(path.join('state', 'qq-official.lock'));
+/** 官方 QQ 机器人的单实例锁（state/qq-official-<appId>.lock，由 qq-official-bot.js 写）。 */
+function externalQqOfficialPid(appId) {
+  return pidFromLockFile(path.join('state', `qq-official-${appId}.lock`));
 }
 
 /**
@@ -3160,167 +3169,251 @@ function bridgeState() {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 let wechat = { child: null, startedAt: null, exitCode: null };
-let qqOfficial = { child: null, startedAt: null, exitCode: null };
+/* 微信多账号：账号 id（wx1..wx10）→ 子进程。`wechat` 变量保留为 wx1（默认号）
+   的视图 —— 旧代码（看护/一键启动/状态）全指着它，别删。 */
+const wechatProcs = new Map();
+/* 官方机器人多号：AppID → 子进程。每个号一个独立 qq-official-bot.js 进程（--app 区分）。 */
+const qqOfficialBots = new Map();
 
-function wechatFiles() {
+/** 微信账号清单：config.json platforms.wechat.accounts（上限 10；缺省 = 只有 wx1）。 */
+function wechatAccountsList(cfg = loadConfig()) {
+  const raw = cfg.platforms?.wechat?.accounts;
+  const ids = (Array.isArray(raw) ? raw : [])
+    .map((x) => (typeof x === 'string' ? x.trim() : String(x?.id ?? '').trim()))
+    .filter((x) => /^wx([1-9]|10)$/.test(x));
+  return [...new Set(ids)].slice(0, 10).length ? [...new Set(ids)].slice(0, 10) : ['wx1'];
+}
+
+function wechatFiles(account = 'wx1') {
   const base = path.join(dataRoot(), 'state');
+  // wx1 沿用无后缀的老文件名（老登录态直接续用）；wx2 起带后缀
+  const suf = account === 'wx1' ? '' : `-${account}`;
   return {
-    qr: path.join(base, 'wechat-qr.json'),
-    token: path.join(base, 'wechat-token.json')
+    qr: path.join(base, `wechat${suf}-qr.json`),
+    token: path.join(base, `wechat${suf}-token.json`)
   };
 }
 
-function wechatState() {
-  const f = wechatFiles();
+function wechatAccountState(account) {
+  const rec = wechatProcs.get(account);
+  const f = wechatFiles(account);
   const qr = readJson(f.qr) ?? {};
   const token = readJson(f.token) ?? {};
-  // 「运行中」不能只看自己的 child：桥接/微信可能是从别的终端起的（比如调试时手起一份），
-  // 这时锁文件里有活着的 pid，界面也得如实显示，否则会诱着用户再点一次启动。
-  const externalPid = wechat.child ? null : externalWechatPid();
-  const runningPid = wechat.child?.pid ?? externalPid ?? null;
-  // 只在「进程在跑 + 码还新鲜」时把图给前端：进程没了那张图就是上次留下的尸体，
-  // 扫了只会得到一个过期提示；超过 4 分钟的码微信那边也已经不认了。
+  // 「运行中」不能只看自己的 child：可能是从别的终端起的，锁文件里有活 pid 也算。
+  const externalPid = rec?.child ? null : externalWechatPid(account);
+  const runningPid = rec?.child?.pid ?? externalPid ?? null;
+  // 只在「进程在跑 + 码还新鲜」时把图给前端：尸体码扫了只会得到过期提示。
   const fresh = qr.dataUrl && Date.now() - Number(qr.at ?? 0) < 4 * 60 * 1000;
   const live = Boolean(runningPid) && fresh && (qr.status === 'waiting' || qr.status === 'scanned');
   return {
+    id: account,
     running: Boolean(runningPid),
     pid: runningPid,
-    externalPid,
-    startedAt: wechat.startedAt,
+    startedAt: rec?.startedAt ?? null,
     loggedIn: Boolean(token.bot_token),
     botId: token.bot_id ?? null,
-    loginTime: token.login_time ?? null,
     qrStatus: qr.status ?? null,
     qr: live ? qr.dataUrl : null,
     qrUrl: live ? qr.qrUrl ?? null : null
   };
 }
 
-function startWechat() {
-  if (wechat.child) return { ok: false, error: '微信接入已在运行' };
-  // 微信这条线自己也有单实例锁（state/wechat.lock）。同一账号只允许一个进程长轮询，
-  // 再 spawn 一个只会立刻 exit(2) —— 界面上看着像"启动失败"，其实服务是好的。
-  const externalPid = externalWechatPid();
+function wechatState() {
+  // 顶层字段仍是 wx1（默认号）的视图：旧 UI（状态页/首页卡/向导）全都读它。
+  const primary = wechatAccountState('wx1');
+  const accounts = wechatAccountsList().map(wechatAccountState);
+  return {
+    ...primary,
+    externalPid: primary.pid && !wechatProcs.get('wx1')?.child ? primary.pid : null,
+    loginTime: readJson(wechatFiles('wx1').token)?.login_time ?? null,
+    accounts
+  };
+}
+
+function startWechat(account = 'wx1') {
+  const acc = /^wx([1-9]|10)$/.test(String(account)) ? String(account) : 'wx1';
+  const rec = wechatProcs.get(acc);
+  if (rec?.child) return { ok: false, error: `微信账号 ${acc} 已在运行` };
+  // 每个账号自己的单实例锁。同一账号只允许一个进程长轮询，再 spawn 一个只会
+  // 立刻 exit(2) —— 界面上看着像"启动失败"，其实服务是好的。
+  const externalPid = externalWechatPid(acc);
   if (externalPid) {
-    pushLog(`微信接入已在运行（pid ${externalPid}，不是本窗口启动的），直接复用`, 'sys', 'wechat');
+    pushLog(`微信账号 ${acc} 已在运行（pid ${externalPid}，不是本窗口启动的），直接复用`, 'sys', 'wechat');
     return { ok: true, pid: externalPid, external: true };
   }
+  if (!wechatAccountsList().includes(acc)) return { ok: false, error: `微信账号 ${acc} 没在配置里（先在登录页添加）` };
   const { command, env } = nodeRunner('wechat');
   const script = path.join(getRoot(), 'src', 'wechat-bot.js');
   if (!fs.existsSync(script)) return { ok: false, error: '找不到 src/wechat-bot.js（桥接目录对吗）' };
 
-  const child = spawn(command, [script], {
+  const child = spawn(command, [script, '--account', acc], {
     cwd: dataRoot(),
     env: { ...process.env, ...env },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
-  wechat = { child, startedAt: Date.now(), exitCode: null };
-  pushLog(`微信接入已启动（pid ${child.pid}）`, 'sys', 'wechat');
+  wechatProcs.set(acc, { child, startedAt: Date.now(), exitCode: null });
+  if (acc === 'wx1') wechat = { child, startedAt: Date.now(), exitCode: null };
+  pushLog(`微信账号 ${acc} 已启动（pid ${child.pid}）`, 'sys', 'wechat');
   relay(child.stdout, 'out', 'wechat');
   relay(child.stderr, 'err', 'wechat');
 
   child.on('close', (code) => {
-    if (wechat.child === child) wechat = { child: null, startedAt: null, exitCode: code };
-    onServiceExit('wechat');
-    pushLog(`微信接入已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'wechat');
+    const prev = wechatProcs.get(acc);
+    if (prev?.child === child) wechatProcs.set(acc, { child: null, startedAt: null, exitCode: code });
+    if (acc === 'wx1' && wechat.child === child) wechat = { child: null, startedAt: null, exitCode: code };
+    pushLog(`微信账号 ${acc} 已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'wechat');
+    // 看护按账号走：手动停的不拉起，其余看总开关
+    if (!shuttingDown && !recentlyStopped(`wechat:${acc}`) && loadAutomation().watch.wechat) {
+      const attempts = (wechatProcs.get(acc).restarts = (wechatProcs.get(acc).restarts ?? 0) + 1);
+      if (attempts <= RESTART_MAX) {
+        pushLog(`看护：微信账号 ${acc} 意外退出，${RESTART_DELAY_MS / 1000} 秒后自动重启（第 ${attempts}/${RESTART_MAX} 次）`, 'sys', 'app');
+        setTimeout(() => {
+          if (shuttingDown) return;
+          wechatProcs.get(acc).restarts = 0;
+          startWechat(acc);
+        }, RESTART_DELAY_MS);
+      } else {
+        pushLog(`微信账号 ${acc} 连续 ${RESTART_MAX} 次自动重启失败，看护放弃`, 'err', 'app');
+      }
+    }
   });
 
-  return { ok: true, pid: child.pid };
+  return { ok: true, pid: child.pid, account: acc };
 }
 
-function stopWechat() {
-  markManualStop('wechat');
+function stopWechat(account = 'wx1') {
+  const acc = /^wx([1-9]|10)$/.test(String(account)) ? String(account) : 'wx1';
+  markManualStop(`wechat:${acc}`);
   // 先看自己拉起来的；没有就试着停「外部启动的」那个（锁文件里记着 pid）。
   // 不这么写的话，界面显示「运行中」但点停止永远提示"没在运行"，只能去任务管理器杀。
-  const child = wechat.child;
-  const pid = child?.pid ?? externalWechatPid();
-  if (!pid) return { ok: false, error: '微信接入没在运行' };
-  pushLog('正在停止微信接入…', 'sys', 'wechat');
+  const child = wechatProcs.get(acc)?.child;
+  const pid = child?.pid ?? externalWechatPid(acc);
+  if (!pid) return { ok: false, error: `微信账号 ${acc} 没在运行` };
+  pushLog(`正在停止微信账号 ${acc}…`, 'sys', 'wechat');
   const done = (async () => {
     const killed = await killProcessTree(pid);
-    // 微信 Bot 停了，它自己的 4601 模型实例也没人用了；QQ 的 4599 不动。
-    await stopManagedModelService('wechat');
+    // 4601 模型实例是所有微信账号共用的：还有别的账号在跑就不能停。
+    const stillRunning = wechatAccountsList().some((a) => a === acc ? false : (wechatProcs.get(a)?.child || externalWechatPid(a)));
+    if (!stillRunning) await stopManagedModelService('wechat');
     return { stopped: true, killed };
   })();
   return withDone({ ok: true, pid }, done);
 }
 
-/* ── QQ 官方机器人（开放平台，不封号那条线） ─────────── */
+/* ── QQ 官方机器人（开放平台，不封号那条线）· 多号 ──── */
 
-function startQqOfficial() {
-  if (qqOfficial.child) return { ok: false, error: '官方机器人已在运行' };
-  const externalPid = externalQqOfficialPid();
+/** 配置里的官方机器人清单（bots 数组 + 旧单号字段兜底，和 bot 进程同一套规则）。 */
+function qqOfficialBotList(cfg = loadConfig()) {
+  const o = cfg.qqOfficial ?? {};
+  const bots = Array.isArray(o.bots)
+    ? o.bots.map((b, i) => ({
+        appId: String(b?.appId ?? '').trim(),
+        appSecret: String(b?.appSecret ?? '').trim(),
+        enabled: b?.enabled !== false,
+        name: String(b?.name ?? '').trim() || `机器人 ${i + 1}`
+      })).filter((b) => b.appId)
+    : [];
+  if (!bots.length && String(o.appId ?? '').trim()) {
+    bots.push({ appId: String(o.appId).trim(), appSecret: String(o.appSecret ?? '').trim(), enabled: o.enabled === true, name: '机器人 1' });
+  }
+  return bots;
+}
+
+function startQqOfficial(appId) {
+  const id = String(appId ?? '').trim();
+  if (!id) return { ok: false, error: '缺少 AppID' };
+  if (qqOfficialBots.get(id)?.child) return { ok: false, error: '这个号已在运行' };
+  const externalPid = externalQqOfficialPid(id);
   if (externalPid) {
-    pushLog(`官方机器人已在运行（pid ${externalPid}，不是本窗口启动的），直接复用`, 'sys', 'qqofficial');
+    pushLog(`官方机器人 ${id.slice(0, 4)}… 已在运行（pid ${externalPid}，不是本窗口启动的），直接复用`, 'sys', 'qqofficial');
     return { ok: true, pid: externalPid, external: true };
   }
-  const cfg = loadConfig();
-  const o = cfg.qqOfficial ?? {};
-  if (o.enabled !== true) return { ok: false, error: '先在面板里填好 AppID/AppSecret 并打开开关' };
-  if (!String(o.appId ?? '').trim() || !String(o.appSecret ?? '').trim()) return { ok: false, error: 'AppID/AppSecret 没填全' };
+  const bot = qqOfficialBotList().find((b) => b.appId === id);
+  if (!bot) return { ok: false, error: '配置里没有这个 AppID' };
+  if (!bot.enabled) return { ok: false, error: '这个号在配置里是停用状态，先在面板里启用' };
+  if (!bot.appSecret) return { ok: false, error: '这个号没填 AppSecret' };
   const { command, env } = nodeRunner('qq');
   const script = path.join(getRoot(), 'src', 'qq-official-bot.js');
   if (!fs.existsSync(script)) return { ok: false, error: '找不到 src/qq-official-bot.js（桥接目录对吗）' };
 
-  const child = spawn(command, [script], {
+  // 脚本必须在 argv[1]：bot 进程的入口守卫靠它判断自己是主程序，放后面会静默退出
+  const child = spawn(command, [script, '--app', id], {
     cwd: dataRoot(),
     env: { ...process.env, ...env },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
-  qqOfficial = { child, startedAt: Date.now(), exitCode: null };
-  pushLog(`官方机器人已启动（pid ${child.pid}）`, 'sys', 'qqofficial');
+  qqOfficialBots.set(id, { child, startedAt: Date.now(), exitCode: null });
+  pushLog(`官方机器人「${bot.name} ${id.slice(0, 4)}…」已启动（pid ${child.pid}）`, 'sys', 'qqofficial');
   relay(child.stdout, 'out', 'qqofficial');
   relay(child.stderr, 'err', 'qqofficial');
 
   child.on('close', (code) => {
-    if (qqOfficial.child === child) qqOfficial = { child: null, startedAt: null, exitCode: code };
-    onServiceExit('qqofficial');
-    pushLog(`官方机器人已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'qqofficial');
+    const rec = qqOfficialBots.get(id);
+    if (rec?.child === child) qqOfficialBots.set(id, { child: null, startedAt: null, exitCode: code });
+    pushLog(`官方机器人「${bot.name}」已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'qqofficial');
+    // 看护按号走：手动停的（markManualStop 记过）不拉起，其余看总开关
+    if (!shuttingDown && !recentlyStopped(`qqofficial:${id}`) && loadAutomation().watch.qqofficial) {
+      const attempts = (qqOfficialBots.get(id).restarts = (qqOfficialBots.get(id).restarts ?? 0) + 1);
+      if (attempts <= RESTART_MAX) {
+        pushLog(`看护：官方机器人「${bot.name}」意外退出，${RESTART_DELAY_MS / 1000} 秒后自动重启（第 ${attempts}/${RESTART_MAX} 次）`, 'sys', 'app');
+        setTimeout(() => {
+          if (shuttingDown) return;
+          qqOfficialBots.get(id).restarts = 0;
+          startQqOfficial(id);
+        }, RESTART_DELAY_MS);
+      } else {
+        pushLog(`官方机器人「${bot.name}」连续 ${RESTART_MAX} 次自动重启失败，看护放弃`, 'err', 'app');
+      }
+    }
   });
 
   return { ok: true, pid: child.pid };
 }
 
-function stopQqOfficial() {
-  markManualStop('qqofficial');
-  const child = qqOfficial.child;
-  const pid = child?.pid ?? externalQqOfficialPid();
-  if (!pid) return { ok: false, error: '官方机器人没在运行' };
-  pushLog('正在停止官方机器人…', 'sys', 'qqofficial');
+function stopQqOfficial(appId) {
+  const id = String(appId ?? '').trim();
+  if (!id) return { ok: false, error: '缺少 AppID' };
+  markManualStop(`qqofficial:${id}`);
+  const child = qqOfficialBots.get(id)?.child;
+  const pid = child?.pid ?? externalQqOfficialPid(id);
+  if (!pid) return { ok: false, error: '这个号没在运行' };
+  pushLog(`正在停止官方机器人 ${id.slice(0, 4)}…`, 'sys', 'qqofficial');
   // 不停 4599 模型实例：QQ 桥接（NapCat 那条）还在用它。
   const done = (async () => ({ stopped: true, killed: await killProcessTree(pid) }))();
   return withDone({ ok: true, pid }, done);
 }
 
-/** 面板/状态页的数据：进程在不在 + Bot 自己写在 state 里的运行况。 */
+/** 面板/状态页的数据：每个号一份（进程在不在 + Bot 写在 state 里的运行况）。 */
 function qqOfficialState() {
-  const cfg = loadConfig();
-  const o = cfg.qqOfficial ?? {};
-  const st = readJson(path.join(dataRoot(), 'state', 'qq-official-status.json'), null) ?? {};
-  const externalPid = qqOfficial.child ? null : externalQqOfficialPid();
-  const runningPid = qqOfficial.child?.pid ?? externalPid ?? null;
-  const statusAt = Number(st.at ?? 0);
-  return {
-    running: Boolean(runningPid),
-    pid: runningPid,
-    externalPid,
-    startedAt: qqOfficial.startedAt,
-    enabled: o.enabled === true,
-    appId: String(o.appId ?? ''),
-    appSecretSet: Boolean(String(o.appSecret ?? '').trim()),
-    // Bot 进程在但状态文件 2 分钟没心跳 = 网关那边多半出事了
-    connected: Boolean(runningPid) && st.connected === true && Date.now() - statusAt < 2 * 60_000,
-    botName: st.botName ?? '',
-    lastEventAt: Number(st.lastEventAt ?? 0),
-    received: Number(st.received ?? 0),
-    replied: Number(st.replied ?? 0),
-    errors: Number(st.errors ?? 0),
-    lastError: st.lastError ?? ''
-  };
+  const bots = qqOfficialBotList().map((bot) => {
+    const rec = qqOfficialBots.get(bot.appId);
+    const st = readJson(path.join(dataRoot(), 'state', `qq-official-${bot.appId}-status.json`), null) ?? {};
+    const externalPid = rec?.child ? null : externalQqOfficialPid(bot.appId);
+    const runningPid = rec?.child?.pid ?? externalPid ?? null;
+    const statusAt = Number(st.at ?? 0);
+    return {
+      appId: bot.appId,
+      name: bot.name,
+      enabled: bot.enabled,
+      appSecretSet: Boolean(bot.appSecret),
+      running: Boolean(runningPid),
+      pid: runningPid,
+      startedAt: rec?.startedAt ?? null,
+      // 进程在但状态文件 2 分钟没心跳 = 网关那边多半出事了
+      connected: Boolean(runningPid) && st.connected === true && Date.now() - statusAt < 2 * 60_000,
+      botName: st.botName ?? '',
+      lastEventAt: Number(st.lastEventAt ?? 0),
+      received: Number(st.received ?? 0),
+      replied: Number(st.replied ?? 0),
+      errors: Number(st.errors ?? 0),
+      lastError: st.lastError ?? ''
+    };
+  });
+  return { bots };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -4437,7 +4530,6 @@ function onServiceExit(kind) {
     try {
       if (kind === 'bridge') startBridge();
       else if (kind === 'wechat') startWechat();
-      else if (kind === 'qqofficial') startQqOfficial();
       pushLog(`看护：「${kind}」已重新拉起`, 'sys', 'app');
     } catch (error) {
       pushLog(`看护重启「${kind}」失败：${error?.message ?? error}`, 'err', 'app');
@@ -4448,7 +4540,7 @@ function onServiceExit(kind) {
 /** 服务稳定跑过 5 分钟就清零计数 —— 偶尔崩一次和连环崩要区别对待。 */
 setInterval(() => {
   for (const k of Object.keys(restartAttempts)) {
-    const startedAt = k === 'bridge' ? bridge.startedAt : k === 'wechat' ? wechat.startedAt : k === 'qqofficial' ? qqOfficial.startedAt : napcatLaunch.startedAt;
+    const startedAt = k === 'bridge' ? bridge.startedAt : k === 'wechat' ? wechat.startedAt : napcatLaunch.startedAt;
     if (startedAt && Date.now() - startedAt > 5 * 60_000) restartAttempts[k] = 0;
   }
 }, 60_000);
@@ -5740,40 +5832,131 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, bringDown(body.scope));
     }
     if (p === '/api/wechat/start') {
+      const body = await readBody(req).catch(() => ({}));
       try {
         await repairModelConfiguration();
       } catch (error) {
         pushLog(`模型配置自动修复失败（继续启动微信）：${error?.message ?? error}`, 'err', 'models');
       }
-      return sendJson(res, startWechat());
+      return sendJson(res, startWechat(body.account));
     }
     if (p === '/api/bots/start') {
       const body = await readBody(req);
       return sendJson(res, await startBotFlow(body?.platform === 'wechat' ? 'wechat' : 'qq'));
     }
-    if (p === '/api/wechat/stop') return sendJson(res, stopWechat());
+    if (p === '/api/wechat/stop') {
+      const body = await readBody(req).catch(() => ({}));
+      return sendJson(res, stopWechat(body.account));
+    }
+
+    if (p === '/api/wechat/accounts') {
+      // 微信多账号清单：add 添下一个 wxN（上限 10），remove 收掉一个（wx1 是默认号不可删）
+      if (req.method === 'GET') return sendJson(res, { ok: true, accounts: wechatAccountsList() });
+      const body = await readBody(req);
+      const cfg = loadConfig();
+      const list = wechatAccountsList(cfg);
+      if (body.action === 'add') {
+        if (list.length >= 10) return sendJson(res, { ok: false, error: '最多 10 个微信账号' });
+        const next = `wx${list.length + 1}`;
+        const merged = [...list, next];
+        cfg.platforms = { ...(cfg.platforms ?? {}), wechat: { ...(cfg.platforms?.wechat ?? {}), accounts: merged } };
+        writeJson(configFile(), cfg);
+        return sendJson(res, { ok: true, accounts: merged, added: next });
+      }
+      if (body.action === 'remove') {
+        const id = String(body.id ?? '').trim();
+        if (id === 'wx1') return sendJson(res, { ok: false, error: 'wx1 是默认账号，不能删（可以不启动它）' });
+        if (!list.includes(id)) return sendJson(res, { ok: false, error: '没有这个账号' });
+        const stopped = stopWechat(id);
+        await Promise.resolve(stopped?.done ?? null);
+        const idx = list.indexOf(id);
+        const merged = list.filter((x) => x !== id).map((x, i) => `wx${i + 1}`);
+        // 在跑的后位号先停：它们的状态文件马上要改名，进程挂在旧 id 上会读错文件
+        const runningAfter = [];
+        for (let i = idx + 1; i < list.length; i++) {
+          if (wechatProcs.get(list[i])?.child || externalWechatPid(list[i])) runningAfter.push(list[i]);
+        }
+        for (const acc of runningAfter) {
+          const st = stopWechat(acc);
+          if (st?.done) await st.done;
+        }
+        // 先清被删号自己的状态文件（登录态/会话/二维码/锁）；id 不是 wx1，一定带后缀
+        for (const name of [`wechat-${id}-token.json`, `wechat-${id}-sessions.json`, `wechat-${id}-qr.json`, `wechat-${id}.lock`]) {
+          try { fs.rmSync(path.join(dataRoot(), 'state', name), { force: true }); } catch { /* 删不动就算了 */ }
+        }
+        // 剩下的号收敛回 wx1..wxN 连号：从后往前改（先改后面的，避免链式覆盖）
+        for (let i = list.length - 1; i > idx; i--) {
+          const from = list[i];
+          const to = merged[i - 1];
+          if (!to || from === to) continue;
+          for (const kind of ['token', 'sessions', 'qr']) {
+            const sufFrom = from === 'wx1' ? '' : `-${from}`;
+            const sufTo = to === 'wx1' ? '' : `-${to}`;
+            const src = path.join(dataRoot(), 'state', `wechat${sufFrom}-${kind}.json`);
+            const dst = path.join(dataRoot(), 'state', `wechat${sufTo}-${kind}.json`);
+            try {
+              if (fs.existsSync(src)) {
+                if (fs.existsSync(dst)) fs.rmSync(dst, { force: true }); // Windows 的 rename 不吃覆盖
+                fs.renameSync(src, dst);
+              }
+            } catch { /* 改不动就算了 */ }
+          }
+        }
+        cfg.platforms = { ...(cfg.platforms ?? {}), wechat: { ...(cfg.platforms?.wechat ?? {}), accounts: merged } };
+        writeJson(configFile(), cfg);
+        pushLog(`微信账号 ${id} 已移除，剩余 ${merged.length} 个`, 'sys', 'wechat');
+        // 移位前在跑的号，按新 id 拉回来（登录态文件已改名，无缝继续）
+        for (const old of runningAfter) startWechat(merged[list.indexOf(old) - 1]);
+        return sendJson(res, { ok: true, accounts: merged });
+      }
+      return sendJson(res, { ok: false, error: 'action 要是 add 或 remove' });
+    }
 
     if (p === '/api/qq-official') {
       if (req.method === 'GET') return sendJson(res, { ok: true, ...qqOfficialState() });
       const body = await readBody(req);
-      if (body.action === 'start') return sendJson(res, startQqOfficial());
-      if (body.action === 'stop') return sendJson(res, stopQqOfficial());
-      // 保存配置：AppID/AppSecret/开关。存完按开关状态顺手启停。
+      if (body.action === 'start') return sendJson(res, startQqOfficial(body.appId));
+      if (body.action === 'stop') return sendJson(res, stopQqOfficial(body.appId));
+
       const cfg = loadConfig();
-      const prev = cfg.qqOfficial ?? {};
-      const appId = body.appId !== undefined ? String(body.appId).trim() : String(prev.appId ?? '');
-      const appSecret = body.appSecret !== undefined ? String(body.appSecret).trim() : String(prev.appSecret ?? '');
-      if (appId && !/^\d{6,15}$/.test(appId)) return sendJson(res, { ok: false, error: 'AppID 应该是一串数字（开放平台管理端的那份）' });
-      const enabled = body.enabled === undefined ? prev.enabled === true : body.enabled === true;
-      if (enabled && (!appId || !appSecret)) return sendJson(res, { ok: false, error: 'AppID 和 AppSecret 都要填才能启用' });
-      cfg.qqOfficial = { ...(cfg.qqOfficial ?? {}), enabled, appId, appSecret };
+      // 多号配置：bots 数组。第一次保存时把旧单号字段迁进去、旧字段删掉（单一事实源）。
+      if (body.action === 'delete') {
+        const appId = String(body.appId ?? '').trim();
+        const bots = qqOfficialBotList(cfg).filter((b) => b.appId !== appId);
+        if (bots.length === qqOfficialBotList(cfg).length) return sendJson(res, { ok: false, error: '配置里没有这个号' });
+        const stopped = stopQqOfficial(appId);
+        await Promise.resolve(stopped?.done ?? null);
+        cfg.qqOfficial = { ...(cfg.qqOfficial ?? {}), bots };
+        delete cfg.qqOfficial.appId;
+        delete cfg.qqOfficial.appSecret;
+        delete cfg.qqOfficial.enabled;
+        writeJson(configFile(), cfg);
+        pushLog(`官方机器人 ${appId.slice(0, 4)}… 已删除`, 'sys', 'qqofficial');
+        return sendJson(res, { ok: true, ...qqOfficialState() });
+      }
+
+      // save / upsert：{appId, appSecret?, enabled, name?}
+      const appId = String(body.appId ?? '').trim();
+      if (!/^\d{6,15}$/.test(appId)) return sendJson(res, { ok: false, error: 'AppID 应该是一串数字（开放平台管理端的那份）' });
+      const bots = qqOfficialBotList(cfg);
+      const hit = bots.find((b) => b.appId === appId);
+      const name = body.name !== undefined ? String(body.name).trim() : hit?.name;
+      const enabled = body.enabled === undefined ? (hit?.enabled ?? true) : body.enabled === true;
+      const appSecret = body.appSecret !== undefined ? String(body.appSecret).trim() : (hit?.appSecret ?? '');
+      if (!appSecret) return sendJson(res, { ok: false, error: 'AppSecret 没填（新号要填一次，改密钥时填新的）' });
+      if (hit) Object.assign(hit, { name: name || hit.name, enabled, appSecret });
+      else bots.push({ appId, name: name || `机器人 ${bots.length + 1}`, enabled, appSecret });
+      if (enabled !== true) {
+        const stopped = stopQqOfficial(appId);
+        await Promise.resolve(stopped?.done ?? null);
+      }
+      cfg.qqOfficial = { ...(cfg.qqOfficial ?? {}), bots };
+      delete cfg.qqOfficial.appId;
+      delete cfg.qqOfficial.appSecret;
+      delete cfg.qqOfficial.enabled;
       writeJson(configFile(), cfg);
-      pushLog(`官方机器人配置已保存（${enabled ? '启用' : '停用'}，AppID ${appId ? appId.slice(0, 4) + '…' : '未填'}）`, 'sys', 'qqofficial');
-      let started = null;
-      let stopped = null;
-      if (enabled) started = startQqOfficial();
-      else stopped = stopQqOfficial();
-      await Promise.resolve(stopped?.done ?? null);
+      pushLog(`官方机器人「${name || appId.slice(0, 4) + '…'}」配置已保存（${enabled ? '启用' : '停用'}）`, 'sys', 'qqofficial');
+      const started = enabled ? startQqOfficial(appId) : null;
       return sendJson(res, { ok: true, ...qqOfficialState(), startedOk: started ? started.ok : null });
     }
 
@@ -7794,11 +7977,10 @@ export async function startServer(preferred = PORT) {
       if (phoneSettings().enabled) startPhoneListener();
       scheduleNapcatUpdateCheck();
       scheduleAppUpdateCheck();
-      // QQ 官方机器人：配置里开了就随软件一起起来（没配/没开就是空操作）
+      // QQ 官方机器人（多号）：配置里启用的号随软件一起起来
       try {
-        const o = (loadConfig().qqOfficial ?? {});
-        if (o.enabled === true && String(o.appId ?? '').trim() && String(o.appSecret ?? '').trim()) {
-          setTimeout(() => startQqOfficial(), 5000);
+        for (const bot of qqOfficialBotList()) {
+          if (bot.enabled && bot.appSecret) setTimeout(() => startQqOfficial(bot.appId), 5000);
         }
       } catch { /* 配置读不了就当没配 */ }
       if (port !== preferred) {

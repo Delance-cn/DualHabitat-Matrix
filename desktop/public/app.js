@@ -1046,32 +1046,67 @@ function renderStatus() {
       </div>`;
   }
 
-  /* QQ 官方机器人面板：QQ 通道才显示（data-pf 由 applyPlatform 控制），
-     这里只负责把状态画出来；表单值只在首次加载时填，别覆盖正在编辑的内容 */
-  const qof = S.qqOfficial;
-  const qofMeta = $('#qof-meta');
-  if (qof && qofMeta) {
-    if (!qof.enabled) {
-      qofMeta.textContent = '未启用 —— 填好 AppID/AppSecret，勾上开关，点「保存并启动」。';
-    } else if (qof.running && qof.connected) {
-      const last = qof.lastEventAt ? `，最近消息 ${new Date(qof.lastEventAt).toLocaleTimeString('zh-CN')}` : '';
-      qofMeta.textContent = `已连接${qof.botName ? `（机器人「${qof.botName}」）` : ''}：收到 ${qof.received} 条、回出 ${qof.replied} 条${last}`;
-    } else if (qof.running) {
-      qofMeta.textContent = `进程在跑，网关还没就绪${qof.lastError ? `（${qof.lastError}）` : '，凭证或网络问题看日志页「官方QQ」'}`;
-    } else {
-      qofMeta.textContent = '配置已保存但没在运行 —— 点「保存并启动」拉起来。';
+  /* QQ 官方机器人多号面板：列表 + 添加/编辑表单。QQ 通道才显示（data-pf 控制） */
+  const qofBots = S.qqOfficial?.bots ?? [];
+  const qofList = $('#qof-list');
+  if (qofList) {
+    if (!qofList.dataset.bound) {
+      qofList.dataset.bound = '1';
+      qofList.addEventListener('click', async (e) => {
+        const b = e.target.closest('button');
+        if (!b) return;
+        const appId = b.dataset.app;
+        if (b.dataset.act === 'start') {
+          const r = await post('/api/qq-official', { action: 'start', appId });
+          toast(r.ok === false ? (r.error ?? '启动失败') : '已启动');
+          await refreshState();
+        } else if (b.dataset.act === 'stop') {
+          const r = await post('/api/qq-official', { action: 'stop', appId });
+          toast(r.ok === false ? (r.error ?? '停止失败') : '已停止');
+          await refreshState();
+        } else if (b.dataset.act === 'edit') {
+          const bot = (S.qqOfficial?.bots ?? []).find((x) => x.appId === appId);
+          if (!bot) return;
+          $('#qof-name').value = bot.name ?? '';
+          $('#qof-app-id').value = bot.appId;
+          $('#qof-app-secret').value = '';
+          $('#qof-app-secret').placeholder = '已保存（要换再填）';
+          $('#qof-clear').hidden = false;
+          setResult('#qof-result', `正在编辑「${bot.name}」，改完点保存`, 'busy');
+          $('#qof-app-id').focus();
+        } else if (b.dataset.act === 'delete') {
+          const bot = (S.qqOfficial?.bots ?? []).find((x) => x.appId === appId);
+          const ok = await confirmBox({
+            title: `删除官方机器人「${bot?.name ?? appId}」？`,
+            text: '配置和登录状态一起删。这个机器人本身在开放平台不受影响，以后想用再添加回来。',
+            okLabel: '删除',
+            danger: true
+          });
+          if (!ok) return;
+          const r = await post('/api/qq-official', { action: 'delete', appId });
+          toast(r.ok === false ? (r.error ?? '删除失败') : '已删除');
+          await refreshState();
+        }
+      });
     }
-    const stopBtn = $('#qof-stop');
-    if (stopBtn) stopBtn.hidden = !qof.running;
-    if (!qofMeta.dataset.filled) {
-      qofMeta.dataset.filled = '1';
-      const idEl = $('#qof-app-id');
-      if (idEl && !idEl.value) idEl.value = qof.appId ?? '';
-      const enEl = $('#qof-enabled');
-      if (enEl) enEl.checked = qof.enabled === true;
-      const secEl = $('#qof-app-secret');
-      if (secEl && qof.appSecretSet) secEl.placeholder = '已保存（要换再填）';
-    }
+    qofList.innerHTML = qofBots.length
+      ? qofBots.map((bot) => {
+          const state = !bot.running
+            ? '<span class="badge">未运行</span>'
+            : bot.connected
+              ? `<span class="badge ok">已连接${bot.botName ? `「${esc(bot.botName)}」` : ''}</span>`
+              : '<span class="badge warn">连接中…</span>';
+          const stat = bot.running ? `收 ${bot.received} / 回 ${bot.replied}` : (bot.lastError ? esc(bot.lastError.slice(0, 60)) : '');
+          return `<div class="pool-item" style="align-items:center;gap:10px">
+            <span class="led ${bot.running ? (bot.connected ? 'on' : 'warn pulse') : ''}"></span>
+            <span class="pool-name" style="flex:1">${esc(bot.name)} <span class="hint">${esc(bot.appId)}</span><span class="hint" style="margin-left:10px">${stat}</span></span>
+            ${state}
+            <button class="btn btn-sm" data-act="${bot.running ? 'stop' : 'start'}" data-app="${esc(bot.appId)}">${bot.running ? '停止' : '启动'}</button>
+            <button class="btn btn-sm btn-ghost" data-act="edit" data-app="${esc(bot.appId)}">编辑</button>
+            <button class="btn btn-sm btn-ghost" data-act="delete" data-app="${esc(bot.appId)}">删除</button>
+          </div>`;
+        }).join('')
+      : '<div class="empty">还没有官方机器人 —— 在下面填 AppID/AppSecret 添加第一个。</div>';
   }
 
   const svcBox = $('#status-services');
@@ -1200,9 +1235,71 @@ async function loadWxOverview() {
   renderWxOverview();
 }
 
+/* 微信多账号：当前在登录页操作哪个号（wx1..wx10），纯前端选中态 */
+let wxAccount = 'wx1';
+
+function wxAccountData() {
+  const list = S?.wechat?.accounts;
+  if (Array.isArray(list) && list.length) return list.find((a) => a.id === wxAccount) ?? list[0];
+  return S?.wechat ?? {};
+}
+
+/** 登录页顶部的账号条：选中哪个号，下面的状态/二维码/启停就作用于哪个号。 */
+function renderWxAccounts() {
+  const box = $('#wx-accounts');
+  if (!box) return;
+  const list = S?.wechat?.accounts ?? [{ id: 'wx1' }];
+  if (!list.some((a) => a.id === wxAccount)) wxAccount = list[0].id;
+  box.innerHTML =
+    list.map((a) => `
+      <button class="btn btn-sm ${a.id === wxAccount ? 'btn-primary' : 'btn-ghost'}" data-wx-acc="${esc(a.id)}" title="${a.loggedIn ? '已登录' : a.running ? '等扫码' : '未启动'}">
+        <span class="led ${a.running ? (a.loggedIn ? 'on' : 'warn pulse') : ''}" style="margin-right:4px"></span>${esc(a.id)}
+      </button>`).join('') +
+    (list.length < 10
+      ? '<button class="btn btn-sm btn-ghost" data-wx-acc-add="1" title="最多 10 个微信账号，每个号独立扫码登录">＋ 添加账号</button>'
+      : '') +
+    (wxAccount !== 'wx1'
+      ? `<button class="btn btn-sm btn-ghost" data-wx-acc-del="${esc(wxAccount)}" title="删掉这个号（登录态一起删）">删除 ${esc(wxAccount)}</button>`
+      : '');
+}
+
+document.addEventListener('click', async (e) => {
+  const chip = e.target.closest('[data-wx-acc]');
+  if (chip) {
+    wxAccount = chip.dataset.wxAcc;
+    renderWxAccounts();
+    renderWxOverview();
+    return;
+  }
+  if (e.target.closest('[data-wx-acc-add]')) {
+    const r = await post('/api/wechat/accounts', { action: 'add' });
+    if (r.ok === false) return toast(r.error ?? '加不了');
+    toast(`已添加 ${r.added}，扫码登录后它就是一台独立机器人`);
+    await refreshState();
+    return;
+  }
+  const del = e.target.closest('[data-wx-acc-del]');
+  if (del) {
+    const id = del.dataset.wxAccDel;
+    const ok = await confirmBox({
+      title: `删除微信账号 ${id}？`,
+      text: '登录态和会话一起删，这个号立即停止收发。wx1 是默认号不能删。',
+      okLabel: '删除',
+      danger: true
+    });
+    if (!ok) return;
+    const r = await post('/api/wechat/accounts', { action: 'remove', id });
+    if (r.ok === false) return toast(r.error ?? '删除失败');
+    wxAccount = 'wx1';
+    toast('已删除');
+    await refreshState();
+  }
+});
+
 function renderWxOverview() {
   if (!S) return;
-  const w = S.wechat ?? {};
+  renderWxAccounts();
+  const w = wxAccountData();
   const on = w.running === true;
 
   setLed('#wxo-led', w.loggedIn ? 'on' : on ? 'warn pulse' : '');
@@ -1758,7 +1855,8 @@ async function svcAction(kind, act) {
   }
   const out = platform() === 'wechat' ? '#wxo-result' : '#up-result';
   setResult(out, act === 'start' ? '正在启动…' : '正在停止…', 'busy');
-  const r = await post(path);
+  // 微信多账号：登录页的启停按钮作用于当前选中的号
+  const r = await post(path, kind === 'wechat' && platform() === 'wechat' ? { account: wxAccount } : {});
   setResult(out, r.ok === false ? r.error : '已执行', r.ok === false ? 'err' : 'ok');
   await new Promise((res) => setTimeout(res, 1200));
   await refreshState();
@@ -1827,28 +1925,38 @@ $('#btn-napcat-panel').addEventListener('click', () => openNapcatPanel());
 
 $('#status-napcat-login')?.addEventListener('click', () => openNapcatPanel());
 
-/* QQ 官方机器人：保存（=启用+启动）和停止。凭证只回显「已保存」，不往回带。 */
-$('#qof-save')?.addEventListener('click', async (e) => {
-  await busy(e.target.closest('button'), '保存中…', async () => {
-    const body = {
-      enabled: $('#qof-enabled').checked === true,
-      appId: $('#qof-app-id').value.trim()
-    };
-    const secret = $('#qof-app-secret').value.trim();
-    if (secret) body.appSecret = secret; // 留空 = 沿用已存的
-    const r = await post('/api/qq-official', body);
-    if (r.ok === false) return setResult('#qof-result', r.error, 'err');
-    $('#qof-app-secret').value = '';
-    setResult('#qof-result', r.running ? '已启动 ✓（等网关连上，几秒内状态更新）' : '已保存 ✓', 'saved');
-    await refreshState();
-  });
+/* QQ 官方机器人多号：添加/编辑保存（启用即启动）和取消编辑 */
+function qofResetForm() {
+  $('#qof-name').value = '';
+  $('#qof-app-id').value = '';
+  $('#qof-app-secret').value = '';
+  $('#qof-app-secret').placeholder = '新号必填；已保存的留空沿用';
+  $('#qof-clear').hidden = true;
+}
+
+$('#qof-clear')?.addEventListener('click', () => {
+  qofResetForm();
+  setResult('#qof-result', '', '');
 });
 
-$('#qof-stop')?.addEventListener('click', async (e) => {
-  await busy(e.target.closest('button'), '停止中…', async () => {
-    const r = await post('/api/qq-official', { action: 'stop' });
+$('#qof-save')?.addEventListener('click', async (e) => {
+  await busy(e.target.closest('button'), '保存中…', async () => {
+    const appId = $('#qof-app-id').value.trim();
+    const secret = $('#qof-app-secret').value.trim();
+    if (!/^\d{6,15}$/.test(appId)) return setResult('#qof-result', 'AppID 应该是一串数字', 'err');
+    if (!secret) {
+      const existing = (S.qqOfficial?.bots ?? []).some((b) => b.appId === appId);
+      if (!existing) return setResult('#qof-result', '新号要把 AppSecret 填上', 'err');
+    }
+    const r = await post('/api/qq-official', {
+      appId,
+      name: $('#qof-name').value.trim() || undefined,
+      ...(secret ? { appSecret: secret } : {}),
+      enabled: true
+    });
     if (r.ok === false) return setResult('#qof-result', r.error, 'err');
-    setResult('#qof-result', '已停止', 'busy');
+    qofResetForm();
+    setResult('#qof-result', '已保存并启动 ✓（等网关连上，几秒内状态更新）', 'saved');
     await refreshState();
   });
 });
