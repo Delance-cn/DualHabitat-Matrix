@@ -37,9 +37,21 @@ QQ 消息 ──► NapCat（OneBot v11，HTTP 3000 / WS 3001）──► 本桥
                     └─► MCP：snowluma（QQ 工具安全子集）+ web-search-safe（联网搜索）+ video-safe（抖音/B站视频）
 ```
 
-## 快速开始
+## 快速开始（普通用户：直接下安装包）
 
-依赖：**Node.js ≥ 22**、[NapCat](https://napcat.oqq.icu/)（OneBot v11，HTTP 3000 + WS 3001，Token 鉴权）。
+不需要 Node、不需要克隆本仓库——**桌面安装包**双击即用（自带模型引擎、桥接和 NapCat）：
+
+- 全部版本：<https://github.com/Delance-cn/DualHabitat-Matrix/releases>
+- GitHub 直连不通时，把镜像前缀拼在下载链接前面：
+  - `https://ghproxy.cn/https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/…`
+  - 备用：`https://ghfast.top/…`（软件 0.5.9 起内置下载线路自动测速，装上 0.5.9+ 后无需手动拼）
+- 安装包校验（SHA256 / Sigstore）：[docs/VERIFY-RELEASE.md](docs/VERIFY-RELEASE.md)
+
+想要 QQ 官方机器人（开放平台接口、带机器人标识、不封号）：装 0.6.0+，配置步骤见 [docs/QQ-OFFICIAL-BOT.md](docs/QQ-OFFICIAL-BOT.md)。
+
+## 快速开始（源码运行）
+
+依赖：**Node.js ≥ 22**（<https://nodejs.org/>）、[NapCat](https://napcat.oqq.icu/)（OneBot v11，HTTP 3000 + WS 3001，Token 鉴权）。
 
 ```bash
 npm install
@@ -173,6 +185,7 @@ bailian/qwen3.8-max → bailian/kimi-k3 → bailian/MiniMax-M2.5 → bailian/qwe
 ## 文档
 
 - 模型接入与二次开发：[docs/LLM-INTEGRATION.md](docs/LLM-INTEGRATION.md)
+- QQ 官方机器人配置：[docs/QQ-OFFICIAL-BOT.md](docs/QQ-OFFICIAL-BOT.md)
 - 上游移植记录：[docs/PHASE0-FINDINGS.md](docs/PHASE0-FINDINGS.md)、[docs/PHASE1-PORT.md](docs/PHASE1-PORT.md)
 - 会话权限与安全：[RULES.md](RULES.md)
 - 发布包校验（Sigstore）：[docs/VERIFY-RELEASE.md](docs/VERIFY-RELEASE.md)
