@@ -58,6 +58,25 @@ const { DRIVERS, UNVERIFIED } = await loadBackend('cli/drivers.js');
 const { resolveBin } = await loadBackend('cli/engine.js');
 
 /**
+ * QQ 多号的账号模型、端口分配、配置形状都跟桥接共用一份实现。
+ *
+ * 桌面端绝不能自己再算一套端口/账号 id：桥接读的是 config.json 里的
+ * platforms.qq.accounts，桌面端写进去的每个字段都必须和它理解的一致。
+ * 打包态桥接在 resources/bridge，开发态在仓库根，两处都认。
+ */
+const qqAccountsFile = fs.existsSync(path.join(DEFAULT_ROOT, 'src', 'qq-accounts.js'))
+  ? path.join(DEFAULT_ROOT, 'src', 'qq-accounts.js')
+  : path.resolve(here, '..', 'src', 'qq-accounts.js');
+const {
+  DEFAULT_ACCOUNT_ID,
+  accountPorts,
+  nextAccountId,
+  normalizeQQAccounts,
+  toConfigAccount,
+  isValidAccountId
+} = await import(pathToFileURL(qqAccountsFile).href);
+
+/**
  * 桌面端自己的设置（不进版本库）。
  * 为什么不放 config.json：那是桥接的配置，混进 UI 状态会互相污染。
  *
@@ -1546,6 +1565,9 @@ function relayText(stream, into) {
  * ══════════════════════════════════════════════════════════════════════════ */
 
 let napcatLaunch = { startedAt: null, pid: null, child: null };
+/* NapCat 多号：账号 id（qq1/qq2…）→ 该号自己的启动器进程。
+   `napcatLaunch` 保留为 qq1 的视图 —— 旧代码（看护/一键启动/状态）全指着它。 */
+const napcatProcs = new Map();
 // 上次真正拉起 NapCat 的目录。用户中途改了设置也要能收掉旧目录里的进程。
 let lastNapcatDir = '';
 
@@ -1658,6 +1680,233 @@ function napcatSettings() {
   };
 }
 
+/** 账号序号：qq2 → 1（0 起）。 */
+function napcatOrdinal(accountId) {
+  const m = /^qq(\d+)$/.exec(String(accountId ?? ''));
+  return m ? Math.max(0, Number(m[1]) - 1) : 0;
+}
+
+/**
+ * NapCat 账号清单。
+ *
+ * 唯一数据源是 config.json 的 platforms.qq.accounts（桥接也读它）；
+ * 没有这个字段时，用桌面端 settings.napcat 合成 qq1，等用户第一次
+ * 添加/编辑账号时再整体写回 config.json。
+ */
+function napcatAccounts(cfg = loadConfig()) {
+  const primary = napcatSettings();
+  const { accounts } = normalizeQQAccounts({ ...cfg, snowluma: cfg.snowluma });
+  return accounts.map((acc) => {
+    const ports = accountPorts(napcatOrdinal(acc.id));
+    const dir = acc.dir || (acc.id === DEFAULT_ACCOUNT_ID ? primary.dir : '');
+    const configDir = dir ? findNapcatConfigDir(dir) : '';
+    return {
+      ...acc,
+      dir,
+      configDir,
+      exe: primary.exe,
+      waitMs: primary.waitMs,
+      bundled: primary.bundled,
+      wsPort: Number(acc.wsPort) || ports.wsPort,
+      httpPort: Number(acc.httpPort) || ports.httpPort,
+      webuiPort: Number(acc.webuiPort) || ports.webuiPort,
+      configured: Boolean(dir && fs.existsSync(path.join(dir, primary.exe)))
+    };
+  });
+}
+
+function napcatAccount(accountId = DEFAULT_ACCOUNT_ID, cfg = loadConfig()) {
+  const id = isValidAccountId(String(accountId)) ? String(accountId) : DEFAULT_ACCOUNT_ID;
+  return napcatAccounts(cfg).find((a) => a.id === id) ?? null;
+}
+
+function napcatAccountState(account) {
+  const rec = napcatProcs.get(account.id);
+  const configDir = account.configDir || (account.dir ? findNapcatConfigDir(account.dir) : '');
+  const webui = configDir ? readJson(path.join(configDir, 'webui.json')) : {};
+  return {
+    id: account.id,
+    qq: account.qq,
+    label: account.label,
+    dir: account.dir,
+    configDir,
+    enabled: account.enabled !== false,
+    configured: account.configured,
+    wsPort: account.wsPort,
+    httpPort: account.httpPort,
+    webuiPort: Number(webui.port) || account.webuiPort,
+    // 启动器退出后 QQ 可能还在跑：managed 表示「这个号是我们拉起的、还没主动停」。
+    running: Boolean(rec?.child || rec?.managed),
+    pid: rec?.child?.pid ?? null,
+    startedAt: rec?.startedAt ?? null,
+    panel: configDir ? napcatPanel(account.id) : { ok: false, error: '找不到 webui.json（先启动一次 NapCat）' }
+  };
+}
+
+function napcatAccountsState() {
+  return napcatAccounts().map(napcatAccountState);
+}
+
+/**
+ * 把账号清单写回 config.json。
+ *
+ * 桌面端 settings.json 只放「默认号」的路径/端口；多号必须落在桥接读的
+ * platforms.qq.accounts 里，否则桥接根本不知道 qq2 的存在。
+ */
+function writeNapcatAccounts(accounts) {
+  const cfg = loadConfig();
+  const list = accounts.map((acc) => toConfigAccount({
+    ...acc,
+    homeDir: acc.homeDir || acc.configDir || ''
+  }));
+  cfg.platforms = cfg.platforms ?? {};
+  cfg.platforms.qq = cfg.platforms.qq ?? {};
+  cfg.platforms.qq.accounts = list;
+  const primary = list.find((a) => a.id === DEFAULT_ACCOUNT_ID);
+  if (primary) {
+    cfg.platforms.qq.dir = primary.dir || cfg.platforms.qq.dir || '';
+    cfg.snowluma = cfg.snowluma ?? {};
+    if (primary.qq) cfg.qq = primary.qq;
+    cfg.snowluma.homeDir = primary.homeDir || cfg.snowluma.homeDir || '';
+    cfg.snowluma.wsUrl = `ws://127.0.0.1:${primary.wsPort}`;
+    cfg.snowluma.httpUrl = `http://127.0.0.1:${primary.httpPort}`;
+    if (primary.token) cfg.snowluma.accessToken = primary.token;
+  }
+  writeJson(configFile(), cfg);
+  return list;
+}
+
+/**
+ * 确保该号的 OneBot WebSocket/HTTP 端口与 token 落在它自己的
+ * `onebot11_<QQ>.json` 里（NapCat 登录后读这个文件）。
+ *
+ * 只补齐缺失字段，不覆盖用户已经调好的其它设置；token 缺失时生成一次，
+ * 并回写给调用方，让 config.json 里的账号 token 与 NapCat 保持一致。
+ */
+function ensureNapcatOneBotConfig(account) {
+  const dir = account.configDir || findNapcatConfigDir(account.dir);
+  if (!dir) return { ok: false, error: '找不到 NapCat 配置目录（先启动一次 NapCat 生成 config）' };
+  // 同时写默认档和账号档：NapCat 登录前读 onebot11.json，登录后读 onebot11_<QQ>.json。
+  // 每个号本来就是独立目录，两份写同一组端口不会互相影响，却能避免登录前的空窗期
+  // 还用着 3001/3000 跟别的号撞端口。
+  const files = [path.join(dir, 'onebot11.json')];
+  if (account.qq) files.push(path.join(dir, `onebot11_${account.qq}.json`));
+  const loaded = files.map((file) => ({ file, cfg: fs.existsSync(file) ? readJson(file) : {} }));
+  const existing = loaded.flatMap(({ cfg }) => [
+    ...(Array.isArray(cfg.network?.websocketServers) ? cfg.network.websocketServers.slice(0, 1) : []),
+    ...(Array.isArray(cfg.network?.httpServers) ? cfg.network.httpServers.slice(0, 1) : [])
+  ]);
+  const token = account.token || existing.find((x) => x?.token)?.token || randomBytes(16).toString('hex');
+
+  for (const { file, cfg } of loaded) {
+    cfg.network = cfg.network ?? {};
+    const ws = Array.isArray(cfg.network.websocketServers) ? cfg.network.websocketServers : [];
+    const http = Array.isArray(cfg.network.httpServers) ? cfg.network.httpServers : [];
+    cfg.network.websocketServers = [
+      { ...(ws[0] ?? {}), enabled: true, host: '127.0.0.1', port: account.wsPort, token },
+      ...ws.slice(1)
+    ];
+    cfg.network.httpServers = [
+      { ...(http[0] ?? {}), enabled: true, host: '127.0.0.1', port: account.httpPort, token },
+      ...http.slice(1)
+    ];
+    writeJson(file, cfg);
+  }
+
+  // WebUI 端口也按号错开；token 保留 NapCat 自己生成的那个。
+  const webuiFile = path.join(dir, 'webui.json');
+  if (fs.existsSync(webuiFile)) {
+    const webui = readJson(webuiFile);
+    if (Number(webui.port) !== Number(account.webuiPort)) {
+      webui.port = account.webuiPort;
+      writeJson(webuiFile, webui);
+    }
+  }
+  return { ok: true, file: files[files.length - 1], token };
+}
+
+/** 新增一个 NapCat 号：必须指向一份独立的 NapCat 目录。 */
+function addNapcatAccount(body = {}) {
+  const exe = napcatSettings().exe;
+  const rawDir = String(body.dir ?? '').trim();
+  if (!rawDir) return { ok: false, error: '请选择这个号自己的 NapCat 目录' };
+  const dir = path.resolve(rawDir);
+  if (!fs.existsSync(path.join(dir, exe))) return { ok: false, error: `目录里没有 ${exe}：${dir}` };
+  const accounts = napcatAccounts();
+  if (accounts.some((a) => a.dir && path.resolve(a.dir) === dir)) {
+    return { ok: false, error: '这个 NapCat 目录已被另一个号使用；多号必须每个号一份独立目录' };
+  }
+  const id = nextAccountId(accounts);
+  const ports = accountPorts(napcatOrdinal(id));
+  const account = {
+    id,
+    qq: String(body.qq ?? '').replace(/\D/g, ''),
+    label: String(body.label ?? '').trim() || `QQ ${id}`,
+    enabled: body.enabled !== false,
+    dir,
+    homeDir: '',
+    wsPort: ports.wsPort,
+    httpPort: ports.httpPort,
+    webuiPort: ports.webuiPort,
+    token: '',
+    policy: {}
+  };
+  // 先把 token 写进这个号自己的 NapCat 配置，再回写 config.json：
+  // 否则 bridge 读到空 token，qq2 会连不上（NapCat 已经生成了 token，但账号里没记）。
+  const ensured = ensureNapcatOneBotConfig(account);
+  if (ensured.ok && ensured.token) account.token = ensured.token;
+  writeNapcatAccounts([...accounts, account]);
+  pushLog(`已添加 NapCat 账号 ${id}（${dir}）`, 'sys', 'napcat');
+  const fresh = napcatAccount(id);
+  return { ok: true, account: fresh ? napcatAccountState(fresh) : null };
+}
+
+/** 改一个号：qq / 备注 / 目录 / 启用状态。 */
+function updateNapcatAccount(accountId, body = {}) {
+  const id = isValidAccountId(String(accountId)) ? String(accountId) : '';
+  if (!id) return { ok: false, error: '账号 id 无效' };
+  const accounts = napcatAccounts();
+  const index = accounts.findIndex((a) => a.id === id);
+  if (index < 0) return { ok: false, error: `账号 ${id} 不存在` };
+  const next = { ...accounts[index] };
+  if (body.qq !== undefined) next.qq = String(body.qq).replace(/\D/g, '');
+  if (body.label !== undefined) next.label = String(body.label).trim();
+  if (body.enabled !== undefined) next.enabled = body.enabled !== false;
+  if (body.dir !== undefined) {
+    const dir = path.resolve(String(body.dir).trim());
+    if (!fs.existsSync(path.join(dir, napcatSettings().exe))) {
+      return { ok: false, error: `目录里没有 ${napcatSettings().exe}：${dir}` };
+    }
+    if (accounts.some((a) => a.id !== id && a.dir && path.resolve(a.dir) === dir)) {
+      return { ok: false, error: '这个 NapCat 目录已被另一个号使用' };
+    }
+    next.dir = dir;
+    next.configDir = findNapcatConfigDir(dir);
+  }
+  // 与新增同理：ensure 可能生成/发现 token，先同步到账号再落盘。
+  const ensured = ensureNapcatOneBotConfig(next);
+  if (ensured.ok && ensured.token) next.token = ensured.token;
+  accounts[index] = next;
+  writeNapcatAccounts(accounts);
+  const fresh = napcatAccount(id);
+  return { ok: true, account: fresh ? napcatAccountState(fresh) : null };
+}
+
+/** 删一个号：qq1 是默认号，不删；运行中的先停。 */
+function removeNapcatAccount(accountId) {
+  const id = isValidAccountId(String(accountId)) ? String(accountId) : '';
+  if (!id) return { ok: false, error: '账号 id 无效' };
+  if (id === DEFAULT_ACCOUNT_ID) return { ok: false, error: '默认号 qq1 不能删除' };
+  const runningRec = napcatProcs.get(id);
+  if (runningRec?.child || runningRec?.managed) return { ok: false, error: `账号 ${id} 还在运行，先停止再删` };
+  const accounts = napcatAccounts();
+  if (!accounts.some((a) => a.id === id)) return { ok: false, error: `账号 ${id} 不存在` };
+  writeNapcatAccounts(accounts.filter((a) => a.id !== id));
+  stopNapcatTail(id);
+  pushLog(`已删除 NapCat 账号 ${id}（会话数据保留，不复用编号）`, 'sys', 'napcat');
+  return { ok: true, removed: id };
+}
+
 /**
  * 起 NapCat。
  *
@@ -1674,38 +1923,74 @@ function napcatSettings() {
  * ⚠️ 停它**不要**用同目录的 `napcat.kill.qq.bat`：那脚本里"输入 0"那条是
  * `taskkill /f /im QQ.exe`，会把用户自己日常在用的 QQ 一起杀掉。
  */
-function startNapcat() {
-  const n = napcatSettings();
-  if (!n.dir) return { ok: false, error: '还没配 NapCat 目录（去「运行」页填）' };
-  if (!fs.existsSync(n.dir)) return { ok: false, error: `NapCat 目录不存在：${n.dir}` };
+function startNapcat(accountId = DEFAULT_ACCOUNT_ID) {
+  const id = isValidAccountId(String(accountId)) ? String(accountId) : DEFAULT_ACCOUNT_ID;
+  const acc = napcatAccount(id);
+  if (!acc) return { ok: false, error: `账号 ${id} 不在配置里` };
+  if (acc.enabled === false) return { ok: false, error: `账号 ${id} 已禁用` };
+  if (napcatProcs.get(id)?.child) return { ok: false, error: `账号 ${id} 已在运行` };
+  if (!acc.dir) return { ok: false, error: `账号 ${id} 还没配 NapCat 目录` };
+  if (!fs.existsSync(acc.dir)) return { ok: false, error: `NapCat 目录不存在：${acc.dir}` };
 
-  const exe = path.join(n.dir, n.exe);
+  const exe = path.join(acc.dir, acc.exe);
   if (!fs.existsSync(exe)) return { ok: false, error: `找不到启动器：${exe}` };
-  lastNapcatDir = n.dir;
 
+  // 多号必须各用各的目录：同一个 NapCat Shell 目录只能跑一个 QQ。
+  const clash = [...napcatProcs.entries()].find(
+    ([otherId, other]) => otherId !== id && (other.child || other.managed) && other.dir && path.resolve(other.dir) === path.resolve(acc.dir)
+  );
+  if (clash) return { ok: false, error: `NapCat 目录正被账号 ${clash[0]} 使用；多号必须每个号一份独立目录` };
+
+  lastNapcatDir = acc.dir;
   // 没开文件日志的话，NapCat 的输出只会进命名管道，日志页永远是空的
-  ensureNapcatFileLog();
+  ensureNapcatFileLog(acc.dir);
 
-  const child = spawn(exe, n.qq ? [String(n.qq)] : [], {
-    cwd: n.dir,
+  // 启动前把该号的 WS/HTTP 端口与 token 写进它自己的 onebot11_<QQ>.json。
+  const onebot = ensureNapcatOneBotConfig(acc);
+  if (onebot.token && onebot.token !== acc.token) {
+    try {
+      const list = napcatAccounts();
+      const index = list.findIndex((a) => a.id === id);
+      if (index >= 0) {
+        list[index].token = onebot.token;
+        writeNapcatAccounts(list);
+      }
+    } catch { /* 写不进去不影响启动，桥接会按旧 token 先试 */ }
+  }
+
+  const child = spawn(exe, acc.qq ? [String(acc.qq)] : [], {
+    cwd: acc.dir,
     windowsHide: true,
     detached: false,
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
-  napcatLaunch = { startedAt: Date.now(), pid: child.pid, child };
-  pushLog(`NapCat 启动中（QQ ${n.qq || '未填'}）`, 'sys', 'napcat');
-  startNapcatTail();
-  pushLog('NapCat 在后台跑，输出直接进这里；要扫码登录就用上面的「打开 NapCat 面板」', 'sys', 'napcat');
+  const state = { startedAt: Date.now(), pid: child.pid, child, dir: acc.dir, managed: true };
+  napcatProcs.set(id, state);
+  if (id === DEFAULT_ACCOUNT_ID) napcatLaunch = { startedAt: state.startedAt, pid: child.pid, child };
+  pushLog(`[${id}] NapCat 启动中（QQ ${acc.qq || '未填'}，WS ${acc.wsPort}）`, 'sys', 'napcat');
+  startNapcatTail(id);
+  pushLog(`[${id}] NapCat 在后台跑；扫码登录用「打开 NapCat 面板」`, 'sys', 'napcat');
 
   relay(child.stdout, 'out', 'napcat');
   relay(child.stderr, 'err', 'napcat');
   child.on('close', (code) => {
-    if (napcatLaunch.child === child) napcatLaunch = { startedAt: null, pid: null, child: null };
-    pushLog(`NapCat 启动器已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'napcat');
+    const prev = napcatProcs.get(id);
+    // 启动器退出 ≠ QQ 退出：保留 managed，让看护按端口继续管这个号。
+    if (prev?.child === child) {
+      napcatProcs.set(id, {
+        child: null,
+        startedAt: prev.startedAt,
+        exitCode: code,
+        dir: acc.dir,
+        managed: true
+      });
+    }
+    if (id === DEFAULT_ACCOUNT_ID && napcatLaunch.child === child) napcatLaunch = { startedAt: null, pid: null, child: null };
+    pushLog(`[${id}] NapCat 启动器已退出（code ${code}）`, code === 0 ? 'sys' : 'err', 'napcat');
   });
 
-  return { ok: true, pid: child.pid };
+  return { ok: true, pid: child.pid, account: id };
 }
 
 /* ── 收进程树 ────────────────────────────────────────────────────────────
@@ -1819,11 +2104,25 @@ function listNapcatPids(dir) {
  * 返回里的 `done` 是个 Promise —— 退出流程要等它，不能 app 先没了、
  * taskkill 还在半路。
  */
-function stopNapcat() {
-  markManualStop('napcat');
-  const launchedPid = napcatLaunch.pid;
-  const dirs = [...new Set([napcatSettings().dir, lastNapcatDir].filter(Boolean))];
-  napcatLaunch = { startedAt: null, pid: null, child: null };
+function stopNapcat(accountId = DEFAULT_ACCOUNT_ID, { force = false } = {}) {
+  const id = isValidAccountId(String(accountId)) ? String(accountId) : DEFAULT_ACCOUNT_ID;
+  markManualStop(id === DEFAULT_ACCOUNT_ID ? 'napcat' : `napcat:${id}`);
+  const rec = napcatProcs.get(id);
+  const acc = napcatAccount(id);
+  const launchedPid = rec?.child?.pid ?? null;
+  const dirs = [...new Set([acc?.dir, rec?.dir].filter(Boolean))];
+  // 配置被手改成同一个目录时，停一个号不能顺手把另一个号的进程收掉。
+  const conflict = force ? null : [...napcatProcs.entries()].find(
+    ([otherId, other]) => otherId !== id && (other.child || other.managed) && other.dir &&
+      dirs.some((dir) => path.resolve(dir) === path.resolve(other.dir))
+  );
+  if (conflict) {
+    const message = `NapCat 目录正被账号 ${conflict[0]} 使用；多号必须每个号一份独立目录`;
+    pushLog(`[${id}] 停止被拒绝：${message}`, 'err', 'napcat');
+    return withDone({ ok: false, error: message }, Promise.resolve());
+  }
+  napcatProcs.set(id, { child: null, startedAt: null, exitCode: null, dir: rec?.dir || acc?.dir || '', managed: false });
+  if (id === DEFAULT_ACCOUNT_ID) napcatLaunch = { startedAt: null, pid: null, child: null };
   const targets = new Set();
   if (launchedPid) targets.add(launchedPid);
 
@@ -1834,9 +2133,10 @@ function stopNapcat() {
       }
 
       // 启动器 pid 已经死了、路径也认不出来时，退回只杀启动器镜像。
-      // 这条兜底不会碰 QQ.exe，所以最多是「没停干净」，不会误伤。
+      // 多号时绝不能这么做：那会把别的号的启动器一起收掉。
       let fallbackRan = false;
-      if (!targets.size && process.platform === 'win32') {
+      const otherRunning = [...napcatProcs.entries()].some(([otherId, other]) => otherId !== id && (other.child || other.managed));
+      if (!targets.size && !dirs.length && !otherRunning && process.platform === 'win32') {
         fallbackRan = true;
         await new Promise((resolve) => {
           let proc;
@@ -1856,7 +2156,7 @@ function stopNapcat() {
 
       // 本来就没在跑：别再来一轮「等它退出」的轮询，白等一秒。
       if (!targets.size && !fallbackRan) {
-        pushLog('NapCat 没在运行，跳过', 'sys', 'napcat');
+        pushLog(`[${id}] NapCat 没在运行，跳过`, 'sys', 'napcat');
         return { ok: true, killed: 0, remaining: [] };
       }
 
@@ -1870,9 +2170,9 @@ function stopNapcat() {
 
       const remaining = [...new Set((await Promise.all(dirs.map(listNapcatPids))).flat())];
       if (remaining.length) {
-        pushLog(`NapCat 还有 ${remaining.length} 个进程没退（pid ${remaining.join(', ')}）`, 'err', 'napcat');
+        pushLog(`[${id}] NapCat 还有 ${remaining.length} 个进程没退（pid ${remaining.join(', ')}）`, 'err', 'napcat');
       } else if (targets.size) {
-        pushLog(`NapCat 已停止（收掉 ${killedCount} 个进程）`, 'sys', 'napcat');
+        pushLog(`[${id}] NapCat 已停止（收掉 ${killedCount} 个进程）`, 'sys', 'napcat');
       }
       return { ok: remaining.length === 0, killed: killedCount, remaining };
     } catch (error) {
@@ -1880,8 +2180,28 @@ function stopNapcat() {
     }
   })();
 
-  pushLog('已请求停止 NapCat', 'sys', 'napcat');
-  return withDone({ ok: true, pid: launchedPid }, done);
+  pushLog(`已请求停止 NapCat 账号 ${id}`, 'sys', 'napcat');
+  return withDone({ ok: true, pid: launchedPid, account: id }, done);
+}
+
+/** 停掉所有 NapCat 号（退出软件时用）。 */
+function stopAllNapcat() {
+  const ids = [...new Set([...napcatProcs.keys(), ...napcatAccounts().map((a) => a.id)])];
+  const done = (async () => {
+    const results = [];
+    for (const id of ids) {
+      const result = stopNapcat(id, { force: true });
+      const detail = result?.done ? await result.done : null;
+      results.push({
+        account: id,
+        ok: result?.ok !== false && detail?.ok !== false,
+        killed: detail?.killed ?? 0,
+        remaining: detail?.remaining ?? []
+      });
+    }
+    return { ok: results.every((r) => r.ok), accounts: results };
+  })();
+  return withDone({ ok: true }, done);
 }
 
 /**
@@ -1891,13 +2211,14 @@ function stopNapcat() {
  * 根目录那个 `config/` 是空的 —— 而版本号会变（`9.9.33-52230` → …），
  * 所以只能搜，不能写死。
  */
-function findNapcatConfigDir() {
+function findNapcatConfigDir(rootDir = napcatSettings().dir) {
   const n = napcatSettings();
-  if (!n.dir) return '';
-  const direct = path.join(n.dir, 'config');
+  const root = rootDir || n.dir;
+  if (!root) return '';
+  const direct = path.join(root, 'config');
   if (fs.existsSync(path.join(direct, 'webui.json'))) return direct;
 
-  const versions = path.join(n.dir, 'versions');
+  const versions = path.join(root, 'versions');
   if (!fs.existsSync(versions)) return '';
   for (const v of fs.readdirSync(versions)) {
     const dir = path.join(versions, v, 'resources', 'app', 'napcat', 'config');
@@ -1914,17 +2235,18 @@ function findNapcatConfigDir() {
  * 我们这边读不到。结果是「日志 → NapCat」那一栏只有两行系统提示，看着像没跑。
  * 所以改成读 NapCat 自己写的文件日志（napcat.json 里 fileLog: true）。
  */
-function findNapcatLogDir() {
+function findNapcatLogDir(rootDir = napcatSettings().dir) {
   const n = napcatSettings();
-  if (!n.dir) return '';
-  const versions = path.join(n.dir, 'versions');
+  const root = rootDir || n.dir;
+  if (!root) return '';
+  const versions = path.join(root, 'versions');
   if (fs.existsSync(versions)) {
     for (const v of fs.readdirSync(versions)) {
       const dir = path.join(versions, v, 'resources', 'app', 'napcat', 'logs');
       if (fs.existsSync(dir)) return dir;
     }
   }
-  const direct = path.join(n.dir, 'logs');
+  const direct = path.join(root, 'logs');
   return fs.existsSync(direct) ? direct : '';
 }
 
@@ -1933,8 +2255,8 @@ function findNapcatLogDir() {
  *
  * 只改这一个字段，改之前留一份 .bak —— 那是他自己装的 NapCat，配置不该被无声改掉。
  */
-function ensureNapcatFileLog() {
-  const dir = findNapcatConfigDir();
+function ensureNapcatFileLog(rootDir = napcatSettings().dir) {
+  const dir = findNapcatConfigDir(rootDir);
   if (!dir) return { ok: false, error: '找不到 NapCat 配置目录' };
   const file = path.join(dir, 'napcat.json');
   if (!fs.existsSync(file)) return { ok: false, error: '没有 napcat.json' };
@@ -1955,29 +2277,42 @@ function ensureNapcatFileLog() {
 }
 
 /**
- * 追 NapCat 的日志文件。
+ * 追 NapCat 的日志文件（每个号一份）。
  *
  * 按字节增量读，只认到最后一个换行符为止 —— 一次写入可能停在半行，
  * 直接按字符串切会把一条日志切成两截。轮转（maxFiles 5）时文件变小，offset 归零重读。
  */
-let napcatTail = { dir: '', file: '', offset: 0, timer: null, hinted: false };
+const napcatTails = new Map();
 
-function startNapcatTail() {
-  if (napcatTail.timer) return;
-  const dir = findNapcatLogDir();
+function startNapcatTail(accountId = DEFAULT_ACCOUNT_ID) {
+  const id = isValidAccountId(String(accountId)) ? String(accountId) : DEFAULT_ACCOUNT_ID;
+  const existing = napcatTails.get(id);
+  if (existing?.timer) return;
+  const acc = napcatAccount(id);
+  const dir = findNapcatLogDir(acc?.dir);
   if (!dir) return;
-  napcatTail.dir = dir;
-  napcatTail.timer = setInterval(pumpNapcatLog, 1000);
-  pumpNapcatLog();
+  const state = { dir, file: '', offset: 0, timer: null, hinted: false };
+  state.timer = setInterval(() => pumpNapcatLog(id), 1000);
+  state.timer.unref?.();
+  napcatTails.set(id, state);
+  pumpNapcatLog(id);
 }
 
-function stopNapcatTail() {
-  if (napcatTail.timer) clearInterval(napcatTail.timer);
-  napcatTail = { dir: '', file: '', offset: 0, timer: null, hinted: false };
+function stopNapcatTail(accountId) {
+  if (accountId === undefined) {
+    for (const id of [...napcatTails.keys()]) stopNapcatTail(id);
+    return;
+  }
+  const id = isValidAccountId(String(accountId)) ? String(accountId) : DEFAULT_ACCOUNT_ID;
+  const state = napcatTails.get(id);
+  if (state?.timer) clearInterval(state.timer);
+  napcatTails.delete(id);
 }
 
-function pumpNapcatLog() {
-  const dir = napcatTail.dir;
+function pumpNapcatLog(accountId = DEFAULT_ACCOUNT_ID) {
+  const id = isValidAccountId(String(accountId)) ? String(accountId) : DEFAULT_ACCOUNT_ID;
+  const state = napcatTails.get(id);
+  const dir = state?.dir;
   if (!dir) return;
 
   let files = [];
@@ -1989,9 +2324,9 @@ function pumpNapcatLog() {
 
   if (!files.length) {
     // 只提示一次，别每秒刷屏
-    if (!napcatTail.hinted) {
-      napcatTail.hinted = true;
-      pushLog('NapCat 还没写出日志文件。开一次 NapCat（或点「一键启动」），文件日志就会开始记。', 'sys', 'napcat');
+    if (!state.hinted) {
+      state.hinted = true;
+      pushLog(`[${id}] NapCat 还没写出日志文件。开一次 NapCat（或点「一键启动」），文件日志就会开始记。`, 'sys', 'napcat');
     }
     return;
   }
@@ -2011,9 +2346,9 @@ function pumpNapcatLog() {
   }
   if (!newest) return;
 
-  if (newest !== napcatTail.file) {
-    napcatTail.file = newest;
-    napcatTail.offset = 0;
+  if (newest !== state.file) {
+    state.file = newest;
+    state.offset = 0;
   }
 
   const full = path.join(dir, newest);
@@ -2023,15 +2358,15 @@ function pumpNapcatLog() {
   } catch {
     return;
   }
-  if (size < napcatTail.offset) napcatTail.offset = 0;
-  if (size === napcatTail.offset) return;
+  if (size < state.offset) state.offset = 0;
+  if (size === state.offset) return;
 
   let buf;
   try {
     const fd = fs.openSync(full, 'r');
-    const len = size - napcatTail.offset;
+    const len = size - state.offset;
     buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, napcatTail.offset);
+    fs.readSync(fd, buf, 0, len, state.offset);
     fs.closeSync(fd);
   } catch {
     return;
@@ -2041,11 +2376,11 @@ function pumpNapcatLog() {
   const lastNl = buf.lastIndexOf(0x0a);
   if (lastNl < 0) return;
 
-  napcatTail.offset += lastNl + 1;
+  state.offset += lastNl + 1;
   const text = buf.subarray(0, lastNl + 1).toString('utf8');
   for (const line of text.split('\n')) {
     const clean = line.replace(/\r$/, '').replace(ANSI, '').trimEnd();
-    if (clean) pushLog(clean, 'out', 'napcat');
+    if (clean) pushLog(id === DEFAULT_ACCOUNT_ID ? clean : `[${id}] ${clean}`, 'out', 'napcat');
   }
 }
 
@@ -2055,14 +2390,16 @@ function pumpNapcatLog() {
  * 为什么把 token 也给前端：它本来就明文躺在 `webui.json` 里，而服务只监听
  * 127.0.0.1、页面同源 —— 本地自用，抄 token 只是折磨人。
  */
-function napcatPanel() {
-  const dir = findNapcatConfigDir();
+function napcatPanel(accountId = DEFAULT_ACCOUNT_ID) {
+  const acc = napcatAccount(accountId);
+  const dir = acc?.configDir || findNapcatConfigDir(acc?.dir);
   if (!dir) return { ok: false, error: '找不到 NapCat 的 webui.json（NapCat 目录配了吗？）' };
   const cfg = readJson(path.join(dir, 'webui.json'));
-  const port = Number(cfg.port) || 6099;
+  const port = Number(cfg.port) || acc?.webuiPort || 6099;
   const token = typeof cfg.token === 'string' ? cfg.token : '';
   return {
     ok: true,
+    account: acc?.id ?? DEFAULT_ACCOUNT_ID,
     port,
     token,
     configDir: dir,
@@ -2780,8 +3117,6 @@ async function bringUp(scope = 'all') {
   // scope: qq = 只开 QQ 这条线；wechat = 只开微信；all = 都开
   const wantQq = scope !== 'wechat';
   const wantWx = scope !== 'qq';
-  const n = napcatSettings();
-  const panel = napcatPanel();
 
   /* 三条线各自起，谁也不等谁 —— 这是「QQ 和微信同时跑」的前提。
    *
@@ -2792,28 +3127,37 @@ async function bringUp(scope = 'all') {
   let napcatError = null;
 
   if (wantQq) {
-    if (await probePort(n.wsPort)) {
-      pushLog(`NapCat 已在运行（${n.wsPort} 端口通），跳过启动`, 'sys', 'napcat');
-      ensureNapcatFileLog();
-      startNapcatTail();
-    } else {
-      const started = startNapcat();
+    const accounts = napcatAccounts().filter((a) => a.enabled !== false);
+    if (!accounts.length) napcatError = '没有启用的 QQ 账号（先在「QQ 多号」里添加）';
+    for (const acc of accounts) {
+      if (!acc.dir) {
+        napcatError ??= `[${acc.id}] 还没配 NapCat 目录`;
+        continue;
+      }
+      if (await probePort(acc.wsPort)) {
+        pushLog(`[${acc.id}] NapCat 已在运行（${acc.wsPort} 端口通），跳过启动`, 'sys', 'napcat');
+        ensureNapcatFileLog(acc.dir);
+        startNapcatTail(acc.id);
+        continue;
+      }
+      const started = startNapcat(acc.id);
       if (!started.ok) {
-        napcatError = started.error ?? 'NapCat 启动失败';
+        napcatError ??= `[${acc.id}] ${started.error ?? 'NapCat 启动失败'}`;
+        continue;
+      }
+      pushLog(`[${acc.id}] 等待 NapCat WebSocket（${acc.wsPort}）…`, 'sys', 'napcat');
+      const ready = await waitForPort(acc.wsPort, acc.waitMs);
+      if (!ready) {
+        // 窗口藏起来了，所以"去它的窗口看看"已经不成立 —— 指到面板上，
+        // 扫码和登录状态都在那儿。
+        const panel = napcatPanel(acc.id);
+        napcatError ??=
+          `[${acc.id}] NapCat 在 ${Math.round(acc.waitMs / 1000)} 秒内没有打开 ${acc.wsPort} 端口。` +
+          (panel.ok
+            ? `多数是要扫码登录：打开 ${panel.url} 看一眼。`
+            : '去「运行」页确认 NapCat 目录，或看日志页的 NapCat 输出。');
       } else {
-        pushLog(`等待 NapCat WebSocket（${n.wsPort}）…`, 'sys', 'napcat');
-        const ready = await waitForPort(n.wsPort, n.waitMs);
-        if (!ready) {
-          // 窗口藏起来了，所以"去它的窗口看看"已经不成立 —— 指到面板上，
-          // 扫码和登录状态都在那儿。
-          napcatError =
-            `NapCat 在 ${Math.round(n.waitMs / 1000)} 秒内没有打开 ${n.wsPort} 端口。` +
-            (panel.ok
-              ? `多数是要扫码登录：打开 ${panel.url} 看一眼。`
-              : '去「运行」页确认 NapCat 目录，或看日志页的 NapCat 输出。');
-        } else {
-          pushLog('NapCat 就绪', 'sys', 'napcat');
-        }
+        pushLog(`[${acc.id}] NapCat 就绪`, 'sys', 'napcat');
       }
     }
   }
@@ -2917,7 +3261,7 @@ function bringDown(scope = 'all') {
   const wantWx = scope !== 'qq';
   // 停 QQ 就只停 QQ 这条线；微信留着，别让它当孤儿，也别互相牵连
   const bridgeResult = wantQq ? stopBridge() : { ok: true, skipped: true };
-  const napcatResult = wantQq ? stopNapcat() : { ok: true, skipped: true };
+  const napcatResult = wantQq ? stopAllNapcat() : { ok: true, skipped: true };
   const wechatResult = wantWx
     ? wechat.child
       ? stopWechat()
@@ -4504,11 +4848,14 @@ const RESTART_MAX = 5;
 const RESTART_DELAY_MS = 5000;
 
 function markManualStop(kind) {
-  if (kind in suppressRestart) suppressRestart[kind] = Date.now();
+  // 多号后 stopKey 是动态的（napcat:qq2 / wechat:wx3 / qqofficial:AppID），
+  // 不能再只认 suppressRestart 里预置的三个键，否则手动停 qq2 会被看护 30 秒后拉起来。
+  if (kind) suppressRestart[kind] = Date.now();
 }
 
 function recentlyStopped(kind) {
-  return Date.now() - suppressRestart[kind] < 15_000;
+  const at = suppressRestart[kind];
+  return Number.isFinite(at) && Date.now() - at < 15_000;
 }
 
 function onServiceExit(kind) {
@@ -4540,7 +4887,13 @@ function onServiceExit(kind) {
 /** 服务稳定跑过 5 分钟就清零计数 —— 偶尔崩一次和连环崩要区别对待。 */
 setInterval(() => {
   for (const k of Object.keys(restartAttempts)) {
-    const startedAt = k === 'bridge' ? bridge.startedAt : k === 'wechat' ? wechat.startedAt : napcatLaunch.startedAt;
+    // NapCat 的计数不按时间清：它可能是「启动了但端口一直没起来」，
+    // 按时间清零会变成无限重试。NapCat 只在端口探测通过时清零（见下面的看护）。
+    const startedAt = k === 'bridge'
+      ? bridge.startedAt
+      : k === 'wechat'
+        ? wechat.startedAt
+        : null;
     if (startedAt && Date.now() - startedAt > 5 * 60_000) restartAttempts[k] = 0;
   }
 }, 60_000);
@@ -4550,16 +4903,30 @@ setInterval(async () => {
   try {
     if (shuttingDown) return;
     const cfg = loadAutomation();
-    if (!cfg.watch.napcat || !napcatLaunch.startedAt || recentlyStopped('napcat')) return;
-    const n = napcatSettings();
-    if (await probePort(n.wsPort)) return;
-    if (restartAttempts.napcat >= RESTART_MAX) {
-      pushLog(`NapCat 连续 ${RESTART_MAX} 次自动重启失败，看护放弃`, 'err', 'app');
-      return;
+    if (!cfg.watch.napcat) return;
+    for (const acc of napcatAccounts()) {
+      if (acc.enabled === false) continue;
+      const rec = napcatProcs.get(acc.id);
+      if (!rec?.managed) continue;
+      const stopKey = acc.id === DEFAULT_ACCOUNT_ID ? 'napcat' : `napcat:${acc.id}`;
+      if (recentlyStopped(stopKey)) continue;
+      if (await probePort(acc.wsPort)) {
+        // 端口通就是稳定了，把之前的失败计数清掉。
+        restartAttempts[stopKey] = 0;
+        continue;
+      }
+      const attempts = restartAttempts[stopKey] ?? 0;
+      if (attempts >= RESTART_MAX) {
+        pushLog(`[${acc.id}] NapCat 连续 ${RESTART_MAX} 次自动重启失败，看护放弃`, 'err', 'app');
+        // 放弃后别再显示「运行中」，让用户能手动重新启动。
+        const current = napcatProcs.get(acc.id);
+        if (current) napcatProcs.set(acc.id, { ...current, managed: false });
+        continue;
+      }
+      restartAttempts[stopKey] = attempts + 1;
+      pushLog(`看护：[${acc.id}] NapCat 端口（${acc.wsPort}）掉了，自动重启（第 ${attempts + 1}/${RESTART_MAX} 次）`, 'sys', 'app');
+      startNapcat(acc.id);
     }
-    restartAttempts.napcat += 1;
-    pushLog(`看护：NapCat 端口（${n.wsPort}）掉了，自动重启（第 ${restartAttempts.napcat}/${RESTART_MAX} 次）`, 'sys', 'app');
-    startNapcat();
   } catch {
     /* 看护自身不能带崩服务 */
   }
@@ -5246,7 +5613,9 @@ const server = http.createServer(async (req, res) => {
           exe: n.exe,
           bundled: n.bundled,
           // 有面板地址时前端才显示「打开 NapCat 面板」按钮
-          panel: napcatPanel()
+          panel: napcatPanel(),
+          // 多号：每个号的运行状态、端口、面板地址
+          accounts: napcatAccountsState()
         },
         secrets: secretPresence(),
         providers: listProviders(),
@@ -6659,8 +7028,27 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, await installNapcat());
     }
 
-    if (p === '/api/napcat/start') return sendJson(res, startNapcat());
-    if (p === '/api/napcat/stop') return sendJson(res, stopNapcat());
+    if (p === '/api/napcat/accounts') {
+      if (req.method === 'GET') {
+        return sendJson(res, { ok: true, primary: DEFAULT_ACCOUNT_ID, accounts: napcatAccountsState() });
+      }
+      const body = await readBody(req);
+      if (req.method === 'POST') return sendJson(res, addNapcatAccount(body ?? {}));
+      if (req.method === 'PUT' || req.method === 'PATCH') {
+        return sendJson(res, updateNapcatAccount(body?.id ?? url.searchParams.get('id'), body ?? {}));
+      }
+      if (req.method === 'DELETE') {
+        return sendJson(res, removeNapcatAccount(url.searchParams.get('id') ?? body?.id));
+      }
+      return sendJson(res, { ok: false, error: '不支持的请求方法' }, 405);
+    }
+
+    if (p === '/api/napcat/start') {
+      return sendJson(res, startNapcat(url.searchParams.get('account') || DEFAULT_ACCOUNT_ID));
+    }
+    if (p === '/api/napcat/stop') {
+      return sendJson(res, stopNapcat(url.searchParams.get('account') || DEFAULT_ACCOUNT_ID));
+    }
 
     if (p === '/api/qq/contacts') return sendJson(res, await qqContacts());
     if (p === '/api/wechat/targets') return sendJson(res, { targets: wechatTargets() });
@@ -7855,21 +8243,24 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, result);
     }
 
-    if (p === '/api/napcat/panel') return sendJson(res, napcatPanel());
+    if (p === '/api/napcat/panel') {
+      return sendJson(res, napcatPanel(url.searchParams.get('account') || DEFAULT_ACCOUNT_ID));
+    }
 
     /* NapCat 面板开在应用内的子窗口里（Electron 主进程注入 opener）。
      * 面板地址是 NapCat WebUI——NapCat 没在跑时它就是死链，直接开窗必然白屏。
      * 所以先探活：没跑就顺手拉起并等端口通了再开；等不到就把人话带回前端。
      * 裸跑（node server.mjs）没有 Electron：返回 inApp:false，前端自己开新标签。 */
     if (p === '/api/napcat/window') {
-      let panel = napcatPanel();
+      const accountId = url.searchParams.get('account') || DEFAULT_ACCOUNT_ID;
+      let panel = napcatPanel(accountId);
       if (!panel.ok) return sendJson(res, panel);
       if (!(await probePort(panel.port))) {
-        const started = startNapcat();
+        const started = startNapcat(accountId);
         if (!started.ok) return sendJson(res, { ok: false, error: `NapCat 没在跑，自动启动失败：${started.error ?? '未知原因'}` });
-        pushLog('NapCat 没在跑，已自动拉起，等面板端口就绪…', 'sys', 'napcat');
+        pushLog(`[${accountId}] NapCat 没在跑，已自动拉起，等面板端口就绪…`, 'sys', 'napcat');
         const ready = await waitForPort(panel.port, 20_000);
-        panel = napcatPanel();
+        panel = napcatPanel(accountId);
         if (!ready || !(await probePort(panel.port))) {
           return sendJson(res, { ok: false, error: 'NapCat 拉起来了，但面板端口 20 秒内没通——看日志页的 NapCat 输出，稍等再点一次' });
         }
@@ -7878,16 +8269,16 @@ const server = http.createServer(async (req, res) => {
       // token，面板就会要求手动登录（0.4.2 实测踩到）。等 webui.json 里的 token
       // 连续两次一致（或满 5 秒）再开窗。
       for (let i = 0; i < 4; i++) {
-        const prev = napcatPanel();
+        const prev = napcatPanel(accountId);
         await new Promise((r2) => setTimeout(r2, 1250));
-        const next = napcatPanel();
+        const next = napcatPanel(accountId);
         if (next.ok && prev.ok && next.token === prev.token) { panel = next; break; }
         panel = next;
       }
       const opener = globalThis.dhmOpenChildWindow;
       if (typeof opener === 'function') {
         try {
-          opener(panel.url, 'NapCat 面板 — 扫码 / 快登');
+          opener(panel.url, `NapCat 面板 ${accountId} — 扫码 / 快登`);
           return sendJson(res, { ok: true, inApp: true, url: panel.url });
         } catch (error) {
           return sendJson(res, { ok: true, inApp: false, url: panel.url, warn: String(error?.message ?? error) });
@@ -7970,8 +8361,12 @@ export async function startServer(preferred = PORT) {
     try {
       const result = await listenOnce(port);
       // NapCat 常常是开机自启或手动开的，等用户点「一键启动」才挂日志就太晚了
-      ensureNapcatFileLog();
-      startNapcatTail();
+      for (const acc of napcatAccounts()) {
+        if (acc.dir) {
+          ensureNapcatFileLog(acc.dir);
+          startNapcatTail(acc.id);
+        }
+      }
       initAutomation();
       // 手机推送是可选功能，没启用时这里什么都不做（也不会占端口）
       if (phoneSettings().enabled) startPhoneListener();
@@ -8016,7 +8411,7 @@ export function shutdownServer() {
 
     const bridgeResult = stopBridge();
     const wechatResult = stopWechat();
-    const napcatResult = stopNapcat();
+    const napcatResult = stopAllNapcat();
 
     // 等每一路真的收完，再把结果并进返回值 —— 界面和测试都按「ok/killed」看，
     // 不需要知道内部那个 done Promise。

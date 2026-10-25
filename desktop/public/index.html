@@ -405,12 +405,33 @@
         </div>
       </div>
 
-      <div class="panel" data-pf="qq" id="status-napcat-panel" hidden>
-        <div class="panel-head"><h2>QQ 登录</h2><span class="hint">NapCat 没连上时，从这里进面板扫码</span></div>
-        <div class="field-row">
-          <button class="btn btn-primary" id="status-napcat-login">扫码 / 登录</button>
-          <span class="hint" style="align-self:center">需要 NapCat 在跑；没装的话去「高级 → 组件」装</span>
+      <div class="panel" data-pf="qq" id="napcat-accounts-panel">
+        <div class="panel-head">
+          <h2>QQ 多号 · NapCat</h2>
+          <span class="hint">每个号一份独立 NapCat 目录；WS / HTTP / 面板端口自动错开。新增或删除账号后重启一次桥接生效</span>
         </div>
+        <div id="napcat-accounts-list"></div>
+        <details class="napcat-add">
+          <summary>添加一个号</summary>
+          <div class="field-row">
+            <div class="field">
+              <label for="napcat-acc-qq">QQ 号</label>
+              <input id="napcat-acc-qq" inputmode="numeric" placeholder="例如 123456789" spellcheck="false" />
+            </div>
+            <div class="field">
+              <label for="napcat-acc-label">备注</label>
+              <input id="napcat-acc-label" placeholder="比如：小号 / 客服" spellcheck="false" />
+            </div>
+            <div class="field field-wide">
+              <label for="napcat-acc-dir">NapCat 目录</label>
+              <input id="napcat-acc-dir" placeholder="另一个号的 NapCat 目录（含 NapCatWinBootMain.exe）" spellcheck="false" />
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" id="napcat-acc-add">添加</button>
+            <span class="result" id="napcat-acc-result"></span>
+          </div>
+        </details>
       </div>
 
       <div class="panel" data-pf="qq" id="qq-official-panel">
@@ -455,6 +476,14 @@
         </div>
         <div class="status-services" id="status-services"></div>
       </div>
+    </section>
+
+    <section class="page" id="page-more" hidden>
+      <header class="page-head">
+        <h1 data-i18n="更多">更多</h1>
+        <p data-i18n="不常用的设置收在这里，主界面只留每天要用的。">不常用的设置收在这里，主界面只留每天要用的。</p>
+      </header>
+      <div class="more-grid" id="more-grid"></div>
     </section>
 
     <section class="page" id="page-models" hidden>

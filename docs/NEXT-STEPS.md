@@ -25,20 +25,12 @@
    画图自定义服务能加能删、provider 删掉后自动回 auto。
 3. **打包清单巡检**：`prepare-bridge.mjs` 拷贝清单核对一次全目录（upstream 曾漏过，新目录必须显式加；
    0.5.0 已把 `src/openai-shell.js` 加进 `must` 自检，0.5.1 需确认 `src/agent-tools-core.js` / `src/mcp-agent-tools.js` 也在）。
+4. **NapCat 双号真机回归**：两份独立 NapCat Shell 目录分别扫码 qq1/qq2，核对两端收发、会话键隔离、
+   qq2 掉线时不会从 qq1 发出、桌面端按号启停与看护、以及升级后 qq1 历史会话/记忆仍能直接打开。
 
 ## 二、中期大件（已规划，按价值排序）
 
-0. **NapCat 多号**（2026-10-25 立项，多号管理三件套的最后一块；官方机器人/微信已完成）：
-   难点在 bridge.js（12k 行）假设单 QQ 身份（单 OneBot 连接、self/ownerQQ/白名单/会话键 `private:<qq>`）。
-   设计方向（分四步走，每步独立可发）：
-   a. **NapCat 多实例**：桌面端按账号拉多个 NapCat（每号独立数据目录 + 错开的 WS/HTTP 端口 3001/3011/3021…），
-      config 迁 `platforms.qq.accounts: [{id:'qq1', qq, wsPort, httpPort, dir}]`（qq1 沿用现字段兼容旧配置）。
-   b. **桥接多连接**：bridge.js 把「一个 OneBot WS 客户端」抽成 Map<accountId, client>；入站消息打账号标签，
-      会话键改 `<account>:private:<qq>` / `<account>:group:<gid>`（qq1 无前缀，旧会话不丢）；
-      出站回复路由回来源账号的客户端。socialV2 群状态按 (account, gid) 复合键。
-   c. **人设/白名单按号**：roles 与 allow/deny 支持 per-account 覆盖（不配则全号共用，现行为）。
-   d. **桌面端多号面板**：每号一张服务卡（登录/启停/看护），复用官方机器人面板的列表交互。
-   风险：b 是主战场，bridge.js 改动集中在 OneBot 连接管理与消息路由两处，其余（socialV2/工具/记忆）吃复合键即可。
+0. ~~**NapCat 多号**~~ ✅ **0.6.0 已交付**：`src/qq-accounts.js` 作为账号模型 / 会话键 / 白名单策略的唯一实现；bridge.js 改为每号一条 OneBot WS 客户端（qq1 键不变，其余 `qqN:` 前缀，账号 id 不复用空洞）；桌面端按号拉独立 NapCat 目录并错开 3001/3011/3021、3000/3010/3020、6099/6109/6119；状态页多号面板支持启停/扫码/删除/添加；导航收敛为 6 项。白名单/人设暂全号共用，`policy` 已按号预留；真机双号扫码登录与掉线不回落待补测。
 1. ~~**OpenAI 兼容壳**~~ ✅ **0.5.0 已交付**（`src/openai-shell.js`，默认 4610，Bearer 鉴权，非流式 + 假流式）。
    二期：真增量 SSE（接 assistant/chunk 逐块 flush）、`tools` / function calling 转发、
    每会话复用（现在每条请求建一个新会话）、`/v1/embeddings`。
@@ -56,7 +48,7 @@
 - **语音闭环**：TTS 已有（edge/sapi），补 ASR（QQ 语音条 → 文字，ffmpeg 已随包）→ 机器人能「听」语音消息。
 - **记忆升级**：每日记忆 v1 是原文记录；加模型生成摘要头 + 按关键词/语义检索（memory-safe MCP 扩展工具）。
 - **备份/迁移向导**：数据根一键打包（config + models.local.json + state + 记忆 + 图库/语音库）→ 换机一键恢复。
-- **多账号**：QQ 多 bot / 微信多号并存（现在单号假设渗透较深，动之前先设计）。
+- **多账号后续**：QQ 多号 / 微信多号 / 官方机器人多号已落地；下一步补人设与白名单的按号覆盖（`policy` 已预留），以及跨号会话总览。
 - **手机端 PWA**：手机页（3210）升级成完整遥控端：状态、发消息、消息流、审批（更新安装等危险操作推到手机确认）。
 - **自动更新加签名校验**：release 附 SHA256，安装前比对（现在靠 HTTPS + GitHub）。
 - **性能债**：`/find` 同步扫描最多 2 万项会卡桥接主循环几秒（挪 worker_threads）；日志文件加轮转。

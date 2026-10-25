@@ -2009,3 +2009,49 @@ html[data-view="home"] .app { grid-template-columns: minmax(0, 1fr); }
 /* 微信多账号选择条：账号芯片 + 添加/删除 */
 .wx-accounts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
 .wx-accounts .btn-sm { display: inline-flex; align-items: center; }
+
+/* ── 「更多」页与 QQ 多号 ───────────────────────────────────────────── */
+.field-row .field-wide { grid-column: 1 / -1; }
+
+.more-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.more-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.more-card:hover {
+  border-color: var(--accent, #4f8cff);
+  transform: translateY(-1px);
+}
+
+.more-card strong { font-size: 14px; font-weight: 650; }
+.more-card span { color: var(--muted, #8a93a3); font-size: 12px; line-height: 1.5; }
+
+.napcat-add {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.napcat-add > summary {
+  cursor: pointer;
+  color: var(--muted, #8a93a3);
+  font-size: 13px;
+  user-select: none;
+}
+
+.napcat-add[open] > summary { margin-bottom: 12px; }

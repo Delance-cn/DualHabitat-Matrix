@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "node src/bridge.js",
+    "test": "node --test \"desktop/scripts/*.test.mjs\"",
     "self-test": "node src/self-test.js",
     "postinstall": "node scripts/patch-snowluma-sdk.mjs",
     "patch:sdk": "node scripts/patch-snowluma-sdk.mjs",

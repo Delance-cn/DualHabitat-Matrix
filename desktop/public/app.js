@@ -286,13 +286,25 @@ const I18N_EN = {
   '选择通道': 'Choose a channel',
   '当前状态': 'Status',
   '对话与人格': 'Chat & Persona',
+  '对话': 'Chat',
   '交流空间': 'Live Feed',
   '消息与任务': 'Messages & Tasks',
+  '消息': 'Messages',
   'API 与模型': 'API & Models',
+  '模型': 'Models',
+  '连接': 'Connection',
+  '更多': 'More',
   '链接手机': 'Phone Link',
   '后端': 'Backend',
   '高级': 'Advanced',
   '登录': 'Sign in',
+  '不常用的设置收在这里，主界面只留每天要用的。': 'Less-used settings live here; the main sidebar keeps only daily essentials.',
+  '把两个会话放在一起看，适合双人设对聊': 'View two conversations side by side — handy for two-persona chats.',
+  '手机查看消息、收推送': 'Read messages and get push notifications on your phone.',
+  '插件、工具与外部集成': 'Plugins, tools and external integrations.',
+  '组件安装、底层开关与维护': 'Component install, low-level switches and maintenance.',
+  '切换模型后端与 CLI 引擎': 'Switch model backend and CLI engine.',
+  '微信消息钩子与转发': 'WeChat message hooks and forwarding.',
   '两条通道各跑各的进程，能同时开。点卡片进去配置；下面的状态灯是实时读数，不用进去看。': 'Each channel runs its own process; both can run at once. Click a card to configure it — the LEDs below are live readings.',
   '每收到或回复一条消息，都会按所选数据格式向指定地址推送一份 JSON。与 QQ 无关。': 'Every incoming or outgoing message is pushed as JSON to your URL in the selected format. Unrelated to QQ.',
   '运行状态、运行时长与当前使用的模型档位。': 'Run state, uptime and the active model tier.',
@@ -505,31 +517,46 @@ const platform = () => (document.documentElement.dataset.platform === 'wechat' ?
 const NAV = {
   qq: [
     ['status', '当前状态'],
-    ['chat', '对话与人格'],
-    ['exchange', '交流空间'],
-    ['messages', '消息与任务'],
-    ['models', 'API 与模型'],
-    ['phone', '链接手机'],
-    ['backend', '后端'],
-    ['extensions', '扩展'],
-    ['advanced', '高级']
+    ['chat', '对话'],
+    ['messages', '消息'],
+    ['models', '模型'],
+    ['backend', '连接'],
+    ['more', '更多']
   ],
   wechat: [
     ['status', '当前状态'],
     ['wx-overview', '登录'],
-    ['chat', '对话与人格'],
-    ['exchange', '交流空间'],
-    ['messages', '消息与任务'],
-    ['models', 'API 与模型'],
-    ['phone', '链接手机'],
-    ['hook', 'Hook'],
-    ['backend', '后端'],
-    ['extensions', '扩展'],
-    ['advanced', '高级']
+    ['chat', '对话'],
+    ['messages', '消息'],
+    ['models', '模型'],
+    ['more', '更多']
+  ]
+};
+
+/**
+ * 「更多」里收的是不常用页面。主界面只留每天要用的 6 项，
+ * 但页面本身一个都没删 —— 老入口、深链接、引导流程照常能用。
+ */
+const MORE = {
+  qq: [
+    ['exchange', '交流空间', '把两个会话放在一起看，适合双人设对聊'],
+    ['phone', '链接手机', '手机查看消息、收推送'],
+    ['extensions', '扩展', '插件、工具与外部集成'],
+    ['advanced', '高级', '组件安装、底层开关与维护']
+  ],
+  wechat: [
+    ['exchange', '交流空间', '把两个会话放在一起看，适合双人设对聊'],
+    ['phone', '链接手机', '手机查看消息、收推送'],
+    ['backend', '后端', '切换模型后端与 CLI 引擎'],
+    ['hook', 'Hook', '微信消息钩子与转发'],
+    ['extensions', '扩展', '插件、工具与外部集成'],
+    ['advanced', '高级', '组件安装、底层开关与维护']
   ]
 };
 
 const pagesOf = (p) => NAV[p].map(([page]) => page);
+/** 当前平台能进入的页面 = 导航 + 「更多」+ 更多页本身（防止 QQ 深链接到微信专属页）。 */
+const pagesFor = (p) => new Set([...pagesOf(p), 'more', ...MORE[p].map(([page]) => page)]);
 
 let currentPage = 'overview';
 
@@ -547,12 +574,25 @@ let modelProfilesLoaded = false;
 
 function renderNav() {
   const items = NAV[platform()];
+  const active = pagesOf(platform()).includes(currentPage) ? currentPage : 'more';
   $('#nav').innerHTML = items
     .map(
       ([page, label]) =>
-        `<button class="nav-item${page === currentPage ? ' is-active' : ''}" data-page="${page}"><span class="nav-dot"></span><span class="nav-label">${t(label)}</span>${
+        `<button class="nav-item${page === active ? ' is-active' : ''}" data-page="${page}"><span class="nav-dot"></span><span class="nav-label">${t(label)}</span>${
           page === 'overview' ? '<span class="nav-badge" id="nav-badge-update" hidden>新</span>' : ''
         }</button>`
+    )
+    .join('');
+}
+
+/** 「更多」页：把不常用页面收成一张张卡片，主界面只留 6 项。 */
+function renderMore() {
+  const box = $('#more-grid');
+  if (!box) return;
+  box.innerHTML = MORE[platform()]
+    .map(
+      ([page, title, desc]) =>
+        `<button class="more-card" type="button" data-goto="${page}"><strong>${t(title)}</strong><span>${t(desc)}</span></button>`
     )
     .join('');
 }
@@ -630,6 +670,11 @@ $('#nav').addEventListener('click', (e) => {
   if (b?.dataset.page) showPage(b.dataset.page);
 });
 
+$('#more-grid')?.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-goto]');
+  if (b?.dataset.goto) showPage(b.dataset.goto);
+});
+
 $$('#platform-switch .pf-btn').forEach((b) => {
   b.addEventListener('click', () => {
     const next = b.dataset.platform;
@@ -653,15 +698,18 @@ $$('.home-card').forEach((card) => {
 
 function showPage(name, anchor) {
   const home = name === 'overview';
-  // 总览是外层首页，不在导航列表里；其它页必须在当前平台的列表内
-  if (!home && !pagesOf(platform()).includes(name)) name = NAV[platform()][0][0];
+  // 总览是外层首页，不在导航列表里；其它页只允许当前平台的导航 + 「更多」，
+  // 避免 QQ 深链接到微信专属页（如 wx-overview / hook）时导航高亮错位。
+  if (!home && !pagesFor(platform()).has(name)) name = NAV[platform()][0][0];
   currentPage = name;
 
   const target = home ? 'overview' : name;
-  $$('#nav .nav-item').forEach((b) => b.classList.toggle('is-active', b.dataset.page === name));
+  const navPage = pagesOf(platform()).includes(name) ? name : 'more';
+  $$('#nav .nav-item').forEach((b) => b.classList.toggle('is-active', b.dataset.page === navPage));
   $$('.page').forEach((p) => {
     p.hidden = p.id !== `page-${target}`;
   });
+  if (name === 'more') renderMore();
   // 没进通道之前侧边栏不出现 —— 总览是独立的一层
   document.documentElement.dataset.view = home ? 'home' : 'platform';
   $('#main').scrollTop = 0;
@@ -688,6 +736,7 @@ function showPage(name, anchor) {
 
 function loadPage(name) {
   if (name === 'overview') return loadOverview();
+  if (name === 'more') return renderMore();
   if (name === 'status') return renderStatus();
   if (name === 'wx-overview') return loadWxOverview();
   if (name === 'hook') return loadHook();
@@ -965,10 +1014,6 @@ function renderStatus() {
   const title = $('#status-title');
   if (title) title.textContent = ok ? '正常运行' : partial ? '部分就绪' : '未启动';
 
-  // QQ 登录直达门：QQ 通道且 NapCat 没连上时亮出来（微信通道一直藏着）
-  const npPanel = $('#status-napcat-panel');
-  if (npPanel) npPanel.hidden = wx || S.napcat?.reachable === true;
-
   const sub = $('#status-sub');
   if (sub) {
     sub.textContent = ok
@@ -1044,6 +1089,65 @@ function renderStatus() {
         <div class="status-slot-note">${note}</div>
         <div class="status-slot-actions">${btn}${toolBtn}</div>
       </div>`;
+  }
+
+  /* QQ 多号（NapCat）：每个号一行，启停 / 扫码 / 删除都在这里 */
+  const napcatAccounts = S.napcat?.accounts ?? [];
+  const napcatBox = $('#napcat-accounts-list');
+  if (napcatBox) {
+    if (!napcatBox.dataset.bound) {
+      napcatBox.dataset.bound = '1';
+      napcatBox.addEventListener('click', async (e) => {
+        const b = e.target.closest('button[data-napcat]');
+        if (!b) return;
+        const id = b.dataset.id;
+        const act = b.dataset.napcat;
+        if (act === 'panel') {
+          await openNapcatPanel(id);
+          return;
+        }
+        if (act === 'delete') {
+          const ok = await confirmBox({
+            title: `删除 NapCat 账号 ${id}？`,
+            text: '只删除这个号的配置，聊天记录和人格数据都会保留。编号不会复用。',
+            okLabel: '删除',
+            danger: true
+          });
+          if (!ok) return;
+          const r = await api(`/api/napcat/accounts?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+          toast(r.ok === false ? (r.error ?? '删除失败') : '已删除');
+          await refreshState();
+          return;
+        }
+        if (act === 'start' || act === 'stop') {
+          const r = await api(`/api/napcat/${act}?account=${encodeURIComponent(id)}`);
+          toast(r.ok === false ? (r.error ?? '操作失败') : act === 'start' ? `[${id}] 已启动` : `[${id}] 已停止`);
+          await refreshState();
+        }
+      });
+    }
+    napcatBox.innerHTML = napcatAccounts.length
+      ? napcatAccounts.map((acc) => {
+          const state = acc.running
+            ? '<span class="badge ok">运行中</span>'
+            : acc.configured
+              ? '<span class="badge">未运行</span>'
+              : '<span class="badge warn">目录未配</span>';
+          const meta = `QQ ${acc.qq || '未填'} · WS ${acc.wsPort} · HTTP ${acc.httpPort} · 面板 ${acc.webuiPort}`;
+          return `<div class="pool-item" style="align-items:center;gap:10px">
+            <span class="led ${acc.running ? 'on' : ''}"></span>
+            <span class="pool-name" style="flex:1;min-width:0">
+              ${esc(acc.label || acc.id)}${acc.label ? ` <span class="hint">${esc(acc.id)}</span>` : ''}
+              <span class="hint" style="display:block;margin-top:2px">${esc(meta)}</span>
+              <span class="hint" style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(acc.dir || '')}">${esc(acc.dir || '还没配 NapCat 目录')}</span>
+            </span>
+            ${state}
+            <button class="btn btn-sm" data-napcat="${acc.running ? 'stop' : 'start'}" data-id="${esc(acc.id)}" ${!acc.running && !acc.configured ? 'disabled' : ''}>${acc.running ? '停止' : '启动'}</button>
+            <button class="btn btn-sm" data-napcat="panel" data-id="${esc(acc.id)}">扫码 / 登录</button>
+            ${acc.id === 'qq1' ? '' : `<button class="btn btn-sm btn-ghost" data-napcat="delete" data-id="${esc(acc.id)}">删除</button>`}
+          </div>`;
+        }).join('')
+      : '<div class="empty">还没有 QQ 号。先在「高级 → 组件」配好 NapCat，再回来添加第二个号。</div>';
   }
 
   /* QQ 官方机器人多号面板：列表 + 添加/编辑表单。QQ 通道才显示（data-pf 控制） */
@@ -1908,11 +2012,12 @@ $('#btn-down').addEventListener('click', async () => {
 $('#btn-refresh').addEventListener('click', () => loadOverview());
 $('#btn-goto-backend').addEventListener('click', () => showPage('backend'));
 
-async function openNapcatPanel() {
-  const r = await api('/api/napcat/window');
+async function openNapcatPanel(accountId = 'qq1') {
+  const r = await api(`/api/napcat/window?account=${encodeURIComponent(accountId)}`);
   if (!r.ok) {
     toast(r.error ?? '拿不到 NapCat 面板地址 —— NapCat 可能还没装/没启动，先去「高级」页配好');
-    wizardGo('qq', 'advanced');
+    // 只有默认号才引导去「高级」页改全局 NapCat 目录；qq2 的问题通常是还没启动过一次。
+    if (accountId === 'qq1') wizardGo('qq', 'advanced');
     return false;
   }
   // inApp = Electron 主进程开了子窗口；裸跑（浏览器模式）回落到新标签
@@ -1923,7 +2028,21 @@ async function openNapcatPanel() {
 
 $('#btn-napcat-panel').addEventListener('click', () => openNapcatPanel());
 
-$('#status-napcat-login')?.addEventListener('click', () => openNapcatPanel());
+/* QQ 多号（NapCat）：添加账号 */
+$('#napcat-acc-add')?.addEventListener('click', async () => {
+  const qq = ($('#napcat-acc-qq').value || '').trim();
+  const label = ($('#napcat-acc-label').value || '').trim();
+  const dir = ($('#napcat-acc-dir').value || '').trim();
+  if (!dir) return setResult('#napcat-acc-result', '先填这个号自己的 NapCat 目录', 'err');
+  if (qq && !/^\d{5,12}$/.test(qq)) return setResult('#napcat-acc-result', 'QQ 号看起来不对', 'err');
+  const r = await post('/api/napcat/accounts', { qq, label, dir });
+  if (r.ok === false) return setResult('#napcat-acc-result', r.error ?? '添加失败', 'err');
+  setResult('#napcat-acc-result', `已添加 ${r.account?.id ?? '新号'}，点列表里的「启动」`, 'saved');
+  $('#napcat-acc-qq').value = '';
+  $('#napcat-acc-label').value = '';
+  $('#napcat-acc-dir').value = '';
+  await refreshState();
+});
 
 /* QQ 官方机器人多号：添加/编辑保存（启用即启动）和取消编辑 */
 function qofResetForm() {

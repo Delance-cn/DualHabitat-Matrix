@@ -144,6 +144,7 @@ const size = (dir) => {
 
 const must = [
   'src/bridge.js',
+  'src/qq-accounts.js',
   'src/wechat-bot.js',
   'src/oc-server.js',
   'src/openai-shell.js',
