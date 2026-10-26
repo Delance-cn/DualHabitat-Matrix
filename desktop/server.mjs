@@ -19,6 +19,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { reloadSecretsInRunningServer, saveSecretsAndApply } from './secrets-reload.mjs';
 import { validateDirectoryPath } from './path-validation.mjs';
+import { extractZip, findFileDown } from './zip-extract.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1831,7 +1832,7 @@ function napcatAccountState(account) {
     running: Boolean(rec?.child || rec?.managed),
     pid: rec?.child?.pid ?? null,
     startedAt: rec?.startedAt ?? null,
-    panel: configDir ? napcatPanel(account.id) : { ok: false, error: '找不到 webui.json（先启动一次 NapCat）' }
+    panel: configDir ? napcatPanel(account.id) : { ok: false, error: '还没生成 webui.json —— 点「打开 NapCat 面板」会自动启动 NapCat 并生成它' }
   };
 }
 
@@ -2015,6 +2016,89 @@ function removeNapcatAccount(accountId) {
  * ⚠️ 停它**不要**用同目录的 `napcat.kill.qq.bat`：那脚本里"输入 0"那条是
  * `taskkill /f /im QQ.exe`，会把用户自己日常在用的 QQ 一起杀掉。
  */
+let qqScanAt = 0;
+let qqScanFound = null;
+
+/**
+ * 找本机 QQ（QQNT）的安装痕迹：注册表里的路径 → 常见安装位置。
+ *
+ * 为什么只是提示不拦截：NapCat Shell 是往 QQ 里注入的，机器上没有新版 QQ
+ * 启动器必然闪退——但 QQ 也可能装在少见的位置，查不到不代表真没有。
+ * 拦死会误伤，提示到日志里足够了。
+ */
+function detectQQInstall() {
+  if (qqScanFound !== null && Date.now() - qqScanAt < 300_000) return qqScanFound;
+  qqScanAt = Date.now();
+  qqScanFound = '';
+  try {
+    for (const key of ['HKCU\\Software\\Tencent\\QQNT', 'HKLM\\Software\\Tencent\\QQNT', 'HKLM\\Software\\WOW6432Node\\Tencent\\QQNT']) {
+      const out = spawnSync('reg.exe', ['query', key], { encoding: 'utf8', windowsHide: true, timeout: 4000 });
+      const m = String(out.stdout ?? '').match(/REG_SZ\s+([^\r\n]+?QQ\.exe)/i);
+      const p = m?.[1]?.trim();
+      if (p && fs.existsSync(p)) {
+        qqScanFound = p;
+        break;
+      }
+    }
+  } catch {
+    /* reg 查不了就当没有 */
+  }
+  if (!qqScanFound) {
+    for (const p of ['C:\\Program Files\\Tencent\\QQNT\\QQ.exe', 'C:\\Program Files (x86)\\Tencent\\QQNT\\QQ.exe']) {
+      if (fs.existsSync(p)) {
+        qqScanFound = p;
+        break;
+      }
+    }
+  }
+  return qqScanFound;
+}
+
+/**
+ * 确保 webui.json 在 NapCat 第一次启动前就存在。
+ *
+ * 为什么：NapCat 第一次成功跑起来才会生成 config/webui.json，而「打开 NapCat
+ * 面板」又要先读它拿端口和 token —— 全新安装就死锁在「找不到 webui.json」，
+ * NapCat 根本没机会启动（0.6.1 在朋友机器上实测就是这么卡死的）。
+ * 这里先按账号配置写一份：NapCat 启动时读它，端口/token 一开始就确定，
+ * 面板地址从第一秒起就是可用的。只在文件不存在时写，绝不覆盖 NapCat 自己的。
+ */
+function ensureNapcatWebuiConfig(account) {
+  const root = account?.dir || napcatSettings().dir;
+  if (!root || !fs.existsSync(root)) return { ok: false, error: 'NapCat 目录不存在' };
+  const existing = findNapcatConfigDir(root);
+  if (existing) return { ok: true, dir: existing, created: false };
+
+  // 还没有：挑该写的地方。Shell 版的正式位置是 versions/<版本>/resources/app/napcat/config，
+  // 没有 versions 就退回 <根>/config。多版本时挑版本目录最新的那个。
+  let base = path.join(root, 'config');
+  const versions = path.join(root, 'versions');
+  if (fs.existsSync(versions)) {
+    const candidates = fs
+      .readdirSync(versions)
+      .map((v) => {
+        const napcat = path.join(versions, v, 'resources', 'app', 'napcat');
+        return fs.existsSync(napcat) ? { napcat, mtime: fs.statSync(path.join(versions, v)).mtimeMs } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime);
+    if (candidates.length) base = path.join(candidates[0].napcat, 'config');
+  }
+
+  try {
+    fs.mkdirSync(base, { recursive: true });
+    const file = path.join(base, 'webui.json');
+    if (!fs.existsSync(file)) {
+      writeJson(file, { port: Number(account.webuiPort) || 6099, token: account.token || randomBytes(16).toString('hex'), loginUrl: '' });
+      pushLog(`[${account.id}] 预生成了 webui.json（端口 ${account.webuiPort}）——面板地址在 NapCat 启动前就可用了`, 'sys', 'napcat');
+      return { ok: true, dir: base, created: true };
+    }
+    return { ok: true, dir: base, created: false };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
 function startNapcat(accountId = DEFAULT_ACCOUNT_ID) {
   const id = isValidAccountId(String(accountId)) ? String(accountId) : DEFAULT_ACCOUNT_ID;
   const acc = napcatAccount(id);
@@ -2034,6 +2118,12 @@ function startNapcat(accountId = DEFAULT_ACCOUNT_ID) {
   if (clash) return { ok: false, error: `NapCat 目录正被账号 ${clash[0]} 使用；多号必须每个号一份独立目录` };
 
   lastNapcatDir = acc.dir;
+  // 全新安装时 webui.json 还没生成过：先补一份，面板才不会死锁在「找不到」
+  ensureNapcatWebuiConfig(acc);
+  // 机器上没有 QQNT 时启动器必然闪退；只提示不拦（QQ 也可能装在少见的位置）
+  if (!detectQQInstall()) {
+    pushLog(`[${id}] 没找到本机 QQ 的安装痕迹 —— NapCat 需要新版 QQ（QQNT）才能注入启动；如果一会儿 NapCat 闪退，先去 https://im.qq.com/ 装 QQ 再试`, 'err', 'napcat');
+  }
   // 没开文件日志的话，NapCat 的输出只会进命名管道，日志页永远是空的
   ensureNapcatFileLog(acc.dir);
 
@@ -2310,12 +2400,17 @@ function findNapcatConfigDir(rootDir = napcatSettings().dir) {
   const direct = path.join(root, 'config');
   if (fs.existsSync(path.join(direct, 'webui.json'))) return direct;
 
+  if (fs.existsSync(path.join(root, 'webui.json'))) return root;
   const versions = path.join(root, 'versions');
-  if (!fs.existsSync(versions)) return '';
-  for (const v of fs.readdirSync(versions)) {
-    const dir = path.join(versions, v, 'resources', 'app', 'napcat', 'config');
-    if (fs.existsSync(path.join(dir, 'webui.json'))) return dir;
+  if (fs.existsSync(versions)) {
+    for (const v of fs.readdirSync(versions)) {
+      const dir = path.join(versions, v, 'resources', 'app', 'napcat', 'config');
+      if (fs.existsSync(path.join(dir, 'webui.json'))) return dir;
+    }
   }
+  // 都没中就限深搜一遍：本地 zip 装的包可能多一层目录，别让人干瞪眼
+  const hit = findFileDown(root, 'webui.json', 7);
+  if (hit && path.basename(path.dirname(hit)) === 'config') return path.dirname(hit);
   return '';
 }
 
@@ -2485,7 +2580,7 @@ function pumpNapcatLog(accountId = DEFAULT_ACCOUNT_ID) {
 function napcatPanel(accountId = DEFAULT_ACCOUNT_ID) {
   const acc = napcatAccount(accountId);
   const dir = acc?.configDir || findNapcatConfigDir(acc?.dir);
-  if (!dir) return { ok: false, error: '找不到 NapCat 的 webui.json（NapCat 目录配了吗？）' };
+  if (!dir) return { ok: false, error: '找不到 NapCat 的 webui.json（NapCat 目录还没配好，或 NapCat 还没成功跑过一次；点「打开 NapCat 面板」会自动启动它）' };
   const cfg = readJson(path.join(dir, 'webui.json'));
   const port = Number(cfg.port) || acc?.webuiPort || 6099;
   const token = typeof cfg.token === 'string' ? cfg.token : '';
@@ -2548,11 +2643,8 @@ async function applyNapcatUpdate(assetUrl) {
   }
   const dest = path.join(tmp, 'unpacked');
   fs.mkdirSync(dest, { recursive: true });
-  await new Promise((resolve) => {
-    const child = spawn(tarExe(), ['-xf', zipPath, '-C', dest], { windowsHide: true });
-    child.on('close', (code) => resolve(code));
-    child.on('error', () => resolve(-1));
-  });
+  const extracted = await extractComponentZip(zipPath, dest);
+  if (!extracted.ok) return { ok: false, error: `解压失败：${extracted.error}` };
   let root = dest;
   try {
     const entries = fs.readdirSync(dest);
@@ -2706,6 +2798,45 @@ async function downloadToFile(url, dest, onProgress) {
 }
 
 /**
+ * 把组件 zip 解到目标目录：纯 JS 优先，系统 tar 兜底。
+ *
+ * 为什么不只靠 tar：tar 是 Windows 10 1803 才自带的，精简版/LTSC/被安全软件
+ * 动过的系统可能没有（0.6.1 在朋友的机器上就解不开，界面只会甩一句
+ * 「本机 tar 不可用？」），而且 tar 失败时拿不到真实原因，用户没法对症下药。
+ * 纯 JS 解压跟着 Node 走：有 Node 就能解，还能把「包不完整」「CRC 不对」
+ * 「路径越界」这些真错误讲清楚。
+ *
+ * 纯 JS 因 zip64/加密拒收的交回 tar 试一把；因 zip-slip 拒收的不兜底——
+ * 安全边界不能因为 tar 愿意解就放过去。
+ */
+async function extractComponentZip(zipPath, dest, onProgress) {
+  const js = await extractZip(zipPath, dest, { onProgress });
+  if (js.ok) return js;
+  if (/越界/.test(js.error)) return js;
+
+  let stderr = '';
+  const tarCode = await new Promise((resolve) => {
+    const child = spawn(tarExe(), ['-xf', zipPath, '-C', dest], { windowsHide: true });
+    child.stderr?.on('data', (d) => {
+      stderr += d;
+      if (stderr.length > 2000) stderr = stderr.slice(-2000);
+    });
+    child.on('close', (code) => resolve(code));
+    child.on('error', (e) => {
+      stderr = String(e?.message ?? e);
+      resolve(-1);
+    });
+  });
+  if (tarCode === 0) return { ok: true, files: -1 };
+
+  const tarNote =
+    tarCode === -1
+      ? `本机没有可用的 tar（${tarExe()}）`
+      : `系统 tar 也失败（退出码 ${tarCode}${stderr.trim() ? `：${stderr.trim().split(/\r?\n/).slice(0, 3).join(' | ')}` : ''}）`;
+  return { ok: false, error: `${js.error}；${tarNote}` };
+}
+
+/**
  * 下载并装一份 NapCat（给「精简安装包」用）。
  *
  * 为什么不把这一步塞进安装器：NSIS 里没有可靠的下载插件（要额外带 inetc），
@@ -2748,12 +2879,11 @@ async function installNapcatFromZip(zipPath, tag, size = 0) {
   const dest = path.join(tmp, 'unpacked');
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(dest, { recursive: true });
-  const tarCode = await new Promise((resolve) => {
-    const child = spawn(tarExe(), ['-xf', zipPath, '-C', dest], { windowsHide: true });
-    child.on('close', (code) => resolve(code));
-    child.on('error', () => resolve(-1));
+  const extracted = await extractComponentZip(zipPath, dest, (ratio) => {
+    // 下载占 0-70%，解压 70-95%，和 ffmpeg 那边对齐
+    componentJob = { ...(componentJob ?? { id: 'napcat' }), pct: 70 + Math.round(ratio * 25), note: `解压中 ${Math.round(ratio * 100)}%` };
   });
-  if (tarCode !== 0) return { ok: false, error: '解压失败（本机 tar 不可用？）' };
+  if (!extracted.ok) return { ok: false, error: `解压失败：${extracted.error}` };
 
   let root = dest;
   try {
@@ -2761,7 +2891,10 @@ async function installNapcatFromZip(zipPath, tag, size = 0) {
     if (entries.length === 1 && fs.statSync(path.join(dest, entries[0])).isDirectory()) root = path.join(dest, entries[0]);
   } catch { /* 读不了就按根目录用 */ }
   if (!fs.existsSync(path.join(root, n.exe))) {
-    return { ok: false, error: `解压出来没找到 ${n.exe} —— 这个可能不是 Shell 包` };
+    // 根部没有就往下找：有的 zip 会多套一层目录，别直接判「不是 Shell 包」
+    const found = findFileDown(root, n.exe, 5);
+    if (!found) return { ok: false, error: `解压出来没找到 ${n.exe} —— 这个可能不是 Shell 包` };
+    root = path.dirname(found);
   }
 
   const safeTag = String(tag || 'latest').replace(/[\\/:*?"<>|]/g, '');
@@ -2890,14 +3023,13 @@ async function installFfmpegFromZip(zipPath) {
   componentJob = { ...componentJob, pct: 72, note: '解压中' };
   const unpack = path.join(os.tmpdir(), `ffmpeg-unpack-${Date.now()}`);
   fs.mkdirSync(unpack, { recursive: true });
-  const code = await new Promise((resolve) => {
-    const child = spawn(tarExe(), ['-xf', zipPath, '-C', unpack], { windowsHide: true });
-    child.on('close', resolve);
-    child.on('error', () => resolve(-1));
+  const extracted = await extractComponentZip(zipPath, unpack, (ratio) => {
+    // 下载占 0-70%，解压 72-92%
+    componentJob = { ...componentJob, pct: 72 + Math.round(ratio * 20), note: `解压中 ${Math.round(ratio * 100)}%` };
   });
-  if (code !== 0) {
+  if (!extracted.ok) {
     fs.rmSync(zipPath, { force: true });
-    return { ok: false, error: '解压失败（本机 tar 不可用？）' };
+    return { ok: false, error: `解压失败：${extracted.error}` };
   }
 
   // 包结构是 ffmpeg-master-*/bin/ffmpeg.exe，层数不固定，直接往下找
@@ -8357,16 +8489,33 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/napcat/window') {
       const accountId = url.searchParams.get('account') || DEFAULT_ACCOUNT_ID;
       let panel = napcatPanel(accountId);
-      if (!panel.ok) return sendJson(res, panel);
-      if (!(await probePort(panel.port))) {
+      const acc = napcatAccount(accountId);
+      const canStart = Boolean(acc?.dir && fs.existsSync(acc.dir));
+
+      /** 拉起 NapCat 并等面板端口；不成就把人话带回去。 */
+      const startAndWait = async (port, maxMs) => {
         const started = startNapcat(accountId);
-        if (!started.ok) return sendJson(res, { ok: false, error: `NapCat 没在跑，自动启动失败：${started.error ?? '未知原因'}` });
-        pushLog(`[${accountId}] NapCat 没在跑，已自动拉起，等面板端口就绪…`, 'sys', 'napcat');
-        const ready = await waitForPort(panel.port, 20_000);
-        panel = napcatPanel(accountId);
-        if (!ready || !(await probePort(panel.port))) {
-          return sendJson(res, { ok: false, error: 'NapCat 拉起来了，但面板端口 20 秒内没通——看日志页的 NapCat 输出，稍等再点一次' });
+        if (!started.ok && !/已在运行/.test(started.error ?? '')) {
+          return { ok: false, error: `NapCat 没在跑，自动启动失败：${started.error ?? '未知原因'}` };
         }
+        pushLog(`[${accountId}] NapCat 没在跑，已自动拉起，等面板端口就绪…`, 'sys', 'napcat');
+        const ready = await waitForPort(port, maxMs);
+        panel = napcatPanel(accountId);
+        if (!ready || !panel.ok || !(await probePort(panel.port))) {
+          return { ok: false, error: `NapCat 拉起来了，但面板端口 ${Math.round(maxMs / 1000)} 秒内没通——看日志页的 NapCat 输出，稍等再点一次` };
+        }
+        return { ok: true };
+      };
+
+      if (!panel.ok) {
+        // 全新安装：webui.json 还没生成（NapCat 一次都没跑过）。0.6.1 在这里直接把
+        // 错误甩回给用户，NapCat 根本没机会启动 —— 现在先拉起，把面板等出来。
+        if (!canStart) return sendJson(res, panel);
+        const r = await startAndWait(Number(acc.webuiPort) || 6099, 25_000);
+        if (!r.ok) return sendJson(res, r);
+      } else if (!(await probePort(panel.port))) {
+        const r = await startAndWait(panel.port, 20_000);
+        if (!r.ok) return sendJson(res, r);
       }
       // NapCat 启动时会轮换 WebUI token，且落盘晚于端口就绪——立刻开窗可能带着旧
       // token，面板就会要求手动登录（0.4.2 实测踩到）。等 webui.json 里的 token

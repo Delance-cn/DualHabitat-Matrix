@@ -12,6 +12,9 @@
 ; 在别的机器上（临时目录被拦 / 解压失败）会直接弹“提示文本读取失败”并中止安装。
 ; 现在文本在**编译期**就进了脚本，运行时不碰任何文件，也不存在读不到的情况。
 
+; 软件目录名：目录页的实时纠正和盘根兜底都用它
+!define DHM_DIRNAME "DualHabitat Matrix"
+
 !include "nsDialogs.nsh"
 !include "LogicLib.nsh"
 !include "WinMessages.nsh"
@@ -168,6 +171,17 @@
     nsExec::Exec 'robocopy "$INSTDIR\resources\bridge\.oc" "$APPDATA\dualhabitat-matrix-desktop\bridge-data\.oc" /E /XC /XN /XO /NFL /NDL /NJH /NJS /NP'
     Pop $0
   ${EndIf}
+
+  ; ── 安装目录兜底 ─────────────────────────────────────────────
+  ; 默认安装路径就落在盘根（比如升级残留的 "D:\"）时，先把应用名文件夹补上。
+  ; 目录页浏览选盘根的实时纠正见下面的 .onVerifyInstDir；electron-builder 自带的
+  ; instFilesPre 只在真正开装时才补，页面上看不见，用户会以为文件撒在盘根。
+  StrLen $R0 "$INSTDIR"
+  ${If} $R0 > 0
+    ${If} $R0 <= 3
+      StrCpy $INSTDIR "$INSTDIR\${DHM_DIRNAME}"
+    ${EndIf}
+  ${EndIf}
 !macroend
 
 !macro customInstall
@@ -204,3 +218,21 @@
 !macro customUnInstall
   ; NapCat 的运行目录可能含用户配置、OneBot 配置与登录缓存；保留该目录避免卸载时丢失数据。
 !macroend
+
+; 目录页实时纠正：浏览/输入选到盘根（D:\ 或 D:）时，当场把应用名文件夹补上，
+; 让页面上看到的就是实际安装位置。不拦任何合法目录。
+; electron-builder 的模板没有定义 .onVerifyInstDir，这里定义不会冲突（已核对模板源码）。
+Function .onVerifyInstDir
+  StrLen $R0 "$INSTDIR"
+  ${If} $R0 = 0
+    Return
+  ${EndIf}
+  ${If} $R0 <= 3
+    StrCpy $R1 "$INSTDIR" 1 -1
+    ${If} $R1 == "\"
+      StrCpy $INSTDIR "$INSTDIR${DHM_DIRNAME}"
+    ${Else}
+      StrCpy $INSTDIR "$INSTDIR\${DHM_DIRNAME}"
+    ${EndIf}
+  ${EndIf}
+FunctionEnd

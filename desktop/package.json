@@ -1,6 +1,6 @@
 {
   "name": "dualhabitat-matrix-desktop",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "type": "module",
   "description": "DualHabitat Matrix 桌面端：总览服务、配模型、管人格、发消息、看日志",
@@ -36,6 +36,7 @@
       "server.mjs",
       "secrets-reload.mjs",
       "path-validation.mjs",
+      "zip-extract.mjs",
       "public/**/*",
       "vendor/**/*",
       "package.json"
