@@ -1714,6 +1714,9 @@ function napcatAccounts(cfg = loadConfig()) {
     const configDir = dir ? findNapcatConfigDir(dir) : '';
     return {
       ...acc,
+      // qq1 的 QQ 号以 settings.napcat.qq 为准：旧配置里 config.json 可能没有
+      // platforms.qq.accounts / qq 字段，不能让账号卡片显示“未填”。
+      qq: acc.qq || (acc.id === DEFAULT_ACCOUNT_ID ? primary.qq : ''),
       dir,
       configDir,
       exe: primary.exe,
