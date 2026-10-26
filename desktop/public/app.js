@@ -1668,6 +1668,8 @@ function bsStartHtml() {
   const wx = platform() === 'wechat';
   return `
     <div class="bs-actions"><button class="btn btn-primary" id="bs-start-run">启动这个机器人</button></div>
+    <div class="bs-actions"><button class="btn" id="bs-health">链路体检（收不到消息就点它）</button></div>
+    <div id="bs-health-result"></div>
     <div id="bs-start-steps"></div>
     <p class="hint">启动完，用手机${wx ? '微信' : 'QQ'}给机器人发一句话试试。收发会出现在下面（几秒刷一次）。</p>
     <div class="bs-msgs" id="bs-msgs"></div>
@@ -1741,7 +1743,33 @@ function bindBotSheet() {
         await refreshState();
       });
     });
+    $('#bs-health')?.addEventListener('click', () => runHealthCheck());
   }
+}
+
+/* 链路体检：NapCat → 端口 → 桥接 → 白名单 → 模型，逐项人话报结果。
+ * 为什么放这：远程支援（帮朋友装）最缺的是「他机器上到底哪断了」，
+ * 一键把整条链查完，不用对着日志猜。 */
+async function runHealthCheck() {
+  const box = $('#bs-health-result');
+  if (!box) return;
+  box.innerHTML = '<div class="hint">体检中…</div>';
+  const r = await api('/api/qq/health');
+  if (r?.ok === false) {
+    box.innerHTML = `<div class="result err">体检失败：${esc(r.error ?? '未知原因')}</div>`;
+    return;
+  }
+  const mark = (ok) => (ok === true ? '✓' : ok === false ? '✗' : '•');
+  box.innerHTML =
+    `<div class="hint">${r.bad ? `有 ${r.bad} 项不过，按下面的提示处理` : '全部通过 —— 用另一个 QQ 给机器人发句话试试'}</div>` +
+    r.checks
+      .map((c) =>
+        `<div class="bs-row"><strong>${mark(c.ok)} ${esc(c.title)}</strong>` +
+        (c.detail ? `<div class="hint">${esc(c.detail)}</div>` : '') +
+        (c.hint ? `<div class="hint">→ ${esc(c.hint)}</div>` : '') +
+        `</div>`
+      )
+      .join('');
 }
 
 function renderBsSteps(box, r) {
@@ -1825,6 +1853,10 @@ async function bsSaveModel() {
   const r = await post('/api/model-profiles', { profiles: modelProfiles, poolEntry });
   if (r.ok === false) return setResult('#bs-result-2', r.error ?? '保存失败', 'err');
   $('#bs-apiKey').value = '';
+  if (data.provider && !data.model) {
+    setResult('#bs-result-2', '密钥已保存 ✓ 但模型名还没填 —— 模型池不会出现它，机器人也回不了话。点「拉列表」选一个，或手填（比如 deepseek-chat）。', 'err');
+    return;
+  }
   if (r.regenerated === false) return setResult('#bs-result-2', `已保存，但生成配置失败：${r.regenError ?? '看日志'}`, 'err');
   autoSavedSig.set(`bs-slot-${pf}`, mark);
   setResult('#bs-result-2', r.botsRestarted ? '已保存 ✓ 服务已重启生效' : '已保存 ✓ 下次服务启动生效', 'saved');

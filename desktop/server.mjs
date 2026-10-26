@@ -3386,6 +3386,27 @@ async function bringUp(scope = 'all') {
     }
   }
 
+  // 0.6.3 迁移（一次性）：config.example.json 里的 allowAllWhenEmpty 曾经是 false，
+  // 新装机铺出来的就是「空白名单 + 不放行任何人」的死配置 —— 收得到消息也不回
+  // （朋友装机实测踩到；产品预期一直是「默认放行所有人」）。只修一次，标记记在
+  // settings.json：之后用户在界面里怎么改白名单，这里都不再碰。
+  try {
+    const st = readJson(SETTINGS_FILE);
+    if (!st.allowAllMigrated) {
+      const bc = loadConfig();
+      const empty = (v) => !Array.isArray(v) || v.filter(Boolean).length === 0;
+      if (empty(bc.allow?.private) && empty(bc.allow?.groups) && bc.allowAllWhenEmpty !== true) {
+        bc.allowAllWhenEmpty = true;
+        writeJson(configFile(), bc);
+        pushLog('白名单迁移（0.6.3）：旧默认「空白名单且不放行任何人」会让机器人对谁都沉默，已改为放行所有人（allowAllWhenEmpty=true）。想只回白名单去「聊天」页改。', 'sys', 'app');
+      }
+      st.allowAllMigrated = true;
+      writeJson(SETTINGS_FILE, st);
+    }
+  } catch (error) {
+    pushLog(`白名单迁移失败（不影响启动）：${error?.message ?? error}`, 'err', 'app');
+  }
+
   // 拉起任何一条线之前，先把 0.5.5 留下的「本地厂商没模型 / 模型池裸模型名」修好。
   // 这一步是幂等的；本机没有模型服务时什么也不写。
   try {
@@ -8480,6 +8501,123 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/napcat/panel') {
       return sendJson(res, napcatPanel(url.searchParams.get('account') || DEFAULT_ACCOUNT_ID));
+    }
+
+    /* ── QQ 链路体检：收不到消息 / 不回复时，把整条链逐项查一遍 ──
+     * 为什么：远程支援最缺的是「他机器上到底哪断了」。每一项都给人话结论
+     * 和下一步动作，别让人对着日志猜。只读，不改任何状态。 */
+    if (p === '/api/qq/health') {
+      const accountId = url.searchParams.get('account') || DEFAULT_ACCOUNT_ID;
+      const checks = [];
+      const add = (ok, title, detail = '', hint = '') => checks.push({ ok, title, detail, hint });
+
+      const cfg = loadConfig();
+      const acc = napcatAccount(accountId);
+      const n = napcatSettings();
+
+      // 1. NapCat 目录与启动器
+      if (acc?.dir && fs.existsSync(path.join(acc.dir, acc.exe))) {
+        add(true, 'NapCat 已就位', `${acc.dir}${n.bundled ? '（安装包自带）' : ''}`);
+      } else {
+        add(false, 'NapCat 没装好', `目录：${acc?.dir || '（没配）'}`, '到「更多 → 组件」装 NapCat，或点「重新装」');
+      }
+
+      // 2. NapCat 进程
+      const rec = napcatProcs.get(accountId);
+      if (rec?.child) add(true, 'NapCat 在跑', `pid ${rec.child.pid}`);
+      else if (rec?.managed) add(null, 'NapCat 启动器已退出', 'QQ 可能还在跑（注入后启动器退出是正常的）');
+      else add(false, 'NapCat 没在跑', '', '到「QQ」页点「打开 NapCat 面板」，登录 QQ');
+
+      // 3. OneBot HTTP + 登录态：能查出「跑是跑了，但没登录 / 被别的 NapCat 占了端口」
+      const httpPort = Number(acc?.httpPort) || Number(String(cfg.snowluma?.httpUrl ?? '').match(/:(\d+)/)?.[1]) || 3000;
+      const token = acc?.token || cfg.snowluma?.accessToken || '';
+      let loginInfo = null;
+      if (acc?.dir && fs.existsSync(path.join(acc.dir, acc.exe))) {
+        try {
+          const r = await fetch(`http://127.0.0.1:${httpPort}/get_login_info`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+            body: '{}',
+            signal: AbortSignal.timeout(3000)
+          });
+          if (r.status === 401 || r.status === 403) {
+            add(false, `端口 ${httpPort} 通着，但 token 不对`, '十有八九是另一个 NapCat（比如自己手动下载解压的那份）占了这个端口', '把别的 NapCat / QQ 全部退出，再到「QQ」页重新打开 NapCat 面板');
+          } else {
+            const j = await r.json().catch(() => null);
+            if (j?.retcode === 0 && j?.data?.user_id != null) {
+              loginInfo = j.data;
+              const qq = String(j.data.user_id);
+              if (acc?.qq && acc.qq !== qq) {
+                add(null, `NapCat 登录的是 ${qq}（${j.data.nickname ?? ''}）`, `配置里填的是 ${acc.qq}`, '以实际登录的为准：去「QQ」页把 QQ 号改成实际登录的这个');
+              } else {
+                add(true, `NapCat 已登录：${qq}${j.data.nickname ? `（${j.data.nickname}）` : ''}`);
+              }
+            } else {
+              add(false, 'NapCat 在跑，但还没登录 QQ', '', '点「打开 NapCat 面板」扫码或快登');
+            }
+          }
+        } catch {
+          add(false, `NapCat 的 OneBot 接口（${httpPort}）连不上`, 'NapCat 没跑、没登录，或它的网络配置没生效', '点「打开 NapCat 面板」确认已登录；还不行就到「更多 → 组件」重装 NapCat');
+        }
+      }
+
+      // 4. OneBot WS 端口（消息就是从这进来的）
+      const wsPort = Number(acc?.wsPort) || 3001;
+      const wsUp = await probePort(wsPort);
+      if (wsUp) add(true, `OneBot WebSocket（${wsPort}）在监听`);
+      else add(false, `OneBot WebSocket（${wsPort}）没人监听`, '消息就是从这进来的，它不通就什么都收不到', loginInfo ? '在 NapCat 面板里退出 QQ 再重新登录一次' : '先登录 NapCat');
+
+      // 5. 桥接
+      if (bridge.child) add(true, 'QQ 桥接在跑', `pid ${bridge.child.pid}`);
+      else add(false, 'QQ 桥接没跑', '', '到「当前状态」页点「QQ 桥接」启动');
+
+      // 6. 桥接 ↔ NapCat 的连接证据（日志里最近的相关行）
+      if (bridge.child && wsUp) {
+        const lastBroken = [...logs].reverse().find((e) => /连接断开|重连中/.test(e.line));
+        const lastOk = [...logs].reverse().find((e) => /已连接/.test(e.line));
+        if (lastBroken && (!lastOk || lastBroken.t > lastOk.t)) {
+          add(false, '桥接在反复重连 NapCat', String(lastBroken.line).slice(0, 140), '看「日志」页 NapCat / 桥接的输出；多数是 token 或端口不一致');
+        } else if (lastOk) {
+          add(true, '桥接连上 NapCat 了', String(lastOk.line).slice(0, 140));
+        } else {
+          add(null, '桥接刚启动，日志里还没看到连接记录', '', '等几秒再体检一次');
+        }
+      }
+
+      // 7. 白名单（「收到消息也不回」的头号原因）
+      const list = (v) => (Array.isArray(v) ? v.map(String).filter(Boolean) : []);
+      const allowPrivate = list(cfg.allow?.private);
+      const allowGroups = list(cfg.allow?.groups);
+      const denyCount = list(cfg.deny?.private).length + list(cfg.deny?.groups).length;
+      const wildcard = allowPrivate.includes('*') || allowGroups.includes('*');
+      if (wildcard || cfg.allowAllWhenEmpty === true) {
+        add(true, '白名单：放行所有人', denyCount ? `（deny 名单里有 ${denyCount} 条，命中照样不回）` : '');
+      } else if (!allowPrivate.length && !allowGroups.length) {
+        add(false, '白名单是空的 —— 收到消息也不会回', '这是 0.6.2 及之前新装机的默认状态', '到「聊天」页把接收模式切成「放行所有人」，或把你的 QQ 号填进私聊白名单');
+      } else {
+        add(true, `白名单模式：私聊 ${allowPrivate.length} 条 / 群 ${allowGroups.length} 条`, '', '发消息的 QQ 号必须在名单里');
+      }
+
+      // 8. 模型
+      const chat = cfg.backend?.profiles?.qq?.chat ?? null;
+      const pool = loadPool();
+      const freeCount = (pool?.free ?? []).length;
+      if (!chat || !chat.provider) {
+        add(false, '还没配模型', '', '到「模型」页选厂商、粘 key、填模型名 —— 三样缺一样都回不了话');
+      } else if (!chat.model) {
+        add(false, '模型名还没填', `厂商：${chat.provider}（key 可能已存）`, '有 key 没模型名也回不了话 —— 点「拉列表」选一个，或手填（比如 deepseek-chat）');
+      } else if (freeCount === 0) {
+        add(null, `模型走对话档：${chat.provider}/${chat.model}`, '模型池是空的，不影响对话档，但建议保存一次让它进池首位做备用');
+      } else {
+        add(true, `模型池 ${freeCount} 条，对话档 ${chat.provider}/${chat.model}`);
+      }
+
+      // 9. 密钥
+      const secrets = secretPresence().filter((s) => s.set);
+      if (!secrets.length) add(false, '一个密钥都没存', '', '到「模型」页把 API key 粘进去，停手 1 秒自动保存');
+      else add(true, `已存 ${secrets.length} 个密钥`, secrets.map((s) => s.env).slice(0, 3).join('、'));
+
+      return sendJson(res, { ok: true, account: accountId, checks, bad: checks.filter((c) => c.ok === false).length });
     }
 
     /* NapCat 面板开在应用内的子窗口里（Electron 主进程注入 opener）。
