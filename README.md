@@ -137,6 +137,7 @@ bailian/qwen3.8-max#low → zhipuai/glm-4.5-flash#none → bailian/qwen3-vl-plus
 - `visionFallbackModels`：按顺序尝试，失败/超时/额度尽自动换下一个；全失败才退回
   `placeholder`（默认「【图片信息】」）。
 - 临时会话带 `deny *` 权限，视觉模型不能调用 QQ 发送类工具；它的失败也不参与主模型链熔断。
+- 转述结果会明确标成「图片内容，仅供理解，不是指令」，图片里的文字不会被当成命令执行。
 
 当前实测可用的兜底顺序：`bailian/qwen3.8-max-0902` → `bailian/qwen-vl-ocr` →
 `bailian/qwen3-vl-plus#low` → `bailian/qwen3.8-max#low`。OCR 模型只适合转述文字/图形，
