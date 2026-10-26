@@ -500,6 +500,7 @@
         </div>
         <div class="model-hero-side">
           <span class="badge warn" id="mh-local" hidden>本机模型 —</span>
+          <span class="badge" id="mh-cat" hidden>分类 —</span>
           <span class="badge warn" id="mh-pool">模型池 —</span>
           <span class="badge warn" id="mh-bridge">服务未启动</span>
         </div>
@@ -728,6 +729,13 @@
         <div class="panel-head">
           <h2>模型池</h2>
           <span class="hint">从上往下依次试，一个用光了换下一个</span>
+        </div>
+
+        <div class="pool-legend">
+          <span class="pool-cat cat-vision">视觉</span>
+          <span class="pool-cat cat-text">文本</span>
+          <span class="pool-cat cat-generation">生成</span>
+          <span class="hint">视觉模型能直接看图；文本模型收到图片时，桥接会先让视觉模型转述。生成类（生图/视频/语音/向量）不是聊天模型，建议不要放进池子。</span>
         </div>
 
         <div class="note" id="pool-warning" hidden></div>

@@ -41,7 +41,7 @@ QQ 消息 ──► NapCat（OneBot v11，HTTP 3000 / WS 3001）──► 本桥
 
 不需要 Node、不需要克隆本仓库——**桌面安装包**双击即用（自带模型引擎、桥接和 NapCat）：
 
-- 最新版 0.6.0：[直链](https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/v0.6.0/DualHabitat-Matrix-Setup-0.6.0.exe) · [镜像](https://ghproxy.cn/https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/v0.6.0/DualHabitat-Matrix-Setup-0.6.0.exe)
+- 最新版 0.6.1：[直链](https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/v0.6.1/DualHabitat-Matrix-Setup-0.6.1.exe) · [镜像](https://ghproxy.cn/https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/v0.6.1/DualHabitat-Matrix-Setup-0.6.1.exe)
 - 全部版本：<https://github.com/Delance-cn/DualHabitat-Matrix/releases>
 - GitHub 直连不通时，把镜像前缀拼在下载链接前面：
   - `https://ghproxy.cn/https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/…`

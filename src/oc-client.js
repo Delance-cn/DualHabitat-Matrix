@@ -131,12 +131,31 @@ export function unwrap(response, label) {
 
 /** 在会话事件流里收集一次 turn 的 assistant 文本（按 turn 分组）。 */
 export function createTurnCollector() {
-  const turns = new Map(); // turn -> { text }
+  const turns = new Map(); // turn -> { text, lastSegment, lastTool }
+  // tool/call 事件不带 turn 号，只能按当前正在跑的 turn 归属。
+  let currentTurn = null;
+  // 这些工具是「动作/发送」而不是「查看/查询」：文字在它们之前通常就是
+  // 最终回复（例如说完「收到」再 qq_mark_read）。查看类工具前的文字则是
+  // 模型自言自语（例如「让我看看是什么」再 qq_get_message_images），不能发。
+  const KEEP_TEXT_BEFORE_TOOL = /(^|[_-])qq[_-](send|mark[_-]?read|set[_-]|react|recall|delete|mute|kick|upload|approve|reject|pin|unpin|forward|reply|add[_-]|remove[_-]|create[_-]|update[_-]|rename[_-])/i;
   return {
     /** 处理一条 session/event，返回该事件是否终结了一个 turn（此时可取最终文本）。 */
     push(event) {
       if (event.type === 'turn/start') {
-        turns.set(event.data.turn, { text: '' });
+        currentTurn = event.data.turn;
+        turns.set(currentTurn, { text: '', lastSegment: '', lastTool: '' });
+        return null;
+      }
+      if (event.type === 'tool/call') {
+        // 记住工具调用前的文字，并开始收集工具之后的新文字。
+        // 回合结束时优先用工具之后的文字；如果工具之后什么都没说，
+        // 只有「动作/发送」类工具才回退到调用前的文字。
+        const t = currentTurn == null ? null : turns.get(currentTurn);
+        if (t) {
+          t.lastSegment = t.text;
+          t.lastTool = String(event.data?.name ?? '');
+          t.text = '';
+        }
         return null;
       }
       if (event.type === 'assistant/chunk') {
@@ -147,7 +166,18 @@ export function createTurnCollector() {
       if (event.type === 'assistant/message') {
         const t = turns.get(event.data.turn);
         if (!t) return null;
-        for (const block of event.data.message?.content ?? []) {
+        const blocks = event.data.message?.content ?? [];
+        // 带工具调用的 assistant 消息里的文字是“调用工具前的旁白”，不是最终回复。
+        // 例如：“管理员发图片了，让我看看是什么内容。”后面紧跟 qq_get_message_images。
+        // 只收纯文本消息；否则旁白会和最终回复一起发到 QQ。
+        const hasTool = blocks.some((block) => (
+          block?.type === 'tool'
+          || block?.type === 'tool-call'
+          || block?.type === 'tool_call'
+          || block?.type === 'tool_use'
+        ));
+        if (hasTool) return null;
+        for (const block of blocks) {
           if (block?.type === 'text' && typeof block.text === 'string') t.text += block.text;
         }
         return null;
@@ -155,8 +185,10 @@ export function createTurnCollector() {
       if (event.type === 'turn/end') {
         const t = turns.get(event.data.turn);
         turns.delete(event.data.turn);
+        if (event.data.turn === currentTurn) currentTurn = null;
         if (!t) return null;
-        return { turn: event.data.turn, reason: event.data.reason, text: t.text };
+        const text = t.text || (KEEP_TEXT_BEFORE_TOOL.test(t.lastTool) ? t.lastSegment : '');
+        return { turn: event.data.turn, reason: event.data.reason, text };
       }
       return null;
     },
@@ -787,10 +819,19 @@ export class NodeApiClient {
           if (!groups.has(providerID)) groups.set(providerID, []);
           // 模型 API 把思维链开关暴露成 variants（实测 glm-4.5-flash = ["none","thinking"]）。
           const variants = model?.variants && typeof model.variants === 'object' ? Object.keys(model.variants) : [];
+          const capabilities = model?.capabilities && typeof model.capabilities === 'object' ? model.capabilities : {};
+          const inputModalities = Array.isArray(capabilities.input)
+            ? capabilities.input
+            : (model?.inputModalities ?? model?.modalities ?? ['text']);
+          const contextLimit = Number(model?.limit?.context ?? model?.contextLimit ?? 0) || null;
+          const outputLimit = Number(model?.limit?.output ?? model?.outputLimit ?? 0) || null;
           groups.get(providerID).push({
             id,
             name: model?.name ?? id,
-            inputModalities: model?.inputModalities ?? model?.modalities ?? ['text'],
+            inputModalities,
+            capabilities,
+            contextLimit,
+            outputLimit,
             reasoning: variants.length
               ? {
                   efforts: variants.map((v) => ({ id: v, name: v, description: '' })),

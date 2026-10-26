@@ -2946,6 +2946,33 @@ function poolEntryNormalized(id) {
   return at > 0 ? `${owner}/${text.slice(0, at)}${text.slice(at)}` : `${owner}/${text}`;
 }
 
+/**
+ * 模型分类：优先用后端返回的 categories（和桥接同一份判断），
+ * 老后端没这个字段时用同样的名称规则兜底，避免页面空白。
+ */
+function poolCategory(id) {
+  const fromServer = poolDraft?.categories?.[id];
+  if (fromServer?.key) return fromServer;
+  const text = String(id ?? '').toLowerCase();
+  if (
+    /(^|[-_/])(vl|vision|omni|ocr)([-_/]|$)/.test(text)
+    || /qwen[\d.]*-?vl/.test(text)
+    || /deepseek-v4\.1-flash/.test(text)
+    || /deepseek-flash/.test(text)
+  ) {
+    return { key: 'vision', label: '视觉', hint: '能直接看图片/表情' };
+  }
+  if (/(dall-e|dalle|flux|stable-diffusion|sdxl|midjourney|imagen|seedream|wanx|embedding|rerank|tts|whisper)/.test(text)) {
+    return { key: 'generation', label: '生成', hint: '生图/视频/语音/向量等非聊天模型' };
+  }
+  return { key: 'text', label: '文本', hint: '只处理文字；收到图片时会先让视觉模型转述' };
+}
+
+function poolCategoryBadge(id) {
+  const cat = poolCategory(id);
+  return `<span class="pool-cat cat-${esc(cat.key)}" title="${esc(cat.hint ?? '')}">${esc(cat.label)}</span>`;
+}
+
 function renderPool() {
   if (!poolDraft) return;
   refreshPoolSuggestions();
@@ -2956,6 +2983,7 @@ function renderPool() {
     return `
     <div class="pool-item ${bad ? 'is-invalid' : ''}" data-id="${esc(id)}" data-list="${list}" title="${bad ? '写法不对：要写成 厂商/模型' : bareLocal ? '本机服务里的模型，保存时自动补上厂商前缀' : ''}">
       <span class="pool-name">${esc(id)}</span>
+      ${poolCategoryBadge(id)}
       ${tag}
       <button class="btn btn-sm btn-ghost" data-move="up" title="上移">↑</button>
       <button class="btn btn-sm btn-ghost" data-move="down" title="下移">↓</button>
@@ -2993,12 +3021,16 @@ function renderPool() {
     .map(
       (s) => {
         // quota 是「额度用完」：不会自己回来（永久坐废池），只能拿回来或删掉；
+        // context 是「这条会话太长」：临时换大上下文模型，过一会儿自动回队；
         // 别的（限流/连不上/认证）是暂停，到期自动回队
         const tag = s.kind === 'quota'
           ? '额度用完 · 已废，不会自动恢复'
-          : '暂停中 · 到期自动恢复';
+          : s.kind === 'context'
+            ? '上下文超限 · 已临时换大模型'
+            : '暂停中 · 到期自动恢复';
         return `<div class="pool-item is-spent" data-id="${esc(s.id)}" title="${esc(s.detail ?? '')}">
         <span class="pool-name">${esc(s.id)}</span>
+        ${poolCategoryBadge(s.id)}
         <span class="pool-tag">${esc(tag)}</span>
         <button class="btn btn-sm" data-restore="${esc(s.id)}" title="清掉熔断记录，模型回到池里排队">拿回来</button>
         <button class="btn btn-sm btn-ghost" data-discard="${esc(s.id)}" title="从模型池里整个删掉">删掉</button>
@@ -3288,6 +3320,19 @@ function renderModelHero() {
         : `本机 ${localServer.baseUrl} 没有响应；消息会先失败，再走模型池兜底`;
     } else {
       localEl.hidden = true;
+    }
+  }
+
+  const categoryEl = document.getElementById('mh-cat');
+  if (categoryEl) {
+    if (model) {
+      const cat = poolCategory(model);
+      categoryEl.hidden = false;
+      categoryEl.textContent = `分类 ${cat.label}`;
+      categoryEl.className = `badge ${cat.key === 'vision' ? 'ok' : cat.key === 'generation' ? 'warn' : ''}`;
+      categoryEl.title = cat.hint ?? '';
+    } else {
+      categoryEl.hidden = true;
     }
   }
 

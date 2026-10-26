@@ -77,6 +77,15 @@ const {
 } = await import(pathToFileURL(qqAccountsFile).href);
 
 /**
+ * 模型能力分类和桥接共用一份实现：模型池页的分类栏、视觉兜底路由
+ * 不能各判各的，否则控制台标「视觉」、桥接却当纯文本跳过。
+ */
+const modelCapabilitiesFile = fs.existsSync(path.join(DEFAULT_ROOT, 'src', 'model-capabilities.js'))
+  ? path.join(DEFAULT_ROOT, 'src', 'model-capabilities.js')
+  : path.resolve(here, '..', 'src', 'model-capabilities.js');
+const { describeModelCategory } = await import(pathToFileURL(modelCapabilitiesFile).href);
+
+/**
  * 桌面端自己的设置（不进版本库）。
  * 为什么不放 config.json：那是桥接的配置，混进 UI 状态会互相污染。
  *
@@ -5904,6 +5913,16 @@ const server = http.createServer(async (req, res) => {
               const slash = x.indexOf('/');
               return slash <= 0 || slash === x.length - 1;
             });
+        const spent = spentInPool(pool);
+        const visionModels = loadConfig()?.socialV2?.images?.visionModels ?? [];
+        const categoryIds = [...new Set([
+          ...(pool.free ?? []).map(String),
+          ...(pool.paid ?? []).map(String),
+          ...spent.map((item) => String(item.id))
+        ])];
+        const categories = Object.fromEntries(
+          categoryIds.map((id) => [id, describeModelCategory(id, { visionModels })])
+        );
         return sendJson(res, {
           enabled: pool.enabled !== false,
           allowPaid: pool.allowPaid === true,
@@ -5911,7 +5930,8 @@ const server = http.createServer(async (req, res) => {
           free: (pool.free ?? []).map(String),
           paid: (pool.paid ?? []).map(String),
           invalid: { free: invalid(pool.free), paid: invalid(pool.paid) },
-          spent: spentInPool(pool),
+          spent,
+          categories,
           usage: await readModelUsage(),
           path: modelsFile(),
           configPath: configFile()

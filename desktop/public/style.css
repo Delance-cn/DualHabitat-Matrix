@@ -716,6 +716,34 @@ table.table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 }
 .pool-item .pool-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pool-item .pool-tag { font-size: 10.5px; color: var(--text-3); font-family: inherit; }
+
+/* 分类栏：视觉 / 文本 / 生成 */
+.pool-cat {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 10.5px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.pool-cat.cat-vision { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
+.pool-cat.cat-text { color: var(--text-3); background: var(--panel); }
+.pool-cat.cat-generation { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
+.pool-cat.cat-unknown { color: var(--text-3); background: var(--panel); }
+
+.pool-legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 2px 0 10px;
+}
+.pool-legend .hint { margin-left: 2px; }
+
 .pool-item.is-spent { border-color: var(--err-soft); }
 .pool-item .btn { font-family: "Segoe UI", system-ui, sans-serif; }
 

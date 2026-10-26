@@ -30,6 +30,7 @@
 export const KIND = {
   QUOTA: 'quota',
   RATE: 'rate',
+  CONTEXT: 'context',
   UNAVAILABLE: 'unavailable',
   AUTH: 'auth',
   UNREACHABLE: 'unreachable',
@@ -37,7 +38,7 @@ export const KIND = {
 };
 
 /** 会被熔断的失败类型（OTHER 不熔断，交给上层报错）。 */
-export const FUSING_KINDS = new Set([KIND.QUOTA, KIND.RATE, KIND.UNAVAILABLE, KIND.AUTH, KIND.UNREACHABLE]);
+export const FUSING_KINDS = new Set([KIND.QUOTA, KIND.RATE, KIND.CONTEXT, KIND.UNAVAILABLE, KIND.AUTH, KIND.UNREACHABLE]);
 
 /**
  * 「永久」冷却的哨兵时间戳：JS 日期上限（275760-09-13），有限数、JSON 能原样存。
@@ -53,6 +54,8 @@ export const PERMANENT_UNTIL = 8640000000000000;
 export const DEFAULT_COOLDOWN_MS = {
   [KIND.QUOTA]: PERMANENT_UNTIL - Date.now(), // 永久：until 落在哨兵时间戳上
   [KIND.RATE]: 60 * 1000, // 限流只躲 60 秒
+  // 上下文超限不是模型坏了，只是这条会话太长；躲十分钟，让链先粘在大上下文模型上。
+  [KIND.CONTEXT]: 10 * 60 * 1000,
   [KIND.UNAVAILABLE]: 24 * 60 * 60 * 1000,
   [KIND.AUTH]: 24 * 60 * 60 * 1000,
   [KIND.UNREACHABLE]: 10 * 60 * 1000 // 代理挂了/DNS 投毒可能恢复，别拉黑一整天
@@ -93,7 +96,9 @@ export function failureText(input) {
 }
 
 // ── 分类规则 ──────────────────────────────────────────────────────────────
-// 顺序有含义：先判"不算失败"的例外，再按 quota → rate → unavailable → auth 匹配。
+// 顺序有含义：先判"不算失败"的例外，再按 context → quota → rate → unavailable → auth 匹配。
+// context 放最前：有些 provider 的超限文案里也带 quota/limit 字样，先命中上下文，
+// 才能把"换个大上下文模型"和"这个模型额度用光了"区分开。
 
 /** 明确**不该**熔断的：工具权限被我们自己拒掉，跟 provider 健康无关。 */
 const NOT_A_FAILURE = [
@@ -102,6 +107,14 @@ const NOT_A_FAILURE = [
 ];
 
 const RULES = [
+  {
+    kind: KIND.CONTEXT,
+    // 模型 API / 各家 provider 的原文不完全一样，常见的是：
+    //   "Prompt exceeds max length"（本机实测）
+    //   "context length exceeded" / "maximum context window"
+    //   "input is too long" / "too many tokens"
+    re: /prompt exceeds max length|prompt is too long|context (?:length|window)|maximum context|input is too long|too many tokens|token limit|max(?:imum)? tokens|超过.{0,8}(?:长度|上限)|上下文.{0,8}(?:超|过长)|输入.{0,8}过长/i
+  },
   {
     kind: KIND.QUOTA,
     // 智谱 1113：余额不足或无可用资源包
