@@ -1811,7 +1811,16 @@ function updateBsKeyHint() {
     el.textContent = '自定义接入：key 会存进 secrets.json，界面上只显示有没有，不回显内容。';
     return;
   }
-  el.textContent = secretSet(env) ? `已保存 ${env}（留空 = 继续用已存的）` : `还没存 ${env}。粘进来保存一次就行，之后留空。`;
+  if (!secretSet(env)) {
+    // sk- 开头的 key 在向导「识别」那步会先认成 OPENAI_API_KEY，DeepSeek/月暗也是这个
+    // 形状 —— 用户以为存过了，其实本厂商的槽位是空的，模型实例起不来就报 unavailable。
+    const mis = secretSet('OPENAI_API_KEY') && env !== 'OPENAI_API_KEY'
+      ? ' ⚠️ 你之前粘的 key 被识别成了 OPENAI_API_KEY（sk- 开头都先认 OpenAI）——这个厂商的 key 要在这里再粘一次。'
+      : '';
+    el.textContent = `还没存 ${env}。粘进来保存一次就行，之后留空。${mis}`;
+    return;
+  }
+  el.textContent = `已保存 ${env}（留空 = 继续用已存的）`;
 }
 
 async function bsSaveModel() {

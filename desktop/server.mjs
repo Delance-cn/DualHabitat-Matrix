@@ -8598,24 +8598,35 @@ const server = http.createServer(async (req, res) => {
         add(true, `白名单模式：私聊 ${allowPrivate.length} 条 / 群 ${allowGroups.length} 条`, '', '发消息的 QQ 号必须在名单里');
       }
 
-      // 8. 模型
+      // 8. 模型（对话档和内置实例的 dsh 路由都报出来 —— agent 实际用哪个一眼看清）
       const chat = cfg.backend?.profiles?.qq?.chat ?? null;
       const pool = loadPool();
       const freeCount = (pool?.free ?? []).length;
-      if (!chat || !chat.provider) {
-        add(false, '还没配模型', '', '到「模型」页选厂商、粘 key、填模型名 —— 三样缺一样都回不了话');
-      } else if (!chat.model) {
-        add(false, '模型名还没填', `厂商：${chat.provider}（key 可能已存）`, '有 key 没模型名也回不了话 —— 点「拉列表」选一个，或手填（比如 deepseek-chat）');
-      } else if (freeCount === 0) {
-        add(null, `模型走对话档：${chat.provider}/${chat.model}`, '模型池是空的，不影响对话档，但建议保存一次让它进池首位做备用');
+      const dshRoute = `${cfg.dsh?.provider ?? 'deepseek-official'}/${cfg.dsh?.model ?? 'deepseek-flash'}`;
+      if (chat?.provider && chat?.model) {
+        add(freeCount > 0, `对话档：${chat.provider}/${chat.model}`, freeCount ? `模型池 ${freeCount} 条` : '模型池是空的（不影响对话档，建议在「模型」页保存一次让它进池首位）');
       } else {
-        add(true, `模型池 ${freeCount} 条，对话档 ${chat.provider}/${chat.model}`);
+        add(false, '对话档还没配完整', chat ? `厂商：${chat.provider ?? '未选'}，模型：${chat.model ?? '未填'}` : '「模型」页还没保存过', '选厂商、填模型名（点「拉列表」选，或手填）—— 三样缺一样都回不了话');
       }
+      add(null, `内置模型实例路由：${dshRoute}`, 'agent 默认走这条；它起不来就会在群里报 Model unavailable', '「模型」页点一次「拉列表」能直接验证 key 和模型名是否可用');
 
-      // 9. 密钥
-      const secrets = secretPresence().filter((s) => s.set);
-      if (!secrets.length) add(false, '一个密钥都没存', '', '到「模型」页把 API key 粘进去，停手 1 秒自动保存');
-      else add(true, `已存 ${secrets.length} 个密钥`, secrets.map((s) => s.env).slice(0, 3).join('、'));
+      // 9. 密钥：点名查「对话档厂商 + DeepSeek 官方（内置实例默认路由）」需要的那几个 env
+      const presence = secretPresence();
+      const setEnvs = new Set(presence.filter((s) => s.set).map((s) => s.env));
+      const needEnvs = [...new Set(
+        [
+          chat?.provider ? MODEL_PROVIDER_CATALOG.get(String(chat.provider))?.keyEnv : null,
+          'DEEPSEEK_API_KEY'
+        ].filter(Boolean)
+      )];
+      const missing = needEnvs.filter((env) => !setEnvs.has(env));
+      if (!setEnvs.size) {
+        add(false, '一个密钥都没存', '', '到「模型」页把 API key 粘进去，停手 1 秒自动保存');
+      } else if (missing.length) {
+        add(false, `还缺密钥：${missing.join('、')}`, `已存的其他 key 顶不了这个坑 —— 向导第 2 步识别时 sk- 开头会先认成 OPENAI_API_KEY（DeepSeek/月暗也是这个形状）`, '到「模型」页在对应厂商下面把 key 再粘一次（输入框留空 = 用已存的，没存过就必须粘）');
+      } else {
+        add(true, `密钥都在：${needEnvs.join('、')}`, `另外还存了 ${Math.max(0, setEnvs.size - needEnvs.length)} 个`);
+      }
 
       return sendJson(res, { ok: true, account: accountId, checks, bad: checks.filter((c) => c.ok === false).length });
     }
