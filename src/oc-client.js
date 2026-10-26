@@ -365,6 +365,9 @@ export class NodeApiClient {
     this._inject = null;
     // 候选是否已经按真实模型目录校验过（只校验一次，invalidate 后重来）
     this._chainValidated = false;
+    // 视觉转述用的临时会话：主事件泵也会看到它们的事件，但绝不能把它们
+    // 的失败算到主模型链头上（否则视觉模型额度用完会把主聊天模型熔断）。
+    this._bypassSessions = new Set();
 
     // 模型池：显式传入的优先，否则读 models.json，再否则用默认池。
     const { pool, source, warnings } = loadModelPool({ inline: auth.models });
@@ -593,6 +596,113 @@ export class NodeApiClient {
   /** 模型链现状（控制台/日志用）。 */
   chainStatus() {
     return this._chain ? this._chain.status() : [];
+  }
+
+  /**
+   * 用指定视觉模型看一组图片/表情，返回纯文本描述。
+   *
+   * 为什么单独开一个临时会话，而不是把主会话切过去再切回来：
+   *   1. 主会话的 preset 可能带 QQ 工具，视觉模型不该碰发送类工具；
+   *   2. 视觉转述的 user/assistant 回合不该混进主会话上下文；
+   *   3. 失败/超时可以直接丢掉，不影响主会话的模型链熔断。
+   *
+   * 这个方法是**旁路**：不经过 ModelChain，也不写 `_appliedModel`。
+   * 调用方负责决定用哪个视觉模型，以及失败时退回文字占位。
+   *
+   * @param {object} options
+   * @param {string} options.provider  例如 `bailian`
+   * @param {string} options.model     例如 `qwen3-vl-plus`
+   * @param {string} [options.variant] 例如 `low`
+   * @param {Array} options.content    ContentBlock[]（text + image）
+   * @param {string} [options.workspaceId] 会话目录；不传用 modelDirectory
+   * @param {string} [options.agentPreset='qq-chat']
+   * @param {number} [options.timeoutMs=120000]
+   * @returns {Promise<string>}
+   */
+  async visionPrompt({
+    provider,
+    model,
+    variant,
+    content,
+    workspaceId,
+    agentPreset = 'qq-chat',
+    title = 'vision-fallback',
+    timeoutMs = 120_000
+  } = {}) {
+    if (!provider || !model) throw new Error('visionPrompt 缺少 provider/model');
+    const client = await this._ensureClient();
+    const directory = workspaceId
+      ? this._dirOfWorkspace(workspaceId)
+      : (this.auth.modelDirectory || process.cwd());
+    const created = await client.session.create({
+      location: { directory },
+      agent: agentPreset,
+      title,
+      // 硬隔离：视觉转述只该看图写字，不能调用 snowluma 等 QQ 工具。
+      // prompt 里也写了“不要调用工具”，但提示词不是权限边界，这里再兜一层。
+      permissions: [{ action: '*', resource: '*', effect: 'deny' }]
+    });
+    const sessionId = created?.id ?? created?.sessionID;
+    if (!sessionId) throw new Error('visionPrompt: session.create 没有返回 id');
+    this._bypassSessions.add(sessionId);
+
+    const ac = new AbortController();
+    let timer = null;
+    let ended = null;
+    try {
+      const modelRef = { providerID: provider, id: model, modelID: model };
+      if (variant) modelRef.variant = variant;
+      await client.session.switchModel({ sessionID: sessionId, model: modelRef });
+
+      const collector = createTurnCollector();
+      const resultPromise = (async () => {
+        for await (const event of client.event.subscribe({ signal: ac.signal })) {
+          let frames;
+          try {
+            frames = this._translate(event);
+          } catch {
+            continue;
+          }
+          for (const frame of frames) {
+            if (frame.sessionId !== sessionId) continue;
+            const done = collector.push(frame.event);
+            if (done) return done;
+          }
+        }
+        throw new Error('visionPrompt: 事件流提前结束');
+      })();
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          try { ac.abort(); } catch {}
+          reject(new Error(`visionPrompt: 等待视觉模型超时(${timeoutMs}ms)`));
+        }, timeoutMs);
+      });
+
+      const text = blocksToText(content);
+      const files = blocksToFiles(content);
+      await client.session.prompt({
+        sessionID: sessionId,
+        text,
+        ...(files.length ? { files } : {})
+      });
+
+      ended = await Promise.race([resultPromise, timeoutPromise]);
+      if (!ended) throw new Error('visionPrompt: 没有收到回合结束');
+      if (ended.reason?.kind !== 'completed') {
+        const detail = ended.reason?.error ? `：${ended.reason.error}` : '';
+        throw new Error(`visionPrompt: 回合未正常完成（${ended.reason?.kind ?? 'unknown'}）${detail}`);
+      }
+      return String(ended.text ?? '').trim();
+    } finally {
+      if (timer) clearTimeout(timer);
+      try { ac.abort(); } catch {}
+      // 先 interrupt/remove。事件流可能比调用返回稍晚，所以旁路标记再保留
+      // 一小段时间：清理过程/迟到事件同样不能算到主模型链头上。
+      try { await client.session.interrupt({ sessionID: sessionId }); } catch {}
+      try { await client.session.remove({ sessionID: sessionId }); } catch {}
+      const cleanupTimer = setTimeout(() => this._bypassSessions.delete(sessionId), 30_000);
+      cleanupTimer.unref?.();
+    }
   }
 
   /* ── 5.1 连接 ──────────────────────────────────────────────────────────── */
@@ -1041,6 +1151,8 @@ export class NodeApiClient {
     const d = event?.data ?? {};
     const sessionId = d.sessionID ?? d.sessionId ?? event?.sessionID;
     if (!sessionId) return frames;
+    // 视觉转述临时会话不参与主模型链的熔断/重试。
+    if (this._bypassSessions.has(sessionId)) return frames;
     const self = this;
 
     if (type === 'session.execution.started') {

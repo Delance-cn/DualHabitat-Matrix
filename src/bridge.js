@@ -8238,6 +8238,81 @@ async function main() {
     return parts;
   }
 
+  /**
+   * 组装一条消息的 content：文本 + 图片/表情。
+   *
+   * - 主模型能看图：沿用原来的直接内联图片块。
+   * - 主模型看不了图：先用视觉模型转述，把文字描述拼进 prompt；转述失败才退回占位。
+   * - 没开视觉兜底 / 没有可用视觉模型：保持原来的占位行为。
+   */
+  async function buildPromptContent({ key, sessionId, promptText, media, accountId }) {
+    const text = withSlangContext(promptText);
+    const list = Array.isArray(media) ? media : [];
+    if (!list.length) return [{ type: 'text', text }];
+
+    if (sessionSeesImages(sessionId)) {
+      return [{ type: 'text', text }, ...(await resolveMediaList(list, { canSeeImages: true, accountId }))];
+    }
+
+    if (!visionFallbackEnabled()) {
+      return [{ type: 'text', text }, ...(await resolveMediaList(list, { canSeeImages: false, accountId }))];
+    }
+
+    const candidates = visionCandidates();
+    if (!candidates.length) {
+      log(`当前模型看不了图，且没有配置视觉兜底模型，按文字占位处理 (${key})`);
+      return [{ type: 'text', text }, ...(await resolveMediaList(list, { canSeeImages: false, accountId }))];
+    }
+
+    // 先取一次图片块。取不到图片（全是表情文字/下载失败）就不必再调视觉模型。
+    const visionParts = await resolveMediaList(list, { canSeeImages: true, accountId });
+    if (!visionParts.some((part) => part.type === 'image')) {
+      return [{ type: 'text', text }, ...(await resolveMediaList(list, { canSeeImages: false, accountId }))];
+    }
+
+    const totalBudgetMs = Math.max(10_000, Number(cfg.socialV2?.images?.visionFallbackTimeoutMs) || 120_000);
+    const startedAt = Date.now();
+    let description = '';
+    for (const vision of candidates) {
+      const left = totalBudgetMs - (Date.now() - startedAt);
+      if (left < 5_000) {
+        log(`视觉兜底总预算用完，停止尝试 (${key})`);
+        break;
+      }
+      try {
+        const perModelTimeout = Math.min(60_000, left);
+        description = await api.visionPrompt({
+          provider: vision.provider,
+          model: vision.model,
+          variant: vision.variant,
+          content: [{ type: 'text', text: visionFallbackInstruction() }, ...visionParts],
+          workspaceId: cfg.sessionCwd || ROOT,
+          agentPreset: 'qq-chat',
+          timeoutMs: perModelTimeout
+        });
+        if (description) {
+          log(`图片已由 ${vision.provider}/${vision.model} 转述（${description.length} 字），主模型继续回复 (${key})`);
+          break;
+        }
+        log(`视觉模型 ${vision.provider}/${vision.model} 返回空描述，换下一个候选 (${key})`);
+      } catch (error) {
+        log(`视觉模型 ${vision.provider}/${vision.model} 转述失败：${error?.message ?? error}`);
+      }
+    }
+
+    if (description) {
+      const maxChars = Math.max(200, Number(cfg.socialV2?.images?.visionFallbackMaxChars) || 2_000);
+      const clipped = description.length > maxChars ? `${description.slice(0, maxChars)}…` : description;
+      return [{
+        type: 'text',
+        text: `${text}\n\n【图片内容（视觉模型转述，供你回复时参考）】\n${clipped}`
+      }];
+    }
+
+    log(`视觉兜底没有拿到描述，按文字占位处理 (${key})`);
+    return [{ type: 'text', text }, ...(await resolveMediaList(list, { canSeeImages: false, accountId }))];
+  }
+
   async function fetchMediaData(mediaList, accountId = primaryAccountId) {
     const out = [];
     let index = 0;
@@ -8472,6 +8547,64 @@ async function main() {
 
   function sessionSeesImages(sessionId) {
     return modelSeesImages(sessionModelRefs.get(sessionId)?.model);
+  }
+
+  // ── 视觉兜底 ────────────────────────────────────────────────────────────
+  // 主模型看不了图时，不把图片块硬塞给它（纯文本模型会 400），而是先让一个
+  // 能看图的模型把图片转述成文字，再把转述拼进主模型的 prompt。
+  // 转述失败就退回原来的「[图片信息]」占位，绝不因为看图把整轮聊天搞挂。
+  function parseModelSpec(spec) {
+    const text = String(spec ?? '').trim();
+    if (!text) return null;
+    const slash = text.indexOf('/');
+    if (slash <= 0) return null;
+    const provider = text.slice(0, slash);
+    let rest = text.slice(slash + 1);
+    let variant = null;
+    const hash = rest.lastIndexOf('#');
+    if (hash > 0) {
+      variant = rest.slice(hash + 1) || null;
+      rest = rest.slice(0, hash);
+    }
+    if (!provider || !rest) return null;
+    return { provider, model: rest, variant };
+  }
+
+  function visionFallbackEnabled() {
+    if (cfg.socialV2?.images?.enabled === false) return false;
+    return cfg.socialV2?.images?.visionFallback !== false;
+  }
+
+  function visionFallbackInstruction() {
+    return String(
+      cfg.socialV2?.images?.visionFallbackPrompt
+      || '请客观、具体地描述这些图片/表情里能看到的内容（人物、物体、场景、文字、表情含义等）。只输出描述，不要回复用户，不要调用任何工具。'
+    );
+  }
+
+  /**
+   * 视觉兜底候选：先按 config 里显式配的顺序，再补模型链里命中 visionModels
+   * 白名单的候选。去重后逐个尝试，前一个额度用完/不可用还能换下一个。
+   */
+  function visionCandidates() {
+    const out = [];
+    const seen = new Set();
+    const add = (spec) => {
+      const parsed = parseModelSpec(spec);
+      if (!parsed) return;
+      const key = `${parsed.provider}/${parsed.model}${parsed.variant ? `#${parsed.variant}` : ''}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(parsed);
+    };
+    const explicit = cfg.socialV2?.images?.visionFallbackModels;
+    if (Array.isArray(explicit)) explicit.forEach(add);
+    for (const entry of api.chainStatus?.() ?? []) {
+      if (!entry?.key || entry.usable === false) continue;
+      const parsed = parseModelSpec(entry.key);
+      if (parsed && modelSeesImages(parsed.model)) add(entry.key);
+    }
+    return out;
   }
 
   // 返回 'applied' | 'not-found' | 'failed'。
@@ -9429,8 +9562,13 @@ async function main() {
     }
     let content = [{ type: 'text', text: withSlangContext(promptText) }];
     if (Array.isArray(opts.media) && opts.media.length > 0) {
-      const imageParts = await resolveMediaList(opts.media, { canSeeImages: sessionSeesImages(sessionId), accountId: keyParts(key)?.accountId ?? primaryAccountId });
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      content = await buildPromptContent({
+        key,
+        sessionId,
+        promptText,
+        media: opts.media,
+        accountId: keyParts(key)?.accountId ?? primaryAccountId
+      });
     }
     // 串行回合：上一轮还在跑（或刚提交、turn/start 还没到）时先等它结束，
     // 否则两条消息会挤进同一个回合，上下文和工具调用互相打架。

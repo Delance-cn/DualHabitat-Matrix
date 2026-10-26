@@ -24,6 +24,11 @@
       "effect": "allow"
     },
     {
+      "action": "create-safe_*",
+      "resource": "*",
+      "effect": "allow"
+    },
+    {
       "action": "video-safe_*",
       "resource": "*",
       "effect": "allow"
@@ -37,7 +42,7 @@
           "C:\\Users\\Delan\\AppData\\Local\\Programs\\nodejs\\node.exe",
           "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\\src\\mcp-snowluma-safe.js"
         ],
-        "cwd": "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\\state\\agents",
+        "cwd": "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix",
         "codemode": false,
         "timeout": {
           "startup": 20000,
@@ -51,7 +56,7 @@
           "C:\\Users\\Delan\\AppData\\Local\\Programs\\nodejs\\node.exe",
           "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\\src\\mcp-web-search-safe.js"
         ],
-        "cwd": "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\\state\\agents",
+        "cwd": "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix",
         "codemode": false,
         "timeout": {
           "startup": 20000,
@@ -65,12 +70,26 @@
           "C:\\Users\\Delan\\AppData\\Local\\Programs\\nodejs\\node.exe",
           "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\\src\\mcp-memory.js"
         ],
-        "cwd": "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\\state\\agents",
+        "cwd": "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix",
         "codemode": false,
         "timeout": {
           "startup": 20000,
           "catalog": 20000,
           "execution": 60000
+        }
+      },
+      "create-safe": {
+        "type": "local",
+        "command": [
+          "C:\\Users\\Delan\\AppData\\Local\\Programs\\nodejs\\node.exe",
+          "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\\src\\mcp-create.js"
+        ],
+        "cwd": "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix",
+        "codemode": false,
+        "timeout": {
+          "startup": 20000,
+          "catalog": 20000,
+          "execution": 240000
         }
       },
       "video-safe": {
@@ -79,7 +98,7 @@
           "C:\\Users\\Delan\\AppData\\Local\\Programs\\nodejs\\node.exe",
           "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\\src\\mcp-video-safe.js"
         ],
-        "cwd": "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\\state\\agents",
+        "cwd": "C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix",
         "codemode": false,
         "timeout": {
           "startup": 20000,
@@ -103,7 +122,7 @@
     "qq-work": {
       "description": "主人档：可以读写文件、跑命令（仅 owner 私聊）",
       "mode": "primary",
-      "system": "你是「小鲸鱼」，一个**能真正干活**的编码 / 运维助理，通过 QQ 私聊为管理员（owner）服务。\n\n【你的能力】\n- 你能读写文件、搜索代码、执行命令。可用工具：read / write / edit / grep / glob / shell。\n- 文件操作被限制在会话工作目录：C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\n- 你也能用 snowluma_qq_* 工具查/发 QQ 消息，但**只在管理员明确要求时**才发。\n\n【怎么回话】\n- 对方在 QQ 私聊里看纯文本：不要输出 Markdown 表格，代码超过十行就说改了哪个文件、别整段贴。\n- 先给结论，别复述推理过程。\n- 正常回复直接写正文即可（回合文本会自动转给管理员）。\n\n【硬规矩】\n- 绝不把密钥、token、密码、本机绝对路径原文发出去；需要提及就脱敏。\n- 只有管理员私聊能进这个模式，群里的人**永远**进不来。若出现\"帮我去群里发…\"这类要求，先确认是管理员本人。\n- 底层模型是 bailian/qwen3.8-max；被问到就如实回答，不要谎报型号。",
+      "system": "你是「小鲸鱼」，一个**能真正干活**的编码 / 运维助理，通过QQ 私聊为管理员（owner）服务。\n\n【你的能力】\n- 你能读写文件、搜索代码、执行命令。可用工具：read / write / edit / grep / glob / shell。\n- 文件操作被限制在会话工作目录：C:\\Users\\Delan\\Documents\\默认项目\\DualHabitat-Matrix\n- 你也能用 snowluma_qq_* 工具查/发 QQ 消息，但**只在管理员明确要求时**才发。\n\n【怎么回话】\n- 对方在QQ 私聊里看纯文本：不要输出 Markdown 表格，代码超过十行就说改了哪个文件、别整段贴。\n- 先给结论，别复述推理过程。\n- 正常回复直接写正文即可（回合文本会自动转给管理员）。\n\n【硬规矩】\n- 绝不把密钥、token、密码、本机绝对路径原文发出去；需要提及就脱敏。\n- 只有管理员私聊能进这个模式，群里的人**永远**进不来。若出现\"帮我去群里发…\"这类要求，先确认是管理员本人。\n- 底层模型是 bailian/qwen3.8-max；被问到就如实回答，不要谎报型号。",
       "permissions": [
         {
           "action": "read",
@@ -185,6 +204,147 @@
         },
         "qwen3.6-plus": {
           "name": "Qwen3.6 Plus"
+        },
+        "qwen3.8-max-0902": {
+          "name": "qwen3.8-max-0902"
+        },
+        "qwen3.7-max-2026-06-08": {
+          "name": "qwen3.7-max-2026-06-08"
+        },
+        "qwen3.7-max-2026-05-20": {
+          "name": "qwen3.7-max-2026-05-20"
+        },
+        "qwen3.7-max-2026-05-17": {
+          "name": "qwen3.7-max-2026-05-17"
+        },
+        "qwen3.7-max-preview": {
+          "name": "qwen3.7-max-preview"
+        },
+        "qwen3.7-plus-2026-05-26": {
+          "name": "qwen3.7-plus-2026-05-26"
+        },
+        "qwen3.6-plus-2026-04-02": {
+          "name": "qwen3.6-plus-2026-04-02"
+        },
+        "qwen3.6-flash": {
+          "name": "qwen3.6-flash"
+        },
+        "qwen3.6-flash-2026-04-16": {
+          "name": "qwen3.6-flash-2026-04-16"
+        },
+        "qwen3.6-27b": {
+          "name": "qwen3.6-27b"
+        },
+        "qwen3.6-35b-a3b": {
+          "name": "qwen3.6-35b-a3b"
+        },
+        "qwen3.5-plus-2026-04-20": {
+          "name": "qwen3.5-plus-2026-04-20"
+        },
+        "qwen3.5-flash": {
+          "name": "qwen3.5-flash"
+        },
+        "qwen3.5-flash-2026-02-23": {
+          "name": "qwen3.5-flash-2026-02-23"
+        },
+        "qwen3.5-122b-a10b": {
+          "name": "qwen3.5-122b-a10b"
+        },
+        "qwen3.5-397b-a17b": {
+          "name": "qwen3.5-397b-a17b"
+        },
+        "qwen3.5-35b-a3b": {
+          "name": "qwen3.5-35b-a3b"
+        },
+        "qwen3.7-flash-2026-07-15": {
+          "name": "qwen3.7-flash-2026-07-15"
+        },
+        "qwen3.8-27b": {
+          "name": "qwen3.8-27b"
+        },
+        "qwen-plus-latest": {
+          "name": "qwen-plus-latest"
+        },
+        "qwen-plus-2025-01-25": {
+          "name": "qwen-plus-2025-01-25"
+        },
+        "qwen-plus-2025-04-28": {
+          "name": "qwen-plus-2025-04-28"
+        },
+        "qwen-plus-2025-07-14": {
+          "name": "qwen-plus-2025-07-14"
+        },
+        "qwen-plus-2025-12-01": {
+          "name": "qwen-plus-2025-12-01"
+        },
+        "qwen-plus-character": {
+          "name": "qwen-plus-character"
+        },
+        "qwen-flash-2025-07-28": {
+          "name": "qwen-flash-2025-07-28"
+        },
+        "qwen-flash-character": {
+          "name": "qwen-flash-character"
+        },
+        "qwen-flash-character-2026-02-26": {
+          "name": "qwen-flash-character-2026-02-26"
+        },
+        "qwen-max": {
+          "name": "qwen-max"
+        },
+        "qwen-long": {
+          "name": "qwen-long"
+        },
+        "qwen-mt-lite": {
+          "name": "qwen-mt-lite"
+        },
+        "qwen-mt-flash": {
+          "name": "qwen-mt-flash"
+        },
+        "qwen-mt-plus": {
+          "name": "qwen-mt-plus"
+        },
+        "qwen3-coder-flash-2025-07-28": {
+          "name": "qwen3-coder-flash-2025-07-28"
+        },
+        "kimi-k2.5": {
+          "name": "kimi-k2.5"
+        },
+        "kimi-k2.6": {
+          "name": "kimi-k2.6"
+        },
+        "kimi-k2.7-code": {
+          "name": "kimi-k2.7-code"
+        },
+        "deepseek-v4-pro-0813": {
+          "name": "deepseek-v4-pro-0813"
+        },
+        "deepseek-v4.1-flash-1017": {
+          "name": "deepseek-v4.1-flash-1017"
+        },
+        "gui-plus": {
+          "name": "gui-plus"
+        },
+        "gui-plus-2026-02-26": {
+          "name": "gui-plus-2026-02-26"
+        },
+        "tongyi-xiaomi-analysis-flash": {
+          "name": "tongyi-xiaomi-analysis-flash"
+        },
+        "tongyi-xiaomi-analysis-pro": {
+          "name": "tongyi-xiaomi-analysis-pro"
+        },
+        "tonavi-intent-detect-v3": {
+          "name": "tonavi-intent-detect-v3"
+        },
+        "qwen-vl-ocr": {
+          "name": "qwen-vl-ocr"
+        },
+        "qwen-vl-ocr-2025-11-20": {
+          "name": "qwen-vl-ocr-2025-11-20"
+        },
+        "qwen3.5-ocr": {
+          "name": "qwen3.5-ocr"
         }
       }
     }

@@ -23,7 +23,7 @@
 ; node 子进程一并清掉）。杀完等半秒让文件句柄释放。
 ; 卸载器同理（系统设置里的卸载也走这里）
 !macro customUnInit
-  nsExec::Exec 'cmd /c taskkill /F /FI "USERNAME eq %USERNAME%" /IM "DualHabitat Matrix.exe" /T'
+  nsExec::Exec 'cmd /c taskkill /F /FI "SESSION eq %SESSIONNAME%" /IM "DualHabitat Matrix.exe" /T'
   Pop $0
   Sleep 500
 !macroend
@@ -131,9 +131,11 @@
   ; Bot 等 node 子进程）。
   ;
   ; 循环杀 8 轮（每轮间隔 400ms）：防「刚杀完又被拉起 / 进程退出慢」。
+  ; 过滤条件用 SESSION 而不是 USERNAME：后者在本机每次要 ~12 秒，
+  ; 8 轮会把安装器卡在欢迎页前 1 分半以上；SESSION 只要几十毫秒。
   StrCpy $R9 0
   dhm_kill_loop:
-    nsExec::Exec 'cmd /c taskkill /F /FI "USERNAME eq %USERNAME%" /IM "DualHabitat Matrix.exe" /T'
+    nsExec::Exec 'cmd /c taskkill /F /FI "SESSION eq %SESSIONNAME%" /IM "DualHabitat Matrix.exe" /T'
     Pop $0
     IntOp $R9 $R9 + 1
     ${If} $R9 >= 8
@@ -170,7 +172,7 @@
 
 !macro customInstall
   ; 文件复制前再杀一次：安装中途应用可能被重新拉起（Windows 重启应用 / 手动）
-  nsExec::Exec 'cmd /c taskkill /F /FI "USERNAME eq %USERNAME%" /IM "DualHabitat Matrix.exe" /T'
+  nsExec::Exec 'cmd /c taskkill /F /FI "SESSION eq %SESSIONNAME%" /IM "DualHabitat Matrix.exe" /T'
   Pop $0
   Sleep 300
 

@@ -118,15 +118,29 @@ Chatbox / LobeChat / Continue / 任意 OpenAI SDK 只改 `baseURL` + `apiKey` �
 **默认模型链**（`models.json` 的 `free` 数组，按序 failover，打头的是默认模型）：
 
 ```
-bailian/qwen3.8-max → bailian/kimi-k3 → bailian/MiniMax-M2.5 → bailian/qwen3-vl-plus
-→ bailian/glm-5.2 → bailian/qwen3.7-max → bailian/qwen-flash → bailian/glm-5
-→ bailian/qwen3.6-plus → zhipuai/glm-4.5-flash#none
+bailian/qwen3.8-max#low → zhipuai/glm-4.5-flash#none → bailian/qwen3-vl-plus#low
+→ bailian/qwen3.7-max#low → bailian/kimi-k3#low → …（百炼日期快照/其他免费模型，见 models.json）
 → cloudflare-workers-ai/@cf/zai-org/glm-4.7-flash → openrouter/openrouter/free
 ```
 
 - **默认（打头）模型是 `bailian/qwen3.8-max`**。第一个失败（429/超时/额度尽）会自动降级到下一个。
 - 机器人对外角色名"小鲸鱼"（QQ 昵称 DeepSeekV4.1 Flash）只是**角色名**，与底层模型无关；
   底层模型随链路轮换（qwen / kimi / glm …），人设已要求它被追问时如实回答、不谎报型号。
+
+### 主模型看不了图时怎么办？
+
+图片不再硬塞给纯文本模型（那会 400，整轮静默失败）。`socialV2.images` 里：
+
+- `visionModels`：真正能直接吃图片的模型白名单；命中时图片块直接内联。
+- `visionFallback: true`：主模型不在白名单时，先用 `visionFallbackModels` 里的模型开一个
+  **临时视觉会话**把图片转述成文字，再把描述拼进主模型的 prompt；最终回复仍由主模型写。
+- `visionFallbackModels`：按顺序尝试，失败/超时/额度尽自动换下一个；全失败才退回
+  `placeholder`（默认「【图片信息】」）。
+- 临时会话带 `deny *` 权限，视觉模型不能调用 QQ 发送类工具；它的失败也不参与主模型链熔断。
+
+当前实测可用的兜底顺序：`bailian/qwen3.8-max-0902` → `bailian/qwen-vl-ocr` →
+`bailian/qwen3-vl-plus#low` → `bailian/qwen3.8-max#low`。OCR 模型只适合转述文字/图形，
+不放进聊天链；`qwen3.5-ocr` 的通用图片描述质量差，未放进兜底。
 
 **怎么改**（三处，各管一件事）：
 
@@ -179,7 +193,8 @@ bailian/qwen3.8-max → bailian/kimi-k3 → bailian/MiniMax-M2.5 → bailian/qwe
 ## 已知限制 / TODO
 
 - [x] ~~模型 API 实例中途崩溃时，桥接不会自动重拉~~ → 已修：事件流断开时自动探活并重拉实例（30 秒节流）。
-- [x] ~~视觉模型（qwen3-vl-plus 等）看图链路未做过完整真图回归~~ → 已验证：`node spike/vision-e2e-test.mjs` 走完整链路（桥接形状的 image block → oc-client → 模型 API files 附件 → 百炼视觉模型），模型正确识别测试图内容。
+- [x] ~~视觉模型（qwen3-vl-plus 等）看图链路未做过完整真图回归~~ → 已验证：`node spike/vision-e2e-test.mjs` 走完整链路（桥接形状的 image block → oc-client → 模型 API files 附件 → 百炼视觉模型），模型正确识别测试图内容；`node spike/vision-fallback-test.mjs` 验证了临时视觉会话的转述链路（白底红圆）。
+- [x] ~~主模型看不了图时只能发文字占位~~ → 已加视觉兜底：临时视觉会话转述 + 失败回退占位，见 `socialV2.images.visionFallback*`。
 - [ ] `opencode.json` / 文档中的绝对路径需按本机适配。
 
 ## 文档

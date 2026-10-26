@@ -1271,15 +1271,27 @@ function ocInstances() {
   };
 }
 
+const DEFAULT_EXHAUSTED_NOTICE = '我这会儿 API 连不上了，等会儿再聊吧。';
+
+/** 旧数据里「GBK 文件被当 UTF-8 读」会留下 U+FFFD 或连续问号，不能原样显示/发出去。 */
+function sanitizeExhaustedNotice(value) {
+  if (typeof value !== 'string') return DEFAULT_EXHAUSTED_NOTICE;
+  const text = value.trim();
+  if (text.includes('\uFFFD') || /\?{2,}/.test(text)) return DEFAULT_EXHAUSTED_NOTICE;
+  return text;
+}
+
 function loadPool() {
-  return readJson(modelsFile(), {
+  const pool = readJson(modelsFile(), {
     enabled: true,
     allowPaid: false,
     // 全链熔断时直接发给对方的一句话，必须是**人话**（旧默认值 429ERROR 会原样发进聊天）。
-    exhaustedNotice: '我这会儿 API 连不上了，等会儿再聊吧。',
+    exhaustedNotice: DEFAULT_EXHAUSTED_NOTICE,
     free: [],
     paid: []
   });
+  pool.exhaustedNotice = sanitizeExhaustedNotice(pool.exhaustedNotice);
+  return pool;
 }
 
 /**
@@ -5970,7 +5982,7 @@ const server = http.createServer(async (req, res) => {
 
       pool.enabled = body.enabled !== false;
       pool.allowPaid = body.allowPaid === true;
-      if (typeof body.exhaustedNotice === 'string') pool.exhaustedNotice = body.exhaustedNotice.trim();
+      if (typeof body.exhaustedNotice === 'string') pool.exhaustedNotice = sanitizeExhaustedNotice(body.exhaustedNotice);
       pool.free = clean(body.free, '免费档');
       pool.paid = clean(body.paid, '付费档');
 

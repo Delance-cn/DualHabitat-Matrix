@@ -278,8 +278,21 @@
       "visionModels": [
         "qwen3-vl-plus",
         "qwen3.8-max",
-        "deepseek-flash"
+        "deepseek-flash",
+        "qwen-vl-ocr",
+        "qwen3.5-ocr"
       ],
+      "_comment_fallback": "主模型看不了图时，按 visionFallbackModels 顺序调用视觉模型转述；失败/超时退回文字占位。视觉模型只负责描述，最终回复仍由主模型写。",
+      "visionFallback": true,
+      "visionFallbackModels": [
+        "bailian/qwen3.8-max-0902",
+        "bailian/qwen-vl-ocr",
+        "bailian/qwen3-vl-plus#low",
+        "bailian/qwen3.8-max#low"
+      ],
+      "visionFallbackPrompt": "请客观、具体地描述这些图片/表情里能看到的内容（人物、物体、场景、文字、表情含义等）。只输出描述，不要回复用户，不要调用任何工具。",
+      "visionFallbackTimeoutMs": 120000,
+      "visionFallbackMaxChars": 2000,
       "placeholder": "【图片信息】"
     },
     "video": {

@@ -56,6 +56,22 @@ export const DEFAULT_POOL = {
 };
 
 /**
+ * 提示语乱码兜底。
+ *
+ * 旧数据里出现过「GBK 文件被当 UTF-8 读」的 `exhaustedNotice`：
+ * 存下来是 U+FFFD，界面上显示成一串问号，最后还会原样发进群里。
+ * 这种值不能当用户文案用，直接回退默认人话。
+ *
+ * 空串是**有效配置**（用户明确关掉用尽提示），不能当成乱码。
+ */
+export function sanitizeExhaustedNotice(value) {
+  if (typeof value !== 'string') return DEFAULT_POOL.exhaustedNotice;
+  const text = value.trim();
+  if (text.includes('\uFFFD') || /\?{2,}/.test(text)) return DEFAULT_POOL.exhaustedNotice;
+  return text;
+}
+
+/**
  * 池里有意义的顶层键。
  *
  * 另外约定：**下划线开头的键一律当注释**（延续 `proxy.json` 里 `_comment` 的写法）。
@@ -155,9 +171,10 @@ export function normalizePool(raw) {
     }
   }
 
-  const notice = typeof source.exhaustedNotice === 'string'
-    ? source.exhaustedNotice.trim()
-    : DEFAULT_POOL.exhaustedNotice;
+  const notice = sanitizeExhaustedNotice(source.exhaustedNotice);
+  if (typeof source.exhaustedNotice === 'string' && notice !== source.exhaustedNotice.trim()) {
+    warnings.push('exhaustedNotice 含乱码（U+FFFD 或连续问号），已回退默认提示语');
+  }
 
   const pool = {
     enabled: source.enabled !== false,
