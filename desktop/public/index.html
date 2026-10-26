@@ -499,6 +499,7 @@
           <span class="model-hero-sub" id="mh-sub">在下面选厂商，或点本机服务按钮。</span>
         </div>
         <div class="model-hero-side">
+          <span class="badge warn" id="mh-local" hidden>本机模型 —</span>
           <span class="badge warn" id="mh-pool">模型池 —</span>
           <span class="badge warn" id="mh-bridge">服务未启动</span>
         </div>
@@ -516,7 +517,7 @@
       <div class="panel" id="usage-panel">
         <div class="panel-head">
           <h2>用量统计</h2>
-          <span class="hint">读本地会话库，QQ 和微信一起算；打开本页时自动加载</span>
+          <span class="hint">读本地会话库，按 QQ 私聊 / QQ 群聊 / 微信拆分；打开本页时自动加载</span>
           <span class="spacer"></span>
           <button class="btn btn-sm btn-ghost" id="btn-usage-refresh">刷新</button>
         </div>
@@ -526,6 +527,7 @@
           <div class="usage-card"><span class="usage-k">消耗 Tokens</span><strong id="us-tok">—</strong><span class="usage-sub" id="us-tok-sub"></span></div>
           <div class="usage-card"><span class="usage-k">缓存命中率</span><strong id="us-hit">—</strong><span class="usage-sub" id="us-hit-sub"></span></div>
         </div>
+        <div class="hint" id="us-split" style="margin:-6px 0 14px"></div>
         <div class="usage-heatmap-wrap">
           <div class="usage-hm-title">每日用量<span class="hint" style="margin-left:8px">最近 26 周，颜色越深当天用得越多</span></div>
           <div class="usage-heatmap" id="us-heatmap"></div>
@@ -534,7 +536,7 @@
         <div class="usage-log-wrap">
           <table class="usage-table">
             <thead>
-              <tr><th>时间</th><th>应用</th><th>模型</th><th>成本</th><th>输入</th><th>输出</th><th>缓存</th><th>速度</th><th>首字</th><th>状态</th></tr>
+              <tr><th>时间</th><th>应用</th><th>会话</th><th>模型</th><th>成本</th><th>输入</th><th>输出</th><th>缓存</th><th>速度</th><th>首字</th><th>状态</th></tr>
             </thead>
             <tbody id="us-log"></tbody>
           </table>

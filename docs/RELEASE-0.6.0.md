@@ -1,7 +1,7 @@
 # DualHabitat Matrix 0.6.0
 
-> **状态：草稿（未发布）**。0.6.0 还在攒功能，下面哈希和大小等打包后回填。
-> 已发布版本看 [Releases](https://github.com/Delance-cn/DualHabitat-Matrix/releases)，当前最新 0.5.9（[直链](https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/v0.5.9/DualHabitat-Matrix-Setup-0.5.9.exe) · [镜像链](https://ghproxy.cn/https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/v0.5.9/DualHabitat-Matrix-Setup-0.5.9.exe)）。
+> **状态：已发布（2026-10-26）**。安装包、大小和 SHA256 见下方「下载与安装」。
+> 已发布版本看 [Releases](https://github.com/Delance-cn/DualHabitat-Matrix/releases)，当前最新 0.6.0（[直链](https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/v0.6.0/DualHabitat-Matrix-Setup-0.6.0.exe) · [镜像链](https://ghproxy.cn/https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/v0.6.0/DualHabitat-Matrix-Setup-0.6.0.exe)）。
 
 ## 一、多号管理（重点更新）
 
@@ -34,16 +34,21 @@
 - **标签区分**：quota 显示「额度用完 · 已废，不会自动恢复」，其余（限流/连不上/认证）仍显示「暂停中 · 到期自动恢复」——后者该自愈的照旧自愈。
 - 想改回限时冷却：`models.json` 的 `cooldownMs.quota` 覆盖仍然优先。
 
-## 五、下载与安装
+## 五、用量统计与模型页状态修复
 
-安装包（0.6.0 发布后）：
+- **用量按会话拆分**：用量统计现在按 QQ 私聊 / QQ 群聊 / 微信分别汇总，最近调用表新增「会话」列；历史会话用标题兜底识别群聊/私聊，映射不到才显示「未知会话」。
+- **模型页状态如实显示**：顶部的服务徽标拆成「QQ 桥接运行中」和本机模型服务状态。当前厂商不是本机服务时不再显示本机徽标；选中的本机服务没启动时明确标「没在运行」，不会把 LM Studio 误报成运行中。
+
+## 六、下载与安装
+
+安装包：
 
 - 直链：`https://github.com/Delance-cn/DualHabitat-Matrix/releases/download/v0.6.0/DualHabitat-Matrix-Setup-0.6.0.exe`
 - 镜像（国内直连不动时用，把前缀拼在完整 URL 前面）：
   - `https://ghproxy.cn/https://github.com/…`
   - `https://ghfast.top/https://github.com/…`
-- 大小：待回填
-- SHA256：待回填
+- 大小：586,477,625 字节（559.3 MB）
+- SHA256：`51ac0d3d3a989284ad54eb0d8be9f42855734a1ab5bb162c642346e6590b7e07`
 
 全部历史版本：<https://github.com/Delance-cn/DualHabitat-Matrix/releases>（每个版本一个独立安装包，互不覆盖）。
 
@@ -51,8 +56,8 @@
 
 ## 验证
 
-- `desktop/scripts` 19 个测试文件 50 用例全部通过（新增 QQ 多号账号模型 / 会话键 / 白名单策略 8 例）。
+- `desktop/scripts` 21 个测试文件 54 用例全部通过（新增 QQ 多号账号模型 / 会话键 / 白名单策略 8 例）。
 - 官方通道实连验证：真实凭证换取 access_token（HTTP 200）、WebSocket 网关 READY（机器人 L.A.N）、心跳稳定、桌面面板实时显示连接状态与收发计数。
-- NapCat 多号桌面端：隔离数据根冒烟通过（`/api/state`、`/api/napcat/accounts` 的 GET/POST/PUT/DELETE、按号面板地址、config.json 回写）；双号真机扫码登录待发布前补测。
+- NapCat 多号桌面端：隔离数据根冒烟通过（`/api/state`、`/api/napcat/accounts` 的 GET/POST/PUT/DELETE、按号面板地址、config.json 回写）；双号真机扫码登录需按实际账号环境验证（发布包不预置登录态）。
 - 模型页一键切换：假 LM Studio 服务端到端实测（横幅 → 一键切换 → 保存生效 → 横幅消失）；池子裸名补前缀前后端实测。
 - 废池：quota 熔断一年后 + 落盘恢复仍然跳过该模型、自动切下一条；限流 60 秒后正常回队。

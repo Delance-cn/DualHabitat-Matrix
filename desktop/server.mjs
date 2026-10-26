@@ -1407,14 +1407,46 @@ function usageDbFiles() {
   return out;
 }
 
+/**
+ * 会话 id → 会话键。用量库只记 session_id，私聊/群聊要靠桥接的
+ * sessions.json（QQ）和 wechat-*-sessions.json（微信）反查。
+ */
+function usageSessionMaps() {
+  const qq = new Map();
+  const wx = new Map();
+  const stateDir = path.join(dataRoot(), 'state');
+  try {
+    const saved = readJson(path.join(stateDir, 'sessions.json'), {});
+    for (const [conv, sid] of Object.entries(saved?.sessions ?? {})) {
+      if (sid) qq.set(String(sid), String(conv));
+    }
+  } catch {
+    /* 没有映射就显示未知会话，不影响用量汇总 */
+  }
+  try {
+    for (const name of fs.readdirSync(stateDir)) {
+      if (!/^wechat(?:-[A-Za-z0-9_.-]+)?-sessions\.json$/.test(name)) continue;
+      const saved = readJson(path.join(stateDir, name), {});
+      for (const [user, rec] of Object.entries(saved ?? {})) {
+        const sid = typeof rec === 'string' ? rec : rec?.sessionId;
+        if (sid) wx.set(String(sid), String(user));
+      }
+    }
+  } catch {
+    /* 微信没登录/没会话时没有这个文件 */
+  }
+  return { qq, wx };
+}
+
 async function readUsageStats() {
   if (_sqliteCtor === null) {
     _sqliteCtor = await import('node:sqlite').then((m) => m.DatabaseSync).catch(() => false);
   }
   if (!_sqliteCtor) return { ok: false, error: '这个环境没有 node:sqlite，读不了会话库' };
   const files = usageDbFiles();
-  if (!files.length) return { ok: true, empty: true, totals: null, days: [], models: [], recent: [] };
+  if (!files.length) return { ok: true, empty: true, totals: null, days: [], models: [], recent: [], byChat: null };
   const rows = [];
+  const sessionMaps = usageSessionMaps();
   for (const { app, file } of files) {
     let db;
     try {
@@ -1438,7 +1470,9 @@ async function readUsageStats() {
              json_extract(data, '$.model.id')        AS model,
              json_extract(data, '$.model.providerID') AS provider,
              json_extract(data, '$.finish')          AS finish,
-             json_extract(data, '$.error.message')   AS err
+             json_extract(data, '$.error.message')   AS err,
+             session_id                               AS sid,
+             (SELECT title FROM session_v2 WHERE id = session_message.session_id) AS title
            FROM session_message WHERE type = 'assistant' ORDER BY time_created ASC`
         )
         .all();
@@ -1452,6 +1486,8 @@ async function readUsageStats() {
   const num = (v) => Number(v) || 0;
   const pad2 = (n) => String(n).padStart(2, '0');
   const totals = { cost: 0, requests: rows.length, ok: 0, errors: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+  const emptyChat = () => ({ requests: 0, ok: 0, errors: 0, cost: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, tokens: 0 });
+  const byChat = { qqPrivate: emptyChat(), qqGroup: emptyChat(), wechat: emptyChat(), unknown: emptyChat() };
   const days = new Map();
   const models = new Map();
   const recent = [];
@@ -1462,19 +1498,47 @@ async function readUsageStats() {
     const inTok = num(r.tin);
     const outTok = num(r.tout);
     const cacheRead = num(r.tcr);
+    const tokens = inTok + outTok + num(r.treason) + num(r.tcw);
     totals.cost += num(r.cost);
     totals.input += inTok;
     totals.output += outTok;
     totals.reasoning += num(r.treason);
     totals.cacheRead += cacheRead;
     totals.cacheWrite += num(r.tcw);
+
+    // 会话库只记 session_id，用桥接的会话映射还原成 private:xxx / group:xxx。
+    const sid = String(r.sid ?? '');
+    const conv = (r.app === '微信' ? sessionMaps.wx.get(sid) : sessionMaps.qq.get(sid)) ?? '';
+    // 会话映射只保留当前会话；历史会话已经换过 id 的，用标题兜底认群聊/私聊。
+    const title = String(r.title ?? '');
+    const titleKind = /(?:qq\s*group|群聊|群组)/i.test(title) ? 'group' : /(?:私聊|private)/i.test(title) ? 'private' : '';
+    const kind = conv.startsWith('group:') ? 'group' : conv.startsWith('private:') ? 'private' : (r.app === '微信' ? 'private' : titleKind || 'unknown');
+    const target = conv.includes(':') ? conv.slice(conv.indexOf(':') + 1) : conv;
+    const chatLabel = kind === 'group'
+      ? (target ? `群 ${target}` : '群聊（旧会话）')
+      : kind === 'private'
+        ? (target ? (r.app === '微信' ? `微信 ${target}` : `私聊 ${target}`) : '私聊（旧会话）')
+        : '未知会话';
+    const chatKey = r.app === '微信' ? 'wechat' : kind === 'group' ? 'qqGroup' : kind === 'private' ? 'qqPrivate' : 'unknown';
+    const bucket = byChat[chatKey];
+    bucket.requests += 1;
+    if (failed) bucket.errors += 1;
+    else bucket.ok += 1;
+    bucket.cost += num(r.cost);
+    bucket.input += inTok;
+    bucket.output += outTok;
+    bucket.reasoning += num(r.treason);
+    bucket.cacheRead += cacheRead;
+    bucket.cacheWrite += num(r.tcw);
+    bucket.tokens += tokens;
+
     if (r.t0) {
       const d = new Date(r.t0);
       const key = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
       const day = days.get(key) ?? { date: key, cost: 0, requests: 0, tokens: 0 };
       day.cost += num(r.cost);
       day.requests += 1;
-      day.tokens += inTok + outTok + num(r.treason) + num(r.tcw);
+      day.tokens += tokens;
       days.set(key, day);
     }
     const modelId = String(r.model ?? '未知');
@@ -1492,6 +1556,9 @@ async function readUsageStats() {
     recent.push({
       t: r.t0,
       app: r.app,
+      chat: chatLabel,
+      conv,
+      kind,
       model: modelId,
       provider,
       cost: num(r.cost),
@@ -1508,6 +1575,7 @@ async function readUsageStats() {
   return {
     ok: true,
     totals: { ...totals, cacheHitRate: denom > 0 ? totals.cacheRead / denom : 0 },
+    byChat,
     days: [...days.values()].sort((a, b) => (a.date < b.date ? -1 : 1)),
     models: [...models.values()].sort((a, b) => b.cost - a.cost || b.requests - a.requests).slice(0, 8),
     recent: recent.slice(-100).reverse()

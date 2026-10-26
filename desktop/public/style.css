@@ -302,6 +302,7 @@ a:hover { text-decoration: underline; }
 .usage-table td { padding: 6px 10px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
 .usage-table tr:last-child td { border-bottom: none; }
 .usage-table .usage-model { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+.usage-table .usage-chat { max-width: 170px; overflow: hidden; text-overflow: ellipsis; }
 .usage-model .usage-prov { display: block; font-size: 10.5px; color: var(--text-3); }
 .usage-err { color: var(--err); font-weight: 600; }
 .usage-ok { color: var(--text-3); }
@@ -555,6 +556,7 @@ select { cursor: pointer; }
   border: 1px solid var(--line);
   line-height: 17px;
 }
+.badge[hidden] { display: none; }
 .badge.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
 .badge.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
 .badge.err { background: var(--err-soft); color: var(--err); border-color: transparent; }

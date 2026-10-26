@@ -131,6 +131,8 @@ async function loadUsage() {
     $('#us-req').textContent = '—';
     $('#us-tok').textContent = '—';
     $('#us-hit').textContent = '—';
+    const split = $('#us-split');
+    if (split) split.textContent = '';
     return setResult('#usage-result', u.error ?? '读不了会话库', 'err');
   }
   usageCache = u;
@@ -156,6 +158,8 @@ function renderUsage(u) {
     $('#us-hit').textContent = '—';
     $('#us-heatmap').innerHTML = '<span class="hint">还没有任何调用记录 —— 发一条消息就有了。</span>';
     $('#us-log').innerHTML = '';
+    const split = $('#us-split');
+    if (split) split.textContent = '';
     return;
   }
   $('#us-cost').textContent = fmtMoney(t.cost);
@@ -167,6 +171,15 @@ function renderUsage(u) {
   $('#us-tok-sub').textContent = `入 ${fmtTok(t.input)} · 出 ${fmtTok(t.output)}`;
   $('#us-hit').textContent = t.cacheHitRate > 0 ? `${Math.round(t.cacheHitRate * 100)}%` : '—';
   $('#us-hit-sub').textContent = t.cacheRead > 0 ? `命中 ${fmtTok(t.cacheRead)}` : '没有缓存统计';
+
+  const byChat = u.byChat ?? {};
+  const splitParts = [];
+  if (byChat.qqPrivate?.requests) splitParts.push(`QQ 私聊 ${byChat.qqPrivate.requests} 次`);
+  if (byChat.qqGroup?.requests) splitParts.push(`QQ 群聊 ${byChat.qqGroup.requests} 次`);
+  if (byChat.wechat?.requests) splitParts.push(`微信 ${byChat.wechat.requests} 次`);
+  if (byChat.unknown?.requests) splitParts.push(`未知会话 ${byChat.unknown.requests} 次`);
+  const split = $('#us-split');
+  if (split) split.textContent = splitParts.length ? `按会话：${splitParts.join(' · ')}` : '按会话：还没有可识别的私聊/群聊记录';
 
   /* 热力图：列对齐周一，最后一列是本周；从本周一回退 25 周共 26 列 */
   const byDay = new Map(u.days.map((d) => [d.date, d]));
@@ -195,7 +208,7 @@ function renderUsage(u) {
         : `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
       const model = r.provider ? `${esc(r.model)}<span class="usage-prov">${esc(r.provider)}</span>` : esc(r.model);
       const status = r.status === 'error' ? `<span class="usage-err" title="${esc(r.error)}">失败</span>` : '<span class="usage-ok">成功</span>';
-      return `<tr><td class="mono">${when}</td><td>${esc(r.app)}</td><td class="usage-model">${model}</td><td>${fmtMoney(r.cost)}</td><td>${fmtTok(r.input)}</td><td>${fmtTok(r.output)}</td><td>${fmtTok(r.cacheRead)}</td><td>${fmtTps(r.tps)}</td><td>${fmtTtft(r.ttftMs)}</td><td>${status}</td></tr>`;
+      return `<tr><td class="mono">${when}</td><td>${esc(r.app)}</td><td class="usage-chat" title="${esc(r.conv ?? '')}">${esc(r.chat ?? '未知会话')}</td><td class="usage-model">${model}</td><td>${fmtMoney(r.cost)}</td><td>${fmtTok(r.input)}</td><td>${fmtTok(r.output)}</td><td>${fmtTok(r.cacheRead)}</td><td>${fmtTps(r.tps)}</td><td>${fmtTtft(r.ttftMs)}</td><td>${status}</td></tr>`;
     })
     .join('');
 }
@@ -3250,6 +3263,7 @@ function renderModelHero() {
   const baseUrl = formBaseUrl || preset?.baseUrl || '';
   const keyEnv = formProvider ? (usesCustomModelEndpoint({ provider: formProvider, baseUrl }, preset) ? modelProfileKeyEnv(pf, 'chat') : preset?.keyEnv) : null;
   const keyState = !keyEnv ? '无需 key' : secretSet(keyEnv) ? 'key 已保存' : 'key 未保存';
+  const localServer = formProvider ? (S?.localModelServers ?? []).find((x) => x.id === formProvider) : null;
 
   const title = document.getElementById('mh-title');
   const sub = document.getElementById('mh-sub');
@@ -3257,9 +3271,24 @@ function renderModelHero() {
   if (platformEl) platformEl.textContent = wx ? '微信' : 'QQ';
   if (title) title.textContent = model ? `${providerLabel} · ${model}` : '还没有选模型';
   if (sub) {
+    const localNote = localServer && !localServer.running ? ` · ${localServer.label} 没在运行` : '';
     sub.textContent = model
-      ? `${baseUrl || '地址未填'} · ${keyState}`
+      ? `${baseUrl || '地址未填'} · ${keyState}${localNote}`
       : '在下面选厂商，或点本机服务按钮；模型和地址会自动填好。';
+  }
+
+  const localEl = document.getElementById('mh-local');
+  if (localEl) {
+    if (localServer) {
+      localEl.hidden = false;
+      localEl.textContent = localServer.running ? `${localServer.label} 已连接` : `${localServer.label} 未运行`;
+      localEl.className = `badge ${localServer.running ? 'ok' : 'warn'}`;
+      localEl.title = localServer.running
+        ? `本机 ${localServer.baseUrl} 已响应`
+        : `本机 ${localServer.baseUrl} 没有响应；消息会先失败，再走模型池兜底`;
+    } else {
+      localEl.hidden = true;
+    }
   }
 
   const pool = document.getElementById('mh-pool');
@@ -3275,8 +3304,10 @@ function renderModelHero() {
   if (bridge) {
     const running = wx ? Boolean(S?.wechat?.running || S?.wechat?.externalPid) : Boolean(S?.bridge?.running || S?.bridge?.externalPid);
     const exit = wx ? S?.wechat?.exitCode : S?.bridge?.exitCode;
-    bridge.textContent = running ? '服务运行中' : exit != null ? `服务已退出（${exit}）` : '服务未启动';
+    const serviceName = wx ? '微信 Bot' : 'QQ 桥接';
+    bridge.textContent = running ? `${serviceName}运行中` : exit != null ? `${serviceName}已退出（${exit}）` : `${serviceName}未启动`;
     bridge.className = `badge ${running ? 'ok' : exit != null ? 'err' : 'warn'}`;
+    bridge.title = wx ? '微信 Bot 进程状态，不是模型服务状态' : 'QQ 桥接进程状态，不是模型服务状态';
   }
 }
 
